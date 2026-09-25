@@ -1,0 +1,116 @@
+# ============================================================================
+# 自动构建 Windows exe 并发布 CPU / CUDA12 两种「外置 DLL」发行包。
+#
+# 为什么 CI 不需要 CUDA Toolkit：
+#   exe 通过 dynamic-link/dynamic-backends 动态链接 llama.dll 与 ggml*.dll，
+#   CUDA 加速由运行时外置 DLL 提供（ggml-cuda.dll、onnxruntime_providers_cuda.dll、
+#   cudart/cublas/cudnn）。这些 DLL 直接取自 llama.cpp / sherpa-onnx / NVIDIA PyPI
+#   的官方预编译产物，由 scripts/package_dist.py 组装进发行包。
+#
+# 旧版静态链接方案的 LNK2038/LNK2005（/MT 与 /MD CRT 混链冲突）也随之消失：
+#   所有 C/C++ 运行时都被隔离在各自 DLL 内部，exe 侧无需任何 RUSTFLAGS hack。
+# ============================================================================
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # tag 推送时创建 Release 需要
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  windows-x64:
+    name: Windows x64 (CPU + CUDA12 packages)
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # llama-cpp-sys-2 的 build.rs 使用 bindgen，需要 libclang
+      - name: Ensure libclang (bindgen)
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "$env:ProgramFiles\LLVM\bin",
+            "${env:ChocolateyInstall}\lib\llvm\tools\LLVM\bin"
+          )
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host 'libclang not found, installing LLVM via choco ...'
+            choco install llvm --no-progress -y | Out-Null
+            $found = "$env:ProgramFiles\LLVM\bin"
+            if (-not (Test-Path (Join-Path $found 'libclang.dll'))) { throw 'LLVM installation failed' }
+          }
+          Write-Host "Using LIBCLANG_PATH=$found"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$found"
+
+      - name: Build release exe (dynamic-link, CPU toolchain only)
+        run: cargo build --release --locked
+
+      - name: Smoke test (--version / --help)
+        shell: pwsh
+        run: |
+          ./target/release/subtitle-assistant.exe --version
+          ./target/release/subtitle-assistant.exe --help | Select-Object -First 5
+
+      # PR 只做编译验证，不组装发行包（省流量与时长）
+      - name: Cache for runtime DLL downloads
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@v4
+        with:
+          path: .distcache
+          key: distcache-${{ hashFiles('scripts/package_dist.py') }}
+          restore-keys: distcache-
+
+      - name: Package CPU & CUDA12 distributions
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $ver = $env:GITHUB_REF_NAME
+          } else {
+            $ver = 'dev-' + $env:GITHUB_SHA.Substring(0, 8)
+          }
+          python scripts/package_dist.py `
+            --exe target/release/subtitle-assistant.exe `
+            --version $ver `
+            --out dist `
+            --cache .distcache
+
+      - name: Upload artifacts
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-x64-packages
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (on tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

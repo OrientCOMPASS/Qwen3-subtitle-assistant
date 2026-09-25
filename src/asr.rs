@@ -1,9 +1,18 @@
+//! Silero VAD 切片 + sherpa-onnx Qwen3-ASR 转录。
+//!
+//! 重构要点：
+//! - ASR 推理 provider 由运行时 DLL 探测决定（"cuda" 时 sherpa-onnx 会让
+//!   onnxruntime.dll 动态加载外置的 onnxruntime_providers_cuda.dll）；
+//! - provider=cuda 创建失败时自动回退 cpu 重试（例如用户只装了 CPU 版 ORT）；
+//! - 转录循环接受 `hook` 回调：每识别出一句立即回调（供逐句 LLM 质检），
+//!   回调返回 false 的句子不会进入结果集。
+
 use crate::ffmpeg::SAMPLE_RATE;
 use crate::srt::format_timestamp;
 use crate::types::SubtitleSegment;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use log::info;
+use log::{info, warn};
 use sherpa_onnx::{
     OfflineModelConfig, OfflineQwen3ASRModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
@@ -11,21 +20,32 @@ use sherpa_onnx::{
 use std::io::Read;
 use std::path::Path;
 
+pub struct AsrOptions {
+    /// onnxruntime provider："cpu" 或 "cuda"
+    pub provider: String,
+    /// ASR CPU 推理线程数
+    pub num_threads: i32,
+}
+
 pub struct AsrEngine {
     vad: VoiceActivityDetector,
     recognizer: OfflineRecognizer,
+    provider: String,
 }
 
+/// Silero VAD 每帧采样点数（16kHz 下 32ms）
+const VAD_WINDOW: usize = 512;
+
 impl AsrEngine {
-    pub fn new(asr_model_dir: &Path, vad_model: &Path) -> Result<Self> {
-        // 1. 初始化 VAD (Silero)
+    pub fn new(asr_model_dir: &Path, vad_model: &Path, opts: &AsrOptions) -> Result<Self> {
+        // ---- 1. VAD（模型极小，固定 CPU 即可）----
         let mut vad_config = VadModelConfig::default();
         vad_config.silero_vad = SileroVadModelConfig {
             model: Some(vad_model.to_string_lossy().into()),
             threshold: 0.5,
             min_silence_duration: 0.5,
             min_speech_duration: 0.25,
-            window_size: 512, // 16kHz 下 32ms
+            window_size: VAD_WINDOW as i32,
             ..Default::default()
         };
         vad_config.sample_rate = SAMPLE_RATE;
@@ -34,7 +54,45 @@ impl AsrEngine {
         let vad = VoiceActivityDetector::create(&vad_config, 60.0)
             .context("初始化 VAD 失败，请检查 silero_vad.onnx 路径")?;
 
-        // 2. 初始化 ASR (Qwen3-ASR)
+        // ---- 2. Qwen3-ASR 识别器 ----
+        let recognizer = match OfflineRecognizer::create(&Self::recognizer_config(
+            asr_model_dir,
+            &opts.provider,
+            opts.num_threads,
+        )) {
+            Some(r) => {
+                info!("ASR 识别器已创建，provider = {}", opts.provider);
+                (r, opts.provider.clone())
+            }
+            None if opts.provider == "cuda" => {
+                warn!(
+                    "CUDA provider 创建 ASR 失败（外置 onnxruntime CUDA DLL 可能不完整），自动回退 CPU…"
+                );
+                let r = OfflineRecognizer::create(&Self::recognizer_config(
+                    asr_model_dir,
+                    "cpu",
+                    opts.num_threads,
+                ))
+                .context("初始化 ASR 识别器失败（CPU 回退亦失败），请检查模型目录结构")?;
+                (r, "cpu".to_string())
+            }
+            None => {
+                anyhow::bail!("初始化 ASR 识别器失败，请检查模型目录结构: {:?}", asr_model_dir)
+            }
+        };
+
+        Ok(Self {
+            vad,
+            recognizer: recognizer.0,
+            provider: recognizer.1,
+        })
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    fn recognizer_config(asr_model_dir: &Path, provider: &str, num_threads: i32) -> OfflineRecognizerConfig {
         let mut model_config = OfflineModelConfig::default();
         model_config.qwen3_asr = OfflineQwen3ASRModelConfig {
             conv_frontend: Some(format!("{}/conv_frontend.onnx", asr_model_dir.display()).into()),
@@ -43,23 +101,31 @@ impl AsrEngine {
             tokenizer: Some(format!("{}/tokenizer", asr_model_dir.display()).into()),
             ..Default::default()
         };
-        model_config.num_threads = 4;
+        model_config.num_threads = num_threads;
+        model_config.provider = Some(provider.to_string());
 
         let mut config = OfflineRecognizerConfig::default();
         config.model_config = model_config;
         config.decoding_method = Some("greedy_search".into());
-
-        let recognizer = OfflineRecognizer::create(&config)
-            .context("初始化 ASR 识别器失败，请检查模型目录结构")?;
-
-        Ok(Self { vad, recognizer })
+        config
     }
 
-    /// 从 FFmpeg stdout 流式读取 f32le 音频，进行 VAD 切片与 ASR 识别
-    pub fn transcribe_stream<R: Read>(&mut self, mut reader: R, total_duration_secs: f64) -> Result<Vec<SubtitleSegment>> {
+    /// 从 FFmpeg stdout 流式读取 f32le 音频，VAD 切片 -> ASR -> 逐句回调 hook。
+    ///
+    /// `hook(&mut seg)` 返回 true 表示该句保留（文本可能已被 hook 纠正），
+    /// 返回 false 表示丢弃。保留的句子才会获得最终 index。
+    pub fn transcribe_stream<R, F>(
+        &mut self,
+        mut reader: R,
+        total_duration_secs: f64,
+        hook: &mut F,
+    ) -> Result<Vec<SubtitleSegment>>
+    where
+        R: Read,
+        F: FnMut(&mut SubtitleSegment) -> bool,
+    {
         let mut segments: Vec<SubtitleSegment> = Vec::new();
-        
-        // 进度条设置
+
         let pb = if total_duration_secs > 0.0 {
             let pb = ProgressBar::new(total_duration_secs as u64);
             pb.set_style(
@@ -73,19 +139,22 @@ impl AsrEngine {
             ProgressBar::new_spinner()
         };
 
-        let mut audio_buf: Vec<u8> = Vec::with_capacity(8192);
-        let mut read_buf = [0u8; 4096]; // 每次读取 4KB
-        let mut total_bytes_read: usize = 0;
+        let mut pending: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize);
+        let mut read_buf = [0u8; 8192];
+        let mut total_bytes_read: u64 = 0;
 
         loop {
             let n = reader.read(&mut read_buf).context("读取 FFmpeg 音频流失败")?;
             if n == 0 {
                 break; // EOF
             }
-            audio_buf.extend_from_slice(&read_buf[..n]);
-            total_bytes_read += n;
+            total_bytes_read += n as u64;
 
-            // 更新进度条 (基于已读取的字节数计算时间)
+            // f32le 字节 -> 采样点
+            for chunk in read_buf[..n].chunks_exact(4) {
+                pending.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+
             let current_sec = (total_bytes_read / 4) as f64 / SAMPLE_RATE as f64;
             if total_duration_secs > 0.0 {
                 pb.set_position(current_sec as u64);
@@ -94,85 +163,75 @@ impl AsrEngine {
                 pb.tick();
             }
 
-            // Silero VAD 要求每次输入精确的 512 个采样点 (2048 bytes)
-            while audio_buf.len() >= 2048 {
-                let chunk_bytes: Vec<u8> = audio_buf.drain(..2048).collect();
-                let samples: Vec<f32> = chunk_bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-
-                self.vad.accept_waveform(&samples);
-
-                // 处理 VAD 切出的完整语音段
-                while !self.vad.is_empty() {
-                    if let Some(segment) = self.vad.front() {
-                        let seg_samples = segment.samples();
-                        let start_sample = segment.start();
-
-                        if !seg_samples.is_empty() {
-                            let stream = self.recognizer.create_stream();
-                            stream.accept_waveform(SAMPLE_RATE, seg_samples);
-                            self.recognizer.decode(&stream);
-
-                            if let Some(result) = stream.get_result() {
-                                let text = result.text.trim();
-                                if !text.is_empty() {
-                                    let start_ms = (start_sample as u64 * 1000) / SAMPLE_RATE as u64;
-                                    let dur_ms = (seg_samples.len() as u64 * 1000) / SAMPLE_RATE as u64;
-                                    let end_ms = start_ms + dur_ms;
-
-                                    let seg = SubtitleSegment {
-                                        index: segments.len() + 1,
-                                        start_ms,
-                                        end_ms,
-                                        text: text.to_string(),
-                                    };
-                                    
-                                    // 实时打印转录结果
-                                    info!("[ASR] {} -> {}", format_timestamp(seg.start_ms), seg.text);
-                                    segments.push(seg);
-                                }
-                            }
-                        }
-                    }
-                    self.vad.pop();
-                }
+            // Silero VAD 要求每次输入精确的 512 个采样点
+            let mut cursor = 0;
+            while pending.len() - cursor >= VAD_WINDOW {
+                self.vad.accept_waveform(&pending[cursor..cursor + VAD_WINDOW]);
+                cursor += VAD_WINDOW;
+                self.drain_vad(&mut segments, hook);
+            }
+            if cursor > 0 {
+                pending.drain(..cursor);
             }
         }
 
         // 冲刷 VAD 缓冲区尾部
         self.vad.flush();
-        while !self.vad.is_empty() {
-            if let Some(segment) = self.vad.front() {
-                let seg_samples = segment.samples();
-                let start_sample = segment.start();
-                if !seg_samples.is_empty() {
-                    let stream = self.recognizer.create_stream();
-                    stream.accept_waveform(SAMPLE_RATE, seg_samples);
-                    self.recognizer.decode(&stream);
-                    if let Some(result) = stream.get_result() {
-                        let text = result.text.trim();
-                        if !text.is_empty() {
-                            let start_ms = (start_sample as u64 * 1000) / SAMPLE_RATE as u64;
-                            let dur_ms = (seg_samples.len() as u64 * 1000) / SAMPLE_RATE as u64;
-                            let seg = SubtitleSegment {
-                                index: segments.len() + 1,
-                                start_ms,
-                                end_ms: start_ms + dur_ms,
-                                text: text.to_string(),
-                            };
-                            info!("[ASR] {} -> {}", format_timestamp(seg.start_ms), seg.text);
-                            segments.push(seg);
-                        }
-                    }
-                }
-            }
-            self.vad.pop();
-        }
+        self.drain_vad(&mut segments, hook);
 
         pb.finish_with_message("转录完成");
-        info!("ASR 流程结束，共识别 {} 条字幕。", segments.len());
+        info!("ASR 流程结束，最终保留 {} 条字幕。", segments.len());
         Ok(segments)
+    }
+
+    /// 取出 VAD 已完成切分的所有语音段，逐段 ASR 并交给 hook 质检。
+    fn drain_vad<F>(&mut self, segments: &mut Vec<SubtitleSegment>, hook: &mut F)
+    where
+        F: FnMut(&mut SubtitleSegment) -> bool,
+    {
+        while !self.vad.is_empty() {
+            let (text, start_ms, end_ms) = {
+                let segment = match self.vad.front() {
+                    Some(s) => s,
+                    None => break,
+                };
+                let samples = segment.samples();
+                let start_sample = segment.start();
+                if samples.is_empty() {
+                    self.vad.pop();
+                    continue;
+                }
+                let text = self.recognize(samples);
+                let start_ms = (start_sample as u64 * 1000) / SAMPLE_RATE as u64;
+                let dur_ms = (samples.len() as u64 * 1000) / SAMPLE_RATE as u64;
+                (text, start_ms, start_ms + dur_ms)
+            };
+            self.vad.pop();
+
+            let Some(text) = text else { continue };
+
+            let mut seg = SubtitleSegment {
+                index: 0, // 通过质检后才分配最终序号
+                start_ms,
+                end_ms,
+                text,
+            };
+
+            if hook(&mut seg) {
+                seg.index = segments.len() + 1;
+                info!("[ASR✔] {} -> {}", format_timestamp(seg.start_ms), seg.text);
+                segments.push(seg);
+            }
+        }
+    }
+
+    fn recognize(&self, samples: &[f32]) -> Option<String> {
+        let stream = self.recognizer.create_stream();
+        stream.accept_waveform(SAMPLE_RATE, samples);
+        self.recognizer.decode(&stream);
+        stream
+            .get_result()
+            .map(|r| r.text.trim().to_string())
+            .filter(|t| !t.is_empty())
     }
 }

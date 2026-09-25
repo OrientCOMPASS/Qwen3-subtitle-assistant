@@ -1,8 +1,9 @@
 [package]
 name = "subtitle-assistant"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "本地离线字幕转录与翻译助手"
+description = "本地离线字幕转录与翻译助手（外置 DLL 运行时，支持 CUDA 加速与逐句 LLM 质检）"
+license = "Unlicense"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -12,14 +13,41 @@ serde_json = "1.0"
 log = "0.4"
 env_logger = "0.11"
 indicatif = "0.17"
-sherpa-onnx = "1.13.6"
-llama-cpp-2 = { version = "0.1.154", features = ["sampler"] }
-# 新增：引入底层 C 绑定，用于屏蔽 llama.cpp 的原生日志
-llama-cpp-sys-2 = "0.1.154"
+# llama-cpp-2 0.1.157 的 token_to_piece 增量解码需要
 encoding_rs = "0.8"
-rand = "0.8"
+
+# ============================================================================
+# 关键设计：两个原生依赖全部使用【动态链接】。
+#
+# - 彻底规避旧版 sherpa-onnx(/MT 静态 CRT) + llama-cpp(/MD 动态 CRT) 混链时的
+#   LNK2038 / LNK2005 冲突：所有 C/C++ 运行时都被隔离在各自的 DLL 内部。
+# - 编译机（含 GitHub Actions runner）不再需要安装 CUDA Toolkit：
+#   CUDA 加速由运行时的外置 DLL（ggml-cuda.dll / onnxruntime_providers_cuda.dll
+#   + cudart/cublas/cudnn）提供，ggml 与 ONNX Runtime 会在进程内动态加载它们。
+# - 构建脚本会自动下载预编译库：
+#   * sherpa-onnx-sys  -> github.com/k2-fsa/sherpa-onnx releases (shared 包)
+#   * llama-cpp-sys-2  -> 本地 CMake 构建（仅需 MSVC + CMake + LLVM/libclang）
+#
+# 版本用 "=" 精确锁定：这两个 crate 的 ABI 与运行时 DLL 强绑定，
+# 升级时必须同步更新 CI 中下载的 DLL 版本（见 scripts/package_dist.py）。
+# ============================================================================
+sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["shared"] }
+llama-cpp-2 = { version = "=0.1.157", default-features = false, features = [
+    "dynamic-link",     # 生成并链接 llama.dll / ggml*.dll（而非静态库）
+    "dynamic-backends", # ggml 后端做成运行时模块，从 exe 目录自动发现 ggml-cuda.dll 等
+    "openmp",
+] }
+
+[features]
+default = []
+# 本地开发者若装有 CUDA Toolkit，想自己编译 CUDA 版 ggml-cuda.dll，可启用：
+#   cargo build --release --features cuda-build
+# CI 发布包不使用该特性（直接使用 llama.cpp 官方发布的 CUDA DLL）。
+cuda-build = ["llama-cpp-2/cuda"]
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 strip = true
+debug = false
+incremental = false
