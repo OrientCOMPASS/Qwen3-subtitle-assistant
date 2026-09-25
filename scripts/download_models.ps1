@@ -46,7 +46,7 @@ if (Test-Path (Join-Path $asrDir "encoder.int8.onnx")) {
 } else {
     $asrTar = Join-Path $tmp "sherpa-onnx-qwen3-asr-0.6B-int8.tar.bz2"
     Get-File "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2" $asrTar
-    Write-Host "解压 ASR 模型（约 230MB）..."
+    Write-Host "解压 ASR 模型（压缩包约 880MB，解压后约 1.1GB）..."
     tar -xf $asrTar -C $tmp
     $extracted = Join-Path $tmp "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
     if (-not (Test-Path $extracted)) { throw "解压后未找到预期目录: $extracted" }
