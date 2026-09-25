@@ -1,0 +1,170 @@
+# ============================================================================
+# 端到端真实测试：yt-dlp 拉取视频 -> Qwen3-ASR 转录 -> 逐句 LLM 质检 -> 翻译
+# 产物（.srt/.raw.srt/.verified.srt + 完整日志）作为 artifact 上传供人工评估。
+#
+# 触发方式：
+#   1. workflow_dispatch（可自定义视频 URL）
+#   2. 推送 e2e-* tag（使用内置默认视频）
+#
+# 说明：
+#   - GitHub runner 无 GPU，运行时探测会自动落到 CPU 后端（这同时验证了
+#     auto 探测与回退链路）；
+#   - YouTube 对数据中心 IP 风控较严：yt-dlp 依次尝试多个 player_client，
+#     全部失败则回退到 HF 镜像仓库自带的测试音频，保证管线必然被验证；
+#   - 模型（~2.1GB）使用 actions/cache 固定 key 缓存，命中后跳过下载。
+# ============================================================================
+name: e2e-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "视频 URL（留空使用默认：Me at the zoo, 19s）"
+        required: false
+        default: ""
+  push:
+    tags: ["e2e-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_LOG: info
+
+jobs:
+  transcribe:
+    name: YouTube 转录翻译端到端测试
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ensure libclang (bindgen)
+        shell: pwsh
+        run: |
+          $candidates = @("$env:ProgramFiles\LLVM\bin", "${env:ChocolateyInstall}\lib\llvm\tools\LLVM\bin")
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          if (-not $found) {
+            choco install llvm --no-progress -y | Out-Null
+            $found = "$env:ProgramFiles\LLVM\bin"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$found"
+
+      - name: Build exe (dynamic-link, CPU)
+        run: cargo build --release --locked
+
+      # ---------------- 模型（缓存） ----------------
+      - name: Cache models (~2.1GB)
+        id: models-cache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: qwen3-models-asr-int8-vad-llm-q8-v1
+
+      - name: Download models (cache miss)
+        if: steps.models-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $asrBase = "https://huggingface.co/jkman2023/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main"
+          $asrDir  = "models/sherpa-onnx-qwen3-asr-0.6B-int8"
+          New-Item -ItemType Directory -Force -Path "$asrDir/tokenizer" | Out-Null
+          $asrFiles = @(
+            "conv_frontend.onnx", "encoder.int8.onnx", "decoder.int8.onnx",
+            "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json"
+          )
+          foreach ($f in $asrFiles) {
+            Write-Host "downloading $f ..."
+            curl.exe -sSL --fail --retry 3 --retry-delay 3 -o "$asrDir/$f" "$asrBase/$f"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $f" }
+          }
+          curl.exe -sSL --fail --retry 3 -o "models/silero_vad.onnx" "$asrBase/silero_vad.onnx"
+          if ($LASTEXITCODE -ne 0) { throw "download failed: silero_vad.onnx" }
+
+          New-Item -ItemType Directory -Force -Path "models/Qwen3-1.7B-GGUF" | Out-Null
+          Write-Host "downloading Qwen3-1.7B-Q8_0.gguf (~1.8GB) ..."
+          curl.exe -sSL --fail --retry 3 --retry-delay 5 -o "models/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf" `
+            "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf"
+          if ($LASTEXITCODE -ne 0) { throw "download failed: Qwen3-1.7B-Q8_0.gguf" }
+          Get-ChildItem -Recurse models | Select-Object FullName, Length
+
+      # ---------------- 测试媒体 ----------------
+      - name: Fetch test media (yt-dlp with fallbacks)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          pip install --quiet --upgrade yt-dlp
+          New-Item -ItemType Directory -Force -Path media | Out-Null
+
+          $url = "${{ github.event.inputs.video_url }}"
+          if (-not $url) { $url = "https://www.youtube.com/watch?v=jNQXAC9IVRw" }  # Me at the zoo (19s)
+          Write-Host "target url: $url"
+          "url=$url" | Out-File -FilePath media/source.txt -Encoding utf8
+
+          $ok = $false
+          if ($url -match "youtube\.com|youtu\.be") {
+            foreach ($client in @("tv_simply", "tv", "web_safari", "android_vr", "web")) {
+              Write-Host "--- trying player_client=$client ---"
+              yt-dlp --no-warnings --extractor-args "youtube:player_client=$client" `
+                -f "bestaudio/best" -o "media/source.%(ext)s" $url 2>&1 | Tee-Object -FilePath media/ytdlp.log -Append
+              $got = Get-ChildItem media/source.* -Exclude *.txt,*.log -ErrorAction SilentlyContinue
+              if ($LASTEXITCODE -eq 0 -and $got) { $ok = $true; "client=$client" | Out-File media/source.txt -Append -Encoding utf8; break }
+              Get-ChildItem media -Exclude source.txt, ytdlp.log -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            }
+          } else {
+            curl.exe -sSL --fail --retry 2 -o media/source.media $url
+            if ($LASTEXITCODE -eq 0) { $ok = $true }
+          }
+
+          if (-not $ok) {
+            Write-Warning "YouTube 拉取失败（数据中心 IP 风控），回退到 HF 镜像仓库测试音频"
+            "fallback=hf-test-wav" | Out-File media/source.txt -Append -Encoding utf8
+            curl.exe -sSL --fail -o media/source.wav `
+              "https://huggingface.co/jkman2023/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/test_wavs/ja1.wav"
+            if ($LASTEXITCODE -ne 0) { throw "fallback media download failed" }
+          }
+          Get-ChildItem media | Select-Object Name, Length
+
+      # ---------------- 运行完整管线 ----------------
+      - name: Run ASR + QC + Translate pipeline
+        shell: pwsh
+        run: |
+          $media = Get-ChildItem media/source.* -Exclude *.txt,*.log | Select-Object -First 1
+          if (-not $media) { throw "no media file found" }
+          Write-Host "processing: $($media.FullName)"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 $media.FullName
+          & ./target/release/subtitle-assistant.exe $media.FullName 2>&1 | Tee-Object -FilePath media/run.log
+          $code = $LASTEXITCODE
+          Write-Host "exit code: $code"
+          Get-ChildItem media | Select-Object Name, Length
+          exit $code
+
+      - name: Show results
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($f in @("media/*.raw.srt", "media/*.verified.srt", "media/*.srt")) {
+            $items = Get-ChildItem $f -ErrorAction SilentlyContinue
+            foreach ($i in $items) {
+              Write-Host "`n========== $($i.Name) =========="
+              Get-Content $i.FullName -Encoding UTF8
+            }
+          }
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: |
+            media/*.srt
+            media/run.log
+            media/ytdlp.log
+            media/source.txt
+          if-no-files-found: warn
