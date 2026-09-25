@@ -3,7 +3,7 @@
 #
 # 媒体源级联：
 #   1. workflow_dispatch 指定 URL（YouTube 用 yt-dlp，其他直链用 curl）
-#   2. 默认：多语言测试矩阵（HF 镜像仓库 test_wavs：日/德/法/中英混说/纯噪音）
+#   2. 默认：多语言测试矩阵（quick=日/德/噪音；dispatch 可选 full=+法/中英混说）
 #      —— 噪音样本用于验证 QC 的 drop 判决；transcript.txt 提供参考文本
 #   注：YouTube 与 bilibili 对 GitHub runner（数据中心 IP）均有风控
 #   （YouTube: "Sign in to confirm you're not a bot"；bilibili: HTTP 412），
@@ -27,9 +27,17 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "视频 URL（留空使用默认：Me at the zoo, 19s）"
+        description: "视频 URL（留空跑多语言测试矩阵）"
         required: false
         default: ""
+      matrix:
+        description: "测试矩阵规模（video_url 留空时生效）"
+        required: false
+        default: "quick"
+        type: choice
+        options:
+          - quick   # ja + de + noise2（约 10 分钟推理）
+          - full    # ja + de + fr + codeswitch + noise2（约 18 分钟推理）
   push:
     tags: ["e2e-*"]
 
@@ -177,10 +185,13 @@ jobs:
             # 默认/回退：HF 镜像 test_wavs 多语言矩阵（已随模型缓存）
             "matrix=hf-test-wavs(ja,de,fr,codeswitch,noise)" | Out-File media/source.txt -Append -Encoding utf8
             $wavs = "models/sherpa-onnx-qwen3-asr-0.6B-int8/test_wavs"
-            foreach ($w in @("ja1.wav","de.wav","fr1.wav","codeswitch.wav","noise2.wav")) {
+            $mode = "${{ github.event.inputs.matrix }}"
+            if (-not $mode) { $mode = "quick" }
+            $need = if ($mode -eq "full") { @("ja1.wav","de.wav","fr1.wav","codeswitch.wav","noise2.wav") } else { @("ja1.wav","de.wav","noise2.wav") }
+            foreach ($w in $need) {
               if (-not (Test-Path "$wavs/$w")) { throw "missing $wavs/$w (模型缓存不完整?)" }
             }
-            Write-Host "使用多语言测试矩阵: ja/de/fr/codeswitch/noise2"
+            Write-Host "使用测试矩阵 [$mode]: $($need -join ', ')"
           }
           Get-ChildItem media -ErrorAction SilentlyContinue | Select-Object Name, Length
 
@@ -194,7 +205,10 @@ jobs:
             $targets = $explicit.FullName
           } else {
             $wavs = "models/sherpa-onnx-qwen3-asr-0.6B-int8/test_wavs"
-            $targets = @("ja1.wav","de.wav","fr1.wav","codeswitch.wav","noise2.wav") | ForEach-Object { (Resolve-Path "$wavs/$_").Path }
+            $mode = "${{ github.event.inputs.matrix }}"
+            if (-not $mode) { $mode = "quick" }
+            $list = if ($mode -eq "full") { @("ja1.wav","de.wav","fr1.wav","codeswitch.wav","noise2.wav") } else { @("ja1.wav","de.wav","noise2.wav") }
+            $targets = $list | ForEach-Object { (Resolve-Path "$wavs/$_").Path }
             # 拷贝到 media/ 下运行，产物集中（exe 在输入文件同目录写 .srt）
             foreach ($t in $targets) { Copy-Item $t media/ }
             $targets = $targets | ForEach-Object { "media/" + (Split-Path $_ -Leaf) }

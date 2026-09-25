@@ -217,6 +217,16 @@ exe 与外置 DLL 的二进制兼容性依赖版本对齐，`Cargo.toml` 因此*
   win-cuda-12.4 / cudart 包、sherpa-onnx v1.13.8 CPU 与 CUDA 包、NVIDIA PyPI cuDNN 9.1.1
   wheel），组装 CPU 与 CUDA12 两个发行包，附 `SHA256SUMS.txt`。
 - 下载物有 `actions/cache` 缓存，重复构建免重下 ~1.5 GB。
+- **push master / PR 只编译+冒烟**（~10 分钟快速反馈），tag `v*` 或手动 dispatch 才组装发行包。
+
+`.github/workflows/e2e-test.yml`（端到端真实测试）：
+
+- **触发**：推送 `e2e-*` tag，或手动 dispatch（可指定任意视频/音频直链 URL、选择 quick/full 矩阵）。
+- **多语言矩阵**：日/德/(法/中英混说)/噪音样本，来自 HF 镜像仓库 `test_wavs/`，随模型缓存。
+- **实测记录**（windows-latest，CPU 推理）：五语言全部通过；噪音样本正确触发 QC 三态判决
+  （2 句丢弃、1 句纠正幻觉前缀、1 句保留真实人声）；QC 提示词加 `/no_think` 后 JSON 首轮命中率 100%。
+- YouTube（"Sign in to confirm you're not a bot"）与 bilibili（海外数据中心 IP 得 HTTP 412）均对
+  GitHub runner 风控，故默认矩阵使用 HF 测试音频；dispatch 传入可访问的直链 URL 亦可测试真实视频。
 
 发布新版本：
 
