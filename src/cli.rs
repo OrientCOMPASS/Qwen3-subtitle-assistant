@@ -122,9 +122,14 @@ pub struct Args {
     pub qc_min_similarity: f32,
 
     // ---------------- 翻译与排版 ----------------
-    /// 每批翻译的字幕条数（prompt 超预算时会自动对半拆分）
+    /// 每批翻译的字幕条数上限（prompt 超预算或译文照抄时会自动对半拆分）
     #[arg(long, default_value_t = 20)]
     pub batch_size: usize,
+
+    /// 每批翻译的原文字符预算。只按条数切批时，20 条长句会让小模型输出退化
+    /// （实测直接照抄原文），字符预算让批次规模与实际内容量挂钩。
+    #[arg(long, default_value_t = 1200)]
+    pub batch_chars: usize,
 
     /// 翻译滑动窗口携带的上文字幕条数
     #[arg(long, default_value_t = 4)]

@@ -15,6 +15,7 @@ pub struct Config {
     pub target_lang: String,
     pub source_lang: String,
     pub batch_size: usize,
+    pub batch_chars: usize,
     pub context_size: usize,
     pub max_retries: usize,
     pub temperature: f32,
@@ -85,6 +86,7 @@ impl Config {
         let prefill_batch = clamp_warn(args.prefill_batch, 64, ctx_size, "--prefill-batch", 2048)
             .min(ctx_size);
         let batch_size = clamp_warn(args.batch_size, 1, usize::MAX, "--batch-size", 1);
+        let batch_chars = clamp_warn(args.batch_chars, 64, usize::MAX, "--batch-chars", 1200);
         let qc_context = clamp_warn(args.qc_context, 1, usize::MAX, "--qc-context", 1);
         let max_cue_secs = if args.max_cue_secs < 0.0 {
             warn!("--max-cue-secs 为负，已按 0（不拆分）处理");
@@ -109,6 +111,7 @@ impl Config {
             target_lang: args.target_lang.clone(),
             source_lang: args.source_lang.clone(),
             batch_size,
+            batch_chars,
             context_size: args.context_size,
             max_retries: args.max_retries.max(1),
             temperature: args.temperature.max(0.0),
@@ -343,6 +346,7 @@ mod tests {
             qc_max_tokens: 128,
             qc_min_similarity: 0.3,
             batch_size: 5,
+            batch_chars: 200,
             context_size: 2,
             target_lang: "简体中文".into(),
             source_lang: "日语".into(),

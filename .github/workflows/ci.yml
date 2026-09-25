@@ -427,6 +427,7 @@ jobs:
           python scripts/check_e2e.py --name T2a-长prompt --srt media/long_lines_ja.translated.srt `
             --log media/t2a.log --min-cues 80 --target-lang zh `
             --max-cue-secs 9 --max-line-width 44 --max-untranslated 5 `
+            --max-kana-ratio 0.12 --max-foreign-cues 3 `
             --expect-log-contains "分块 prefill"
           if ($LASTEXITCODE -ne 0) { throw "T2a 断言失败" }
 
@@ -448,7 +449,8 @@ jobs:
         run: |
           python scripts/check_e2e.py --name T2b-摘要分块 --srt media/short40_ja.translated.srt `
             --log media/t2b.log --min-cues 40 --target-lang zh `
-            --max-cue-secs 9 --max-line-width 44 --min-summary-chunks 2 --max-untranslated 3
+            --max-cue-secs 9 --max-line-width 44 --min-summary-chunks 2 --max-untranslated 3 `
+            --max-kana-ratio 0.12 --max-foreign-cues 2
           if ($LASTEXITCODE -ne 0) { throw "T2b 断言失败" }
 
       # T3：迁移目录回归（拖拽/快捷方式启动路径）。exe+DLL+prompts 拷到 TEMP，
@@ -516,7 +518,7 @@ jobs:
           Get-Content $srt -Encoding UTF8 | Select-Object -First 60
           python scripts/check_e2e.py --name T1-真实视频 --srt $srt --log media/t1.log `
             --min-cues 8 --target-lang zh --max-cue-secs 15 --max-line-width 44 `
-            --expect-qc --max-untranslated 5
+            --expect-qc --max-untranslated 5 --max-kana-ratio 0.08 --max-foreign-cues 2
           if ($LASTEXITCODE -ne 0) { throw "T1 断言失败" }
 
       - name: Upload e2e results

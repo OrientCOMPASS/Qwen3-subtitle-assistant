@@ -249,10 +249,33 @@ pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64) -> Vec<SubtitleS
         groups.push(cur.trim().to_string());
     }
     groups.retain(|g| !g.is_empty());
-    if groups.len() <= 1 {
+
+    // 兜住不变式：单个"句子"本身就很长时（标点稀疏），贪心分组会把它整段收下，
+    // 产出的 cue 仍然超过 max_cue_secs。这里对超长的组再按字符均分硬切一次，
+    // 保证"每条 cue 的时长 <= ~max_cue_secs"这个对外承诺成立。
+    let mut final_groups: Vec<String> = Vec::with_capacity(groups.len());
+    for g in groups {
+        let n = g.chars().count();
+        let g_secs = n as f64 / total_chars * dur;
+        if g_secs <= max_cue_secs || n < 2 {
+            final_groups.push(g);
+            continue;
+        }
+        let parts = (g_secs / max_cue_secs).ceil().max(2.0) as usize;
+        let chars: Vec<char> = g.chars().collect();
+        let per = (chars.len() / parts).max(1);
+        for chunk in chars.chunks(per) {
+            let piece: String = chunk.iter().collect();
+            let piece = piece.trim().to_string();
+            if !piece.is_empty() {
+                final_groups.push(piece);
+            }
+        }
+    }
+    if final_groups.len() <= 1 {
         return vec![seg.clone()];
     }
-    distribute(seg, &groups)
+    distribute(seg, &final_groups)
 }
 
 /// 按各组字符数占比分配时间区间（保证单调递增、无缝隙）。
@@ -430,6 +453,37 @@ mod tests {
         // 文本无丢失
         let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
         assert_eq!(joined.replace(' ', ""), text);
+    }
+
+    #[test]
+    fn split_enforces_max_duration_even_with_sparse_punctuation() {
+        // 一整句 60 秒、中间只有一个逗号：贪心分组会把超长单句整段收下，
+        // 必须靠均分兜底，否则"每条 cue <= max_cue_secs"的承诺就不成立。
+        let text = format!("{}，{}", "あ".repeat(60), "い".repeat(60));
+        let s = seg(0, 60_000, &text);
+        let parts = split_long_cue(&s, 7.0);
+        assert!(parts.len() >= 8, "应被切成足够多条: {}", parts.len());
+        for p in &parts {
+            assert!(
+                p.duration_secs() <= 8.0,
+                "仍有超长 cue: {:.1}s",
+                p.duration_secs()
+            );
+        }
+        // 时间轴连续覆盖原区间，文本无丢失
+        assert_eq!(parts[0].start_ms, 0);
+        assert_eq!(parts.last().unwrap().end_ms, 60_000);
+        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined.replace(' ', ""), text.replace(' ', ""));
+    }
+
+    #[test]
+    fn split_handles_text_without_any_punctuation() {
+        let text = "あ".repeat(200);
+        let s = seg(0, 40_000, &text);
+        let parts = split_long_cue(&s, 7.0);
+        assert!(parts.len() >= 5, "{}", parts.len());
+        assert!(parts.iter().all(|p| p.duration_secs() <= 8.5));
     }
 
     #[test]

@@ -125,6 +125,9 @@ def main() -> int:
     ap.add_argument("--min-summary-chunks", type=int, default=0)
     ap.add_argument("--max-untranslated", type=int, default=0)
     ap.add_argument("--max-kana-ratio", type=float, default=0.03)
+    ap.add_argument("--max-foreign-cues", type=int, default=-1,
+                    help="允许「基本没翻译」的 cue 条数（该 cue 假名占比 > 40%%）；-1=不检查。"
+                         "比全局假名占比更准：专有名词保留原文不会被误判，整批照抄则一定被抓到")
     ap.add_argument("--expect-log-contains", action="append", default=[],
                     help="日志中必须出现的字样（可多次），用于验证某条代码路径确实被走到")
     args = ap.parse_args()
@@ -168,6 +171,12 @@ def main() -> int:
     check(all(c["end"] > c["start"] for c in cues), "所有 cue 的 end > start")
     overlaps = sum(1 for a, b in zip(cues, cues[1:]) if b["start"] < a["end"] - 1)
     check(overlaps == 0, f"相邻 cue 无重叠（重叠 {overlaps} 处）")
+
+    if args.target_lang == "zh" and args.max_foreign_cues >= 0:
+        foreign = [c for c in cues if script_ratio(c["text"])["kana"] > 0.40]
+        check(len(foreign) <= args.max_foreign_cues,
+              f"未翻译的 cue {len(foreign)} 条 <= {args.max_foreign_cues}"
+              + (f"（例: {foreign[0]['text'][:40]}…）" if foreign else ""))
 
     if args.target_lang == "zh":
         check(ratios["kana"] <= args.max_kana_ratio,

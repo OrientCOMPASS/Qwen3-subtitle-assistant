@@ -194,6 +194,8 @@ pub struct TranslateStats {
     pub failed_batches: usize,
     /// 模型漏条/重编号，靠位置兜底救回的条数
     pub positional: usize,
+    /// 译文与原文几乎相同（照抄未翻译）的条数
+    pub copied: usize,
     /// 最终使用原文（未翻译）的条数
     pub untranslated: usize,
     /// 全局摘要被切成的块数（1 = 未触发分块）
@@ -205,13 +207,14 @@ pub struct TranslateStats {
 impl TranslateStats {
     pub fn summary(&self) -> String {
         format!(
-            "翻译 {} 条 / {} 批：重试 {}，拆分 {}，整批失败 {}，位置兜底 {}，回退原文 {}，摘要分块 {}",
+            "翻译 {} 条 / {} 批：重试 {}，拆分 {}，整批失败 {}，位置兜底 {}，照抄 {}，未翻译 {}，摘要分块 {}",
             self.segments,
             self.batches,
             self.retries,
             self.splits,
             self.failed_batches,
             self.positional,
+            self.copied,
             self.untranslated,
             self.summary_chunks
         )
