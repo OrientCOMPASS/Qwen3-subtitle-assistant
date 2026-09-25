@@ -56,6 +56,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   RUST_LOG: info
+  # runner 控制台默认 cp1252：python 输出中文会抛 UnicodeEncodeError（实测踩过），
+  # 统一强制 UTF-8 模式。
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
   # e2e 真实测试媒体：bilibili 上的日语视频（1~5 分钟），按顺序尝试，第一个可用即用。
   # 换视频只需改这里；下载结果进 actions/cache，后续运行不再访问 bilibili。
   E2E_BVIDS: "BV16r421g797 BV1ccdQY8Ee8 BV1No4y117UC BV1jT42167f3"
@@ -234,7 +238,7 @@ jobs:
               print(('OK  ' if ok else 'FAIL'), f'{name:<28}', where)
               if not ok and not name.lower().startswith(SYS):
                   bad.append(name)
-          print('非系统导入项加载失败:', bad or '无')
+          print('non-system import load failures:', bad or 'none')
           raise SystemExit(1 if bad else 0)
           "@
           if ($LASTEXITCODE -ne 0) { throw "导入项加载验证失败（见上方 FAIL 行）" }
@@ -280,9 +284,9 @@ jobs:
       - name: Console UTF-8
         shell: pwsh
         run: |
-          Add-Content -Path $env:GITHUB_ENV -Value "PYTHONIOENCODING=utf-8"
           chcp 65001 | Out-Null
           [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          Write-Host "PYTHONUTF8=$env:PYTHONUTF8 PYTHONIOENCODING=$env:PYTHONIOENCODING"
 
       - name: Install ffmpeg / ffprobe
         shell: pwsh

@@ -106,6 +106,13 @@ def log_stats(log_text: str) -> dict:
 
 
 def main() -> int:
+    # Windows 控制台默认 cp1252：中文断言输出会抛 UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
     ap.add_argument("--srt", required=True)
