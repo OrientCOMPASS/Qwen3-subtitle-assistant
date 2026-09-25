@@ -44,6 +44,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # 见 build.yml 注释：target/ 不入缓存，避免 sherpa-onnx-prebuilt 缺失导致 LNK1181
+          cache-targets: false
+          cache-on-failure: true
 
       - name: Ensure libclang (bindgen)
         shell: pwsh

@@ -45,6 +45,11 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
+          # target/ 不入缓存：sherpa-onnx-sys 把预编译库解到 target/sherpa-onnx-prebuilt/，
+          # 该目录不在 rust-cache 的保存范围内，但 fingerprint 会被恢复——导致 build.rs
+          # 不重跑而链接器找不到 sherpa-onnx-c-api.lib (LNK1181)。全量构建实测仅 ~8 分钟，
+          # 用确定性换时间。
+          cache-targets: false
           cache-on-failure: true
 
       # llama-cpp-sys-2 的 build.rs 使用 bindgen，需要 libclang
