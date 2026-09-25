@@ -14,3 +14,5 @@
 
 【待质检字幕】（语音时长约 {{duration}} 秒）
 {{text}}
+
+/no_think
