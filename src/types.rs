@@ -164,6 +164,8 @@ pub struct QcStats {
     pub failed: usize,
     /// 模型判 fix 但纠正文本不可信（差异过大/为空），已保留原文的次数
     pub fix_rejected: usize,
+    /// 模型判 drop 但句子过长且非重复（几乎不可能是噪音），已保留原文的次数
+    pub drop_rejected: usize,
     /// 因 LLM 调用出错而重试的次数
     pub retries: usize,
 }
@@ -171,13 +173,14 @@ pub struct QcStats {
 impl QcStats {
     pub fn summary(&self) -> String {
         format!(
-            "质检 {} 句：保留 {}，纠正 {}，丢弃 {}，解析失败兜底 {}，纠正被拒 {}，重试 {}",
+            "质检 {} 句：保留 {}，纠正 {}，丢弃 {}，解析失败兜底 {}，纠正被拒 {}，丢弃被拒 {}，重试 {}",
             self.total,
             self.kept,
             self.fixed,
             self.dropped,
             self.failed,
             self.fix_rejected,
+            self.drop_rejected,
             self.retries
         )
     }

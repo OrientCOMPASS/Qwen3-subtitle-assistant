@@ -257,7 +257,12 @@ fn process_with_qc(
 
     // ---------- 阶段 1: 转录 + 逐句质检 ----------
     info!("▶ 阶段 1: 流式转录 + 逐句 LLM 质检...");
-    let mut checker = QualityChecker::new(cfg.qc_context, cfg.qc_retries, cfg.qc_min_similarity);
+    let mut checker = QualityChecker::new(
+        cfg.qc_context,
+        cfg.qc_retries,
+        cfg.qc_min_similarity,
+        cfg.qc_keep_min_chars,
+    );
     let qc_max_tokens = cfg.qc_max_tokens;
 
     let mut raw_log: Vec<SubtitleSegment> = Vec::new();

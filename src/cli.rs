@@ -121,6 +121,11 @@ pub struct Args {
     #[arg(long, default_value_t = 0.35)]
     pub qc_min_similarity: f32,
 
+    /// 长句保护阈值：达到该字符数且非重复文本的句子**不允许被 QC 丢弃**（0=关闭）。
+    /// 实测小模型会把"自己看不懂的外语长句"判成背景噪音，一段 39 字的日语演讲被整句丢掉。
+    #[arg(long, default_value_t = 30)]
+    pub qc_keep_min_chars: usize,
+
     // ---------------- 翻译与排版 ----------------
     /// 每批翻译的字幕条数上限（prompt 超预算或译文照抄时会自动对半拆分）
     #[arg(long, default_value_t = 20)]

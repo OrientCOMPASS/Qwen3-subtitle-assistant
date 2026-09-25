@@ -89,6 +89,7 @@ def log_stats(log_text: str) -> dict:
                         + len(re.findall(r"\[翻译-回退\]", log_text)),
         "positional": len(re.findall(r"改用位置兜底", log_text)),
         "fix_rejected": len(re.findall(r"QC⚠ 纠正被拒", log_text)),
+        "drop_rejected": len(re.findall(r"QC⚠ 丢弃被拒", log_text)),
         "qc_dropped": len(re.findall(r"QC✂ 丢弃", log_text)),
         "qc_fixed": len(re.findall(r"QC✎ 纠正", log_text)),
         "retries": len(re.findall(r"\[翻译\] 第 \d+ 次|\[摘要\] 第 \d+ 次|\[QC\] 第 \d+/\d+ 次", log_text)),
@@ -96,7 +97,9 @@ def log_stats(log_text: str) -> dict:
     }
     m = re.search(r"摘要分块 (\d+)", log_text)
     out["summary_chunks"] = int(m.group(1)) if m else None
-    m = re.search(r"质检 (\d+) 句：保留 (\d+)，纠正 (\d+)，丢弃 (\d+)，解析失败兜底 (\d+)，纠正被拒 (\d+)", log_text)
+    m = re.search(
+        r"质检 (\d+) 句：保留 (\d+)，纠正 (\d+)，丢弃 (\d+)，解析失败兜底 (\d+)，"
+        r"纠正被拒 (\d+)，丢弃被拒 (\d+)，重试 (\d+)", log_text)
     out["qc"] = tuple(int(x) for x in m.groups()) if m else None
     m = re.search(r"排版完成：(\d+) 条 -> (\d+) 条", log_text)
     out["layout"] = (int(m.group(1)), int(m.group(2))) if m else None
@@ -128,6 +131,9 @@ def main() -> int:
     ap.add_argument("--max-foreign-cues", type=int, default=-1,
                     help="允许「基本没翻译」的 cue 条数（该 cue 假名占比 > 40%%）；-1=不检查。"
                          "比全局假名占比更准：专有名词保留原文不会被误判，整批照抄则一定被抓到")
+    ap.add_argument("--max-qc-drop-ratio", type=float, default=-1.0,
+                    help="QC 丢弃率上限（丢弃条数/质检总条数）；-1=不检查。"
+                         "小模型容易把看不懂的外语长句判成噪音，实测过 66% 的丢弃率")
     ap.add_argument("--expect-log-contains", action="append", default=[],
                     help="日志中必须出现的字样（可多次），用于验证某条代码路径确实被走到")
     args = ap.parse_args()
@@ -199,7 +205,12 @@ def main() -> int:
             if args.expect_qc:
                 check(st["qc"] is not None, "日志含质检统计行")
                 if st["qc"]:
-                    total, kept, fixed, dropped, failed, rejected = st["qc"]
+                    total, kept, fixed, dropped, failed, rejected, drop_rej, retries = st["qc"]
+                    if args.max_qc_drop_ratio >= 0 and total:
+                        ratio = dropped / total
+                        check(ratio <= args.max_qc_drop_ratio,
+                              f"QC 丢弃率 {ratio:.0%}（{dropped}/{total}）<= {args.max_qc_drop_ratio:.0%}"
+                              f"；另有 {drop_rej} 条因长句保护被拦下")
                     # 每句必然落入 kept/fixed/dropped 之一（fail-open 与"纠正被拒"都计入 kept）
                     check(total == kept + fixed + dropped,
                           f"质检计数自洽: 共 {total} 句 = 保留 {kept} + 纠正 {fixed} + 丢弃 {dropped}"

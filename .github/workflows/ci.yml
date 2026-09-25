@@ -518,7 +518,8 @@ jobs:
           Get-Content $srt -Encoding UTF8 | Select-Object -First 60
           python scripts/check_e2e.py --name T1-真实视频 --srt $srt --log media/t1.log `
             --min-cues 8 --target-lang zh --max-cue-secs 15 --max-line-width 44 `
-            --expect-qc --max-untranslated 5 --max-kana-ratio 0.08 --max-foreign-cues 2
+            --expect-qc --max-untranslated 5 --max-kana-ratio 0.08 --max-foreign-cues 2 `
+            --max-qc-drop-ratio 0.35
           if ($LASTEXITCODE -ne 0) { throw "T1 断言失败" }
 
       - name: Upload e2e results

@@ -32,10 +32,17 @@ pub struct QualityChecker {
     min_similarity: f32,
     /// fix 文本相对原文的长度比允许区间
     len_ratio: (f32, f32),
+    /// 超过这个字符数的句子不允许被 drop（除非高度重复），0 = 关闭该保护
+    keep_min_chars: usize,
 }
 
 impl QualityChecker {
-    pub fn new(context_size: usize, max_attempts: usize, min_similarity: f32) -> Self {
+    pub fn new(
+        context_size: usize,
+        max_attempts: usize,
+        min_similarity: f32,
+        keep_min_chars: usize,
+    ) -> Self {
         Self {
             context_size: context_size.max(1),
             history: VecDeque::new(),
@@ -43,6 +50,7 @@ impl QualityChecker {
             max_attempts: max_attempts.clamp(1, 5),
             min_similarity: min_similarity.clamp(0.0, 1.0),
             len_ratio: (0.3, 3.0),
+            keep_min_chars,
         }
     }
 
@@ -128,6 +136,21 @@ impl QualityChecker {
 
         match decision.as_str() {
             "drop" | "noise" | "invalid" | "reject" | "discard" => {
+                // drop 是不可逆的（内容永久丢失），所以也要过一道客观校验：
+                // 实测 1.7B 模型会把"自己看不懂的外语长句"判成背景噪音，
+                // 一段 39 字的日语演讲被整句丢掉。长句 + 非重复文本几乎不可能是噪音。
+                if let Err(why) = self.validate_drop(&seg.text) {
+                    self.stats.drop_rejected += 1;
+                    self.stats.kept += 1;
+                    warn!(
+                        "[QC⚠ 丢弃被拒] 「{}」 {}，保留原文（模型给的理由: {}）",
+                        truncate(&seg.text, 50),
+                        why,
+                        if reason.is_empty() { "（未提供）" } else { reason }
+                    );
+                    self.push_history(&seg.text);
+                    return true;
+                }
                 self.stats.dropped += 1;
                 info!(
                     "[QC✂ 丢弃] 「{}」 理由: {}",
@@ -176,6 +199,24 @@ impl QualityChecker {
         }
     }
 
+    /// 校验 drop 判决是否可信：长且非重复的句子不允许丢弃。
+    fn validate_drop(&self, text: &str) -> Result<(), String> {
+        if self.keep_min_chars == 0 {
+            return Ok(());
+        }
+        let n = text.chars().count();
+        if n < self.keep_min_chars {
+            return Ok(());
+        }
+        if is_repetitive(text) {
+            return Ok(()); // 长但高度重复 -> 很可能是幻觉/歌词，允许丢弃
+        }
+        Err(format!(
+            "长度 {} 字且非重复文本，不像噪音（阈值 --qc-keep-min-chars {}）",
+            n, self.keep_min_chars
+        ))
+    }
+
     /// 校验模型给出的纠正文本是否可信。
     fn validate_fix(&self, original: &str, fixed: &str) -> Result<String, String> {
         if fixed.is_empty() {
@@ -214,6 +255,30 @@ impl QualityChecker {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// 文本是否"高度重复"——幻觉与歌词的典型特征。
+///
+/// 两个信号任一命中即算重复：
+/// - 去重后的字符占比过低（< 0.35）；
+/// - 出现次数最多的 2-gram 覆盖了全文 40% 以上的字符。
+pub fn is_repetitive(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 8 {
+        return false;
+    }
+    let mut sorted = chars.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() as f32 / (chars.len() as f32) < 0.35 {
+        return true;
+    }
+    let mut bigrams: HashMap<String, usize> = HashMap::new();
+    for w in chars.windows(2) {
+        *bigrams.entry(w.iter().collect()).or_insert(0) += 1;
+    }
+    let max_rep = bigrams.values().copied().max().unwrap_or(0);
+    ((max_rep * 2) as f32) >= (chars.len() as f32) * 0.4
 }
 
 /// 字符级相似度：`1 - 编辑距离 / max(len)`，取值 0~1。
@@ -276,7 +341,7 @@ mod tests {
     }
 
     fn checker(sim: f32) -> QualityChecker {
-        QualityChecker::new(3, 2, sim)
+        QualityChecker::new(3, 2, sim, 30)
     }
 
     #[test]
@@ -330,8 +395,36 @@ mod tests {
     }
 
     #[test]
+    fn repetition_detection() {
+        assert!(is_repetitive("ありがとうありがとうありがとうありがとう"));
+        assert!(is_repetitive("字幕由某某字幕组提供 字幕由某某字幕组提供 字幕由某某字幕组提供"));
+        // 真实语句：字符多样、2-gram 不集中
+        assert!(!is_repetitive(
+            "落ちてしまって、足を複雑骨折してしまって、歩けなくなってしまいました。"
+        ));
+        assert!(!is_repetitive("今日はとても良い天気なので公園まで散歩に行きました。"));
+        assert!(!is_repetitive("短い")); // 太短不判定
+    }
+
+    #[test]
+    fn long_structured_sentence_cannot_be_dropped() {
+        let c = checker(0.35);
+        let real = "落ちてしまって、足をこう複雑骨折してしまって、歩けなくなってしまいました。";
+        assert!(c.validate_drop(real).is_err(), "长句不应允许丢弃");
+        // 短句仍可丢弃
+        assert!(c.validate_drop("今日。").is_ok());
+        // 长但高度重复（幻觉）仍可丢弃
+        assert!(c
+            .validate_drop("ありがとうありがとうありがとうありがとうありがとう")
+            .is_ok());
+        // 关闭保护后一律允许
+        let off = QualityChecker::new(3, 2, 0.35, 0);
+        assert!(off.validate_drop(real).is_ok());
+    }
+
+    #[test]
     fn history_window_is_bounded() {
-        let mut c = QualityChecker::new(2, 2, 0.35);
+        let mut c = QualityChecker::new(2, 2, 0.35, 30);
         c.push_history("a");
         c.push_history("b");
         c.push_history("c");

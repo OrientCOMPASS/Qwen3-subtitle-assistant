@@ -43,6 +43,7 @@ pub struct Config {
     pub qc_retries: usize,
     pub qc_max_tokens: u32,
     pub qc_min_similarity: f32,
+    pub qc_keep_min_chars: usize,
 
     // ---- 排版 ----
     pub max_line_width: usize,
@@ -136,6 +137,7 @@ impl Config {
             qc_retries: args.qc_retries.clamp(1, 5),
             qc_max_tokens: args.qc_max_tokens.max(64),
             qc_min_similarity: args.qc_min_similarity.clamp(0.0, 1.0),
+            qc_keep_min_chars: args.qc_keep_min_chars,
             max_line_width: args.max_line_width,
             max_cue_secs,
             layout_enabled: !args.no_layout,
@@ -345,6 +347,7 @@ mod tests {
             qc_retries: 1,
             qc_max_tokens: 128,
             qc_min_similarity: 0.3,
+            qc_keep_min_chars: 30,
             batch_size: 5,
             batch_chars: 200,
             context_size: 2,
