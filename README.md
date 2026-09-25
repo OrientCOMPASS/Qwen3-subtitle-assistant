@@ -1,37 +1,50 @@
 # Qwen3 Subtitle Assistant (Qwen3 字幕助手)
 
-**完全本地离线**的 Rust 视频/音频字幕转录与翻译助手：媒体文件进，精准双语 SRT 出。
+**完全本地离线**的 Rust 视频/音频字幕转录与翻译助手：媒体文件进，排版好的中文字幕 SRT 出。
 
 组合 **Qwen3-ASR 0.6B**（语音识别）与 **Qwen3-1.7B**（逐句质检 + 全局摘要 + 滑动窗口翻译），
-在消费级显卡或纯 CPU 上流畅运行，数据绝不出域。
+在消费级显卡或纯 CPU 上都能跑，数据绝不出域。
 
-> **v0.2 重构要点**
-> 1. **外置 DLL 运行时**：推理引擎不再静态编入 exe。CUDA 加速由放在 exe 旁边的外置
->    DLL（`ggml-cuda.dll`、`onnxruntime_providers_cuda.dll` + cudart/cublas/cudnn）提供，
->    **同一个 exe 自动适应 CPU / CUDA 两种环境**，缺件自动回退 CPU 并给出日志提示。
-> 2. **逐句 LLM 质检**：ASR 每识别出一句，立即携带已通过质检的上文语境调用 LLM，
->    判断该句是【有效语音 / 识别错误 / 噪音幻觉】——噪音直接丢弃，识别错误就地纠正，
->    只有质检通过的句子才进入翻译，从源头提高字幕质量。
-> 3. **编译问题根治**：旧版 Windows 下 `/MT` 与 `/MD` CRT 混链导致的 `LNK2038/LNK2005`
->    彻底消失（各 DLL 自带运行时）；编译 CUDA 版也不再需要本机安装 CUDA Toolkit。
-> 4. **GitHub Actions 自动构建**：推送 `v*` tag 即自动产出 CPU / CUDA12 两个发行包。
+> **v0.3 变更要点**（相对 v0.2）
+> 1. **长视频不再崩**：prompt 按 `n_batch` 分块 prefill（旧版超过 2048 token 会命中
+>    llama.cpp 的 `GGML_ASSERT` 直接 abort）；转录过长时全局摘要自动走 **map-reduce 分块**。
+> 2. **翻译不再静默回退原文**：紧凑输出格式（只回传 `i`/`t`，时间轴由 Rust 保留）、
+>    索引对不上时按位置兜底、每条回退都 warn 并计数，收尾打印统计。
+> 3. **提示词全部 `/no_think` + JSON 任务贪心解码**：v0.2 只给质检提示词关了思考模式，
+>    摘要/翻译仍在思考，白白吃掉生成预算导致 JSON 截断。
+> 4. **字幕排版**：按显示宽度折行（CJK 计 2）、超长 cue 按句读拆分并按字符占比分配时间。
+>    旧版一个 VAD 语音段就是一条字幕，十几秒的连续讲话会变成一整屏文字。
+> 5. **资源路径回退到 exe 目录**：拖拽/快捷方式启动时 CWD 不可控，旧版会直接报
+>    “提示词目录不存在”。
+> 6. **`--from-srt`**：跳过 ASR，直接翻译已有 SRT（重跑翻译、二次修正、CI 回归都靠它）。
+> 7. **模型跨文件复用**：批处理多个文件时不再每个文件都重新加载/卸载模型。
+> 8. **发行包自检**：打包时按 PE 导入表**按需补 cuFFT**，并在组装后做依赖闭包检查
+>    （旧版 CUDA 包缺 `cufft64_11.dll`，ASR 的 CUDA EP 会静默回退 CPU）。
+> 9. **CI 收敛为单个 `ci.yml`**：push 自动构建+测试，手动 dispatch 才打包发布；
+>    e2e 换成 **bilibili 真实日语视频**（>1 分钟，缓存）+ 长文本回归 + 迁移目录回归，
+>    断言从“产出了 .srt”升级为“字幕条数/时长/行宽/译文语言/回退条数”全部达标。
 
 ---
 
 ## ✨ 核心特性
 
 - **🔒 完全离线**：识别、质检、翻译全部本地完成。
-- **🧠 逐句质检（新）**：每句 ASR 结果都经 LLM 结合上文判定 keep / fix / drop：
+- **🧠 逐句质检**：每句 ASR 结果都经 LLM 结合上文判定 keep / fix / drop：
   背景音乐、掌声、ASR 幻觉（“字幕由…提供”之类）被自动剔除；同音字、断词错误被自动纠正。
-- **⚡ CUDA 加速即插即用（新）**：CUDA 能力来自外置 DLL，`ggml-cuda.dll` 由 llama.cpp
+  纠正文本还要过**可信度校验**（与原文的编辑距离相似度、长度比），不合格就保留原文，
+  避免小模型把正确句子“纠正”成幻觉。
+- **⚡ CUDA 加速即插即用**：CUDA 能力来自外置 DLL，`ggml-cuda.dll` 由 llama.cpp
   运行时自动扫描加载，`onnxruntime_providers_cuda.dll` 由 ONNX Runtime 按需加载；
-  程序启动时主动探测并打印后端选择结果。
-- **📚 智能上下文翻译**：翻译前 LLM 先通读全片提取剧情摘要与术语表，翻译时注入
-  全局摘要 + 滑动窗口上文，解决长视频术语漂移与上下文割裂。
-- **🔁 会话级 KV cache 复用（新）**：逐句质检高频调用 LLM，上下文只创建一次、
-  每轮仅清 KV cache，避免旧版每句重建 8K 上下文的巨大开销。
-- **🎞 流式音频管线**：FFmpeg 管道直出 16kHz `f32le` PCM + Silero VAD 精准切片，零中间文件。
-- **🖱 极简交互**：多个媒体文件拖到 exe（或其快捷方式）上即按序处理。
+  程序启动时主动探测并打印后端选择结果，缺件回退 CPU 并给出补齐提示。
+- **📚 智能上下文翻译**：翻译前先提取剧情摘要与术语表；转录超过 `--summary-chunk-tokens`
+  时自动分块提取再合并（map-reduce），长视频也能拿到全局上下文。翻译时注入
+  全局摘要 + 滑动窗口上文，抑制术语漂移与上下文割裂。
+- **🎞 流式音频管线**：FFmpeg 管道直出 16kHz `f32le` PCM + Silero VAD 切片，零中间文件。
+- **🧾 字幕排版**：行宽折行 + 超长 cue 拆分（`--max-line-width` / `--max-cue-secs`）。
+- **🔁 会话复用**：LLM 上下文只创建一次，每轮清 KV cache 复用，逐句质检的高频调用
+  不必反复重建 8K 上下文。
+- **🖱 极简交互**：多个媒体文件拖到 exe（或其快捷方式）上即按序处理；失败时窗口不会
+  一闪而过（`--no-pause` 可关），也可 `--log-file` 落盘日志。
 
 ## ⚙️ 工作流
 
@@ -43,24 +56,29 @@
               Qwen3-ASR 转录（CPU / CUDA 外置 DLL）
                         │  每句
                         ▼
-              LLM 逐句质检（带最近 N 句上文）
-              ├─ drop：噪音/幻觉 → 丢弃
-              ├─ fix ：识别错误 → 纠正后保留
+              LLM 逐句质检（带最近 N 句上文，贪心解码）
+              ├─ drop：噪音/幻觉 → 丢弃（计入统计）
+              ├─ fix ：识别错误 → 过相似度校验后纠正
               └─ keep：有效语音 → 保留
                         │
                         ▼   (.raw.srt / .verified.srt 中间产物)
-              LLM 全局摘要 + 术语表提取
+              LLM 全局摘要 + 术语表（转录过长则分块 map-reduce）
                         │
                         ▼
-              滑动窗口分批翻译（JSON 输出，自动重试）
+              滑动窗口分批翻译（紧凑 JSON，失败按位置兜底并告警）
                         │
                         ▼
-                  最终 .srt 字幕
+              排版（折行 + 长 cue 拆分）──▶ 最终 .srt
 ```
 
 启用质检时（默认），ASR 与 LLM 在转录阶段**同时驻留**内存/显存（约 4~5 GB 显存可同时
-跑 CUDA 版 ASR + Q8 LLM）；转录一结束立即卸载 ASR 再翻译。显存紧张可加 `--no-qc`
-回到旧版线性工作流（先转录完、卸载 ASR、再加载 LLM 翻译），或 `--gpu-layers 0` 让 LLM 留在 CPU。
+跑 CUDA 版 ASR + Q8 LLM）。批处理多个文件时两者只加载一次、跨文件复用（内存峰值不变，
+省掉每个文件几秒到几十秒的重复加载）。显存紧张可加 `--no-qc` 回到线性工作流
+（先转录完、卸载 ASR、再加载 LLM 翻译，此时**每个文件**都会重新加载模型以维持最低峰值），
+或 `--gpu-layers 0` 让 LLM 留在 CPU。
+
+> 输出是**目标语言单语字幕**（默认简体中文）。原文另存为 `.raw.srt` / `.verified.srt`
+> 两个中间文件，本程序不生成“原文+译文”同屏的双语字幕。
 
 ---
 
@@ -70,27 +88,30 @@
 
 | 发行包 | 适用场景 | 体积 |
 |---|---|---|
-| `Qwen3SubAssistant-<ver>-win-x64-cpu.zip` | 无 N 卡 / 不想装驱动依赖 | ~50 MB |
-| `Qwen3SubAssistant-<ver>-win-x64-cuda12.zip` | NVIDIA 显卡加速（推荐） | ~1.5 GB |
+| `Qwen3SubAssistant-<ver>-win-x64-cpu.zip` | 无 N 卡 / 不想装驱动依赖 | ~20 MB |
+| `Qwen3SubAssistant-<ver>-win-x64-cuda12.zip` | NVIDIA 显卡加速（推荐） | ~1.9 GB |
 
 CUDA 包要求：**NVIDIA 驱动 ≥ 551.61**（CUDA 12.4 运行时；更新的驱动向下兼容）。
-两个包内的 `subtitle-assistant.exe` 完全相同，差别只在旁边放了哪套 DLL——
-把 CPU 包的 exe 拷进 CUDA 包目录（或反之）即可切换后端。
+两个包内的 `subtitle-assistant.exe` 完全相同，差别只在旁边放了哪套 DLL。
 
 解压后目录结构：
 
 ```
 Qwen3SubAssistant-win-x64-cuda12/
 ├── subtitle-assistant.exe            # 主程序（CPU/CUDA 通用）
-├── llama.dll / ggml*.dll / libomp.dll          # LLM 运行时（llama.cpp 官方构建）
-├── ggml-cuda.dll                               # ★ LLM CUDA 后端（运行时自动扫描加载）
+├── llama.dll / llama-common.dll      # LLM 运行时（llama-common 用本仓库 CI 构建产物）
+├── ggml.dll / ggml-base.dll / ggml-cpu-*.dll / libomp.dll
+├── ggml-cuda.dll                     # ★ LLM CUDA 后端（运行时自动扫描加载）
 ├── cudart64_12.dll / cublas64_12.dll / cublasLt64_12.dll
-├── cudnn64_9.dll / cudnn_*64_9.dll             # cuDNN 9（ASR CUDA EP 需要）
-├── sherpa-onnx-c-api.dll / onnxruntime.dll     # ASR 运行时
-├── onnxruntime_providers_cuda.dll              # ★ ASR CUDA ExecutionProvider
-├── prompts/                                    # 提示词模板（质检/摘要/翻译）
-├── scripts/download_models.bat|.ps1            # 模型一键下载
-└── models/                                     # 模型目录（下载后生成）
+├── cufft64_11.dll                    # ★ ASR CUDA EP 依赖（按需自动补齐）
+├── cudnn64_9.dll / cudnn_*64_9.dll   # cuDNN 9（ASR CUDA EP 需要）
+├── sherpa-onnx-c-api.dll / onnxruntime.dll / onnxruntime_providers_shared.dll
+├── onnxruntime_providers_cuda.dll    # ★ ASR CUDA ExecutionProvider
+├── vcruntime140.dll / msvcp140.dll   # VC++ 运行时（exe 是 /MD 构建）
+├── prompts/                          # 提示词模板（质检/摘要/翻译）
+├── scripts/download_models.bat|.ps1  # 模型一键下载
+├── THIRD-PARTY-NOTICES.txt           # 第三方组件与许可
+└── models/                           # 模型目录（下载后生成）
 ```
 
 ### 2. 下载模型（必须）
@@ -108,7 +129,8 @@ powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1 -HfMirror h
 2. `models/silero_vad.onnx` — VAD（k2-fsa GitHub Release）
 3. `models/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf` — 质检 + 翻译 LLM（HuggingFace）
 
-也可手动下载任意 Qwen3 GGUF 量化版放入 `models/` 任意子目录（程序会递归搜索第一个 `.gguf`）。
+也可手动下载任意 Qwen3 GGUF 量化版放入 `models/` 任意子目录（程序会递归搜索第一个 `.gguf`；
+有多个时会 warn 并提示用 `--llm-model` 指定）。
 
 ### 3. 运行
 
@@ -117,40 +139,82 @@ powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1 -HfMirror h
 .\subtitle-assistant.exe "C:\path\to\video.mp4"
 
 # 显式控制设备
-.\subtitle-assistant.exe --device cuda .\video.mp4   # 强制 CUDA（探测失败直接报错，便于排查）
+.\subtitle-assistant.exe --device cuda .\video.mp4   # 强制 CUDA（两个关键 DLL 都加载失败才报错）
 .\subtitle-assistant.exe --device cpu  .\video.mp4   # 强制 CPU
 
-# CUDA 运行时 DLL 不放在 exe 旁边时
+# CUDA 运行时 DLL 不放在 exe 旁边时（仅对"运行时才加载"的 DLL 有效，见下方 FAQ）
 .\subtitle-assistant.exe --lib-dir D:\cuda-runtime\bin .\video.mp4
 
 # 关闭逐句质检（ASR 与 LLM 不同时驻留，内存峰值最低）
 .\subtitle-assistant.exe --no-qc .\video.mp4
+
+# 已有 SRT，只重跑翻译（跳过 ASR）
+.\subtitle-assistant.exe --from-srt --output-dir out .\video.srt
+
+# 专有名词识别错误多时，给 ASR 加偏置词
+.\subtitle-assistant.exe --asr-hotwords "東京,山中伸弥,iPS細胞" .\video.mp4
 ```
 
-也可以把多个视频**直接拖拽到 exe（或其快捷方式）图标**上按序批处理。
+也可以把多个视频**直接拖拽到 exe（或其快捷方式）图标**上按序批处理
+（模型只加载一次）。**任何一个文件失败，进程退出码为 1**，并在控制台等待回车
+（`--no-pause` 可关闭等待）。
 
-输出（与源文件同目录）：
+输出（默认与源文件同目录，可用 `--output-dir` 改）：
 
 | 文件 | 内容 |
 |---|---|
-| `video.srt` | 最终翻译字幕 |
+| `video.srt` | 最终译文字幕（已折行/拆分） |
 | `video.raw.srt` | ASR 原始输出（质检前，便于对照） |
 | `video.verified.srt` | 质检后的原文字幕（仅开启质检时） |
+| `video.translated.srt` | `--from-srt` 模式的输出（不覆盖输入） |
 
-### 常用参数
+### 参数一览
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
+| **路径与模型** | | |
+| `--asr-model-dir DIR` | `./models/sherpa-onnx-qwen3-asr-0.6B-int8` | ASR 模型目录 |
+| `--vad-model FILE` | `./models/silero_vad.onnx` | Silero VAD 模型 |
+| `--llm-model FILE` | 自动搜索 | Qwen3 GGUF 路径（不给则递归搜 `./models`，再搜 exe 目录的 `models`） |
+| `--prompts-dir DIR` | `./prompts` | 提示词目录 |
+| `--output-dir DIR` | 源文件同目录 | 输出目录 |
+| **设备** | | |
 | `--device auto\|cpu\|cuda` | auto | 推理设备（依赖外置 DLL 探测） |
 | `--lib-dir DIR` | - | 附加 DLL 搜索目录（可多次） |
-| `--no-qc` | 关 | 关闭逐句 LLM 质检（回到旧版线性流程） |
-| `--qc-context N` | 3 | 质检时携带的上文条数 |
 | `--gpu-layers N` | -1(自动) | LLM GPU offload 层数；0=纯 CPU |
-| `--ctx-size N` | 8192 | LLM 上下文长度 |
-| `--batch-size N` | 20 | 每批翻译条数 |
+| **LLM** | | |
+| `--ctx-size N` | 8192 | LLM 上下文长度（小于 2048 会被抬到 2048 并 warn） |
+| `--prefill-batch N` | 2048 | llama.cpp `n_batch`；长 prompt 会自动按它分块 |
+| `--seed N` | 42 | 采样种子（固定值 → 结果可复现） |
+| `--temperature F` | 0.3 | 翻译首轮采样温度；重试一律转贪心 |
+| `--max-retries N` | 3 | 摘要/翻译单批最大重试次数 |
+| **质检** | | |
+| `--no-qc` | 关 | 关闭逐句 LLM 质检（回到线性流程） |
+| `--qc-context N` | 3 | 质检携带的上文条数 |
+| `--qc-retries N` | 2 | 质检单句最大尝试次数 |
+| `--qc-max-tokens N` | 256 | 质检单句生成上限 |
+| `--qc-min-similarity F` | 0.35 | fix 判决的最小可信相似度，低于则保留原文 |
+| **翻译与排版** | | |
+| `--batch-size N` | 20 | 每批翻译条数（prompt 超预算时自动对半拆） |
 | `--context-size N` | 4 | 翻译滑动窗口上文条数 |
+| `--summary-chunk-tokens N` | 3000 | 摘要单块 token 预算，超出即分块 map-reduce |
+| `--translate-tokens-per-item N` | 96 | 每条译文的生成预算系数 |
 | `--target-lang LANG` | 简体中文 | 翻译目标语言 |
-| `--asr-threads N` | 4 | ASR CPU 线程数 |
+| `--source-lang LANG` | 自动检测（视频原语言） | 源语言（提示词用） |
+| `--max-line-width N` | 40 | 单行最大显示宽度（CJK 计 2；40≈20 汉字），0=不折行 |
+| `--max-cue-secs F` | 7.0 | 单条字幕最长秒数，超出按句读拆分，0=不拆 |
+| `--no-layout` | 关 | 关闭折行与拆分 |
+| **ASR / VAD** | | |
+| `--asr-threads N` | 4 | ASR CPU 线程数（仅 CPU provider 生效） |
+| `--asr-hotwords LIST` | 空 | Qwen3-ASR 偏置词（英文逗号分隔） |
+| `--asr-max-new-tokens N` | 256 | 单段最多生成 token（sherpa 默认 128 偏小） |
+| `--asr-max-total-len N` | 1024 | 最大总序列长度（sherpa 默认 512） |
+| `--vad-buffer-secs F` | 60 | VAD 缓冲区秒数（= 单段长度上限） |
+| `--vad-min-silence F` | 0.5 | 判定语音结束所需的最短静音 |
+| **运行方式** | | |
+| `--from-srt` | 关 | 跳过 ASR，把输入当 SRT 直接翻译 |
+| `--log-file FILE` | - | 日志同时写入文件 |
+| `--no-pause` | 关 | 失败退出时不等待回车 |
 
 依赖：系统 `PATH` 中需有 **FFmpeg / ffprobe**（音频解码用）。
 
@@ -158,17 +222,17 @@ powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1 -HfMirror h
 
 ## 🛠 从源码编译（开发者指南）
 
-重构后编译大幅简化——**不再需要**：CRT 链接 hack（`RUSTFLAGS=-C target-feature=+crt-static`、
+**不需要**：CRT 链接 hack（`RUSTFLAGS=-C target-feature=+crt-static`、
 `CMAKE_MSVC_RUNTIME_LIBRARY` 等）、CUDA Toolkit、手动区分 cpu/cuda 两次编译。
 
 ### 环境要求
 
 - Rust stable（MSVC toolchain，`x86_64-pc-windows-msvc`）
-- Visual Studio Build Tools（C++ 工作负载）+ CMake（VS 自带或独立安装）
+- Visual Studio Build Tools（C++ 工作负载）+ CMake
 - LLVM/clang（提供 bindgen 所需的 `libclang.dll`，设置 `LIBCLANG_PATH` 指向其 bin 目录）
 - FFmpeg（仅运行时需要）
 
-### 编译
+### 编译与测试
 
 ```powershell
 cargo build --release
@@ -177,18 +241,21 @@ cargo build --release
 #   - sherpa-onnx-sys: 下载 v1.13.8 win-x64 shared 预编译库并把 DLL 拷到 target\release
 #   - llama-cpp-sys-2: CMake 构建 llama.cpp（dynamic-link + dynamic-backends），
 #     llama.dll/ggml*.dll 硬链接到 target\release
+
+# 纯函数单元测试（时间轴/折行/长 cue 拆分、JSON 提取与修复、模板渲染、质检门槛、配置路径）
+$env:PATH = "$PWD\target\release;$env:PATH"   # 测试二进制需要能找到原生 DLL
+cargo test --release
 ```
 
-本机直接运行 `target\release\subtitle-assistant.exe` 即为 **CPU 版**（ggml CPU 后端模块
-通过构建期烧录的路径自动发现）。想要 CUDA：把 CI 发行包 CUDA12 里的 DLL 拷到 exe 旁即可，
-无需重新编译；或者（不推荐）安装 CUDA Toolkit 后 `cargo build --release --features cuda-build`
-自行编译 `ggml-cuda.dll`。
+本机直接运行 `target\release\subtitle-assistant.exe` 即为 **CPU 版**。想要 CUDA：
+把 CI 发行包 CUDA12 里的 DLL 拷到 exe 旁即可，无需重新编译；或者（不推荐）安装 CUDA
+Toolkit 后 `cargo build --release --features cuda-build` 自行编译 `ggml-cuda.dll`。
 
 ### 为什么动态链接能根治编译问题？
 
-| 旧版（静态链接） | 新版（外置 DLL） |
+| 旧版（静态链接） | 现在（外置 DLL） |
 |---|---|
-| sherpa-onnx 预编译库用 `/MT`，llama.cpp CMake 构建用 `/MD`，混链必炸 `LNK2038/LNK2005`，需手工统一 CRT | exe 只链接各 DLL 的导入库，C/C++ 运行时被封在各自 DLL 内，冲突无从发生 |
+| sherpa-onnx 预编译库用 `/MT`，llama.cpp CMake 构建用 `/MD`，混链必炸 `LNK2038/LNK2005` | exe 只链接各 DLL 的导入库，C/C++ 运行时被封在各自 DLL 内，冲突无从发生 |
 | CUDA 版必须本机装 CUDA Toolkit 全量编译 | CUDA 由官方预编译 DLL 运行时提供，编译机零 CUDA 依赖 |
 | cpu/cuda 要编两个 exe | 一个 exe，换 DLL 即换后端 |
 | exe 体积巨大、启动加载慢 | exe ~2MB，按需加载 |
@@ -199,39 +266,59 @@ exe 与外置 DLL 的二进制兼容性依赖版本对齐，`Cargo.toml` 因此*
 
 - `sherpa-onnx = "=1.13.8"` ↔ 发行包 DLL 取自 sherpa-onnx **v1.13.8** Release；
 - `llama-cpp-2 = "=0.1.157"`（vendored llama.cpp commit `26394b4e`）↔ 发行包 DLL 取自
-  llama.cpp **b11153** Release（已验证两者公开头文件零差异，导入符号一致）。
+  llama.cpp **b11153** Release（已核对公开头文件一致）。
+  注意 `llama-common.dll` **必须**用本仓库 CI 构建产物，不能用官方 zip 里的版本。
 
 升级任一依赖时，必须同步更新 `scripts/package_dist.py` 顶部的
-`LLAMA_TAG` / `SHERPA_VER` / `CUDNN_VER`，并重新核对 ABI。
+`LLAMA_TAG` / `SHERPA_VER` / `CUDNN_VER` / `CUFFT_VER`，并跑一次：
+
+```powershell
+python scripts/check_dll_deps.py --dir <发行包目录> --fail-on-missing --strict-vcredist
+```
+
+`llama-cpp-2` 0.1.158+ 把 `str_to_token`/`is_eog_token`/`token_to_piece` 迁到了
+`model.vocab()`，升级时需同步修改 `src/llm.rs`。
 
 ---
 
-## 🤖 CI 自动构建（GitHub Actions）
+## 🤖 CI（`.github/workflows/ci.yml`）
 
-`.github/workflows/build.yml`：
+只有一个工作流，触发规则：
 
-- **触发**：推送 `v*` tag（自动创建 GitHub Release 并上传发行包）、push master / PR（编译验证）、手动 dispatch。
-- **构建**：`windows-latest` + Rust stable + LLVM(libclang)，`cargo build --release`，
-  全程**无需 CUDA Toolkit**。
-- **打包**：`scripts/package_dist.py` 下载官方预编译 DLL（llama.cpp b11153 win-cpu /
-  win-cuda-12.4 / cudart 包、sherpa-onnx v1.13.8 CPU 与 CUDA 包、NVIDIA PyPI cuDNN 9.1.1
-  wheel），组装 CPU 与 CUDA12 两个发行包，附 `SHA256SUMS.txt`。
-- 下载物有 `actions/cache` 缓存，重复构建免重下 ~1.5 GB。
-- **push master / PR 只编译+冒烟**（~10 分钟快速反馈），tag `v*` 或手动 dispatch 才组装发行包。
+| 触发 | 行为 |
+|---|---|
+| push `master` / PR | **build**（编译 + `cargo test` + 冒烟）→ **e2e**（真实视频 + 回归用例） |
+| `workflow_dispatch` | 同上；勾选 `release` 时再跑 **release**（打包 CPU/CUDA12 + 创建 GitHub Release） |
 
-`.github/workflows/e2e-test.yml`（端到端真实测试）：
+**build**：`windows-latest` + Rust stable + LLVM(libclang)，`cargo build --release --locked`，
+全程无需 CUDA Toolkit；构建产物（exe + DLL）作为 artifact 传给后续 job。
+冒烟测试会打印 PE 导入表并逐个 `LoadLibrary` 验证。
 
-- **触发**：推送 `e2e-*` tag，或手动 dispatch（可指定任意视频/音频直链 URL、选择 quick/full 矩阵）。
-- **多语言矩阵**：日/德/(法/中英混说)/噪音样本，来自 HF 镜像仓库 `test_wavs/`，随模型缓存。
-- **实测记录**（windows-latest，CPU 推理）：五语言全部通过；噪音样本正确触发 QC 三态判决
-  （2 句丢弃、1 句纠正幻觉前缀、1 句保留真实人声）；QC 提示词加 `/no_think` 后 JSON 首轮命中率 100%。
-- YouTube（"Sign in to confirm you're not a bot"）与 bilibili（海外数据中心 IP 得 HTTP 412）均对
-  GitHub runner 风控，故默认矩阵使用 HF 测试音频；dispatch 传入可访问的直链 URL 亦可测试真实视频。
+**e2e**（`needs: build`，复用 artifact，不重复编译）：
+
+| 用例 | 内容 | 断言 |
+|---|---|---|
+| T1 真实视频 | bilibili 日语视频（>1 分钟，`scripts/fetch_media.py` 下载 + actions/cache 缓存）跑完整流程：ASR → 逐句质检 → 摘要 → 翻译 → 排版 | 字幕条数、最长 cue ≤15s、最宽行 ≤44、假名占比 ≤3%（确认真翻成中文）、回退原文 ≤2 条、质检计数自洽、日志无 `GGML_ASSERT`/panic |
+| T2 长文本回归 | `tests/fixtures/long_ja.srt`（125 条、约 3500 字日语）用 `--from-srt --summary-chunk-tokens 1200` 跑翻译 | 退出码 0（旧版这里必然 abort）、≥120 条、摘要分块 ≥2、回退原文 0 条 |
+| T3 迁移目录回归 | exe+DLL+prompts 拷到 `%TEMP%`，`models` 用 junction，从**非仓库 CWD** 启动 | 退出码 0，且日志出现“改用 exe 目录”（证明资源路径回退生效） |
+
+关于 bilibili：它对数据中心 IP 有**请求级**风控（HTTP 412）。`fetch_media.py` 的做法是
+先访问首页拿 `buvid3` cookie，再用 view/playurl 两个接口取最低码率的音频轨（一次运行只发
+3 个请求），失败则换候选 BV、再退到 yt-dlp。下载成功后进 `actions/cache`
+（key `e2e-media-bilibili-v2`），后续运行不再访问 bilibili。若当次全部失败：默认**跳过 T1**
+并打 warning（T2/T3 照跑），dispatch 时勾选 `strict_media` 可改为直接判失败。
+换测试视频只需改 workflow 顶部的 `E2E_BVIDS`。
+
+**release**（`needs: [build, e2e]`，仅手动 dispatch 且勾选 `release`）：
+`scripts/package_dist.py` 下载官方预编译 DLL 组装 CPU / CUDA12 两个发行包，
+组装时**按 `onnxruntime_providers_cuda.dll` 的真实导入表决定是否补 cuFFT**，
+组装后跑依赖闭包检查（`--strict-deps`，缺件直接失败），最后打印包内完整文件清单、
+生成 `SHA256SUMS.txt` 并创建 Release（tag 由 `version` 输入或 Cargo.toml 版本决定）。
 
 发布新版本：
 
-```bash
-git tag v0.2.0 && git push origin v0.2.0
+```
+Actions → CI → Run workflow → 勾选 release（version 留空则用 Cargo.toml 里的版本）
 ```
 
 ---
@@ -241,42 +328,65 @@ git tag v0.2.0 && git push origin v0.2.0
 ```
 Qwen3-subtitle-assistant/
 ├── Cargo.toml                  # 依赖精确锁版本；dynamic-link/dynamic-backends/shared
-├── .github/workflows/build.yml # CI：构建 exe + 组装 CPU/CUDA12 发行包 + Release
+├── .github/workflows/ci.yml    # 唯一 CI：build → e2e →（手动）release
 ├── prompts/
-│   ├── qc_segment.txt          # 逐句质检提示词（keep/fix/drop + 纠正）
-│   ├── extract_context.txt     # 全局摘要与术语表提取
-│   └── translate_batch.txt     # 滑动窗口批量翻译
+│   ├── qc_segment.txt          # 逐句质检（keep/fix/drop，/no_think）
+│   ├── extract_context.txt     # 全局摘要与术语表提取（/no_think）
+│   └── translate_batch.txt     # 滑动窗口批量翻译（紧凑 i/t 输出，/no_think）
 ├── scripts/
-│   ├── package_dist.py         # CI 打包：下载官方 DLL、组装、压缩、校验和
+│   ├── package_dist.py         # 打包：下载官方 DLL、按需补 cuFFT、自检、压缩、校验和
+│   ├── check_dll_deps.py       # PE 导入闭包检查（静态，无需 GPU/驱动）
+│   ├── fetch_media.py          # e2e 媒体获取（bilibili 抗风控 + yt-dlp 兜底）
+│   ├── check_e2e.py            # e2e 结果断言（字幕内容级，而非“文件存在”）
 │   ├── download_models.ps1     # 模型一键下载（支持 HF 镜像）
 │   └── download_models.bat
+├── tests/fixtures/
+│   └── long_ja.srt             # 长文本回归夹具（125 条日语，自撰文本，无版权问题）
 └── src/
-    ├── main.rs                 # 编排：质检模式(双模型共存) / 线性模式(--no-qc)
-    ├── runtime.rs              # ★ 外置 DLL 探测与加载（LoadLibraryExW/dlopen、--lib-dir、UTF-8 控制台）
+    ├── main.rs                 # 编排：质检模式 / 线性模式(--no-qc) / --from-srt；模型跨文件复用
+    ├── runtime.rs              # 外置 DLL 探测与加载、exe 目录、UTF-8 控制台、失败暂停
     ├── cli.rs                  # 命令行参数
-    ├── config.rs               # 配置与 GGUF 自动搜寻
-    ├── ffmpeg.rs               # FFmpeg 流式解码（stderr 排空防死锁）
-    ├── asr.rs                  # VAD 切片 + Qwen3-ASR（provider 选择 + CUDA 失败回退 + 质检钩子）
-    ├── qc.rs                   # ★ 逐句 LLM 质检（上文语境、fail-open 兜底、统计）
-    ├── llm.rs                  # llama.cpp 绑定：可复用 Session（持久 KV cache）
-    ├── translate.rs            # 全局摘要 + 滑动窗口翻译（重试与原文回退）
-    ├── prompt.rs               # 提示词模板渲染
-    ├── srt.rs                  # SRT 时间轴与输出
-    └── types.rs                # 数据结构（字幕段/全局上下文/质检判决）
+    ├── config.rs               # 配置、资源路径回退、GGUF 自动搜寻、输出路径
+    ├── ffmpeg.rs               # FFmpeg 流式解码（-nostdin、stderr 尾部保留、异常杀进程）
+    ├── asr.rs                  # VAD 切片 + Qwen3-ASR（provider 选择、CUDA 回退、hotwords、质检钩子）
+    ├── qc.rs                   # 逐句 LLM 质检（贪心、格式提示重试、fix 可信度校验、fail-open）
+    ├── llm.rs                  # llama.cpp 绑定：分块 prefill、token 计数、JSON 提取/修复
+    ├── translate.rs            # 摘要 map-reduce + 滑动窗口翻译（自适应拆批、位置兜底、统计）
+    ├── prompt.rs               # 模板单遍渲染 + 双向占位符校验 + 缓存
+    ├── srt.rs                  # SRT 读写、折行、长 cue 拆分、显示宽度
+    └── types.rs                # 数据结构（字幕段/全局上下文/质检判决/翻译统计）
 ```
 
 ## 🩺 常见问题
 
-- **启动报“由于找不到 llama.dll…”**：DLL 必须与 exe 同目录（或用 `--lib-dir` 指定）。
-- **日志显示 LLM/ASR 回退 CPU**：说明 CUDA DLL 或其依赖缺失/驱动过旧，按启动日志中的
-  warn 提示补齐对应 DLL；`--device cuda` 可强制探测并在失败时直接报错定位问题。
-- **显存不足**：`--gpu-layers 0`（LLM 走 CPU，ASR 仍可 CUDA）或 `--no-qc` + `--ctx-size 4096`。
-- **质检拖慢速度**：逐句质检每句增加一次 LLM 生成（GPU 上通常 <1s）；追求速度可 `--no-qc`。
-- **ffmpeg/ffprobe 找不到**：安装 FFmpeg 并加入 `PATH`。
+- **启动报“由于找不到 llama.dll…”**：`llama.dll`、`ggml*.dll`、`llama-common.dll`、
+  `sherpa-onnx-c-api.dll` 是 exe 的**静态导入**，Windows 加载器在 `main()` 之前就解析它们，
+  所以**必须与 exe 同目录**（或在系统 `PATH` 中）——`--lib-dir` 对此无效。
+  `--lib-dir` 只对运行时才加载的 DLL 有用：`ggml-cuda.dll`、
+  `onnxruntime_providers_cuda.dll` 以及它们的依赖（cudart/cublas/cublasLt/cufft/cudnn）。
+- **日志显示 LLM/ASR 回退 CPU**：说明 CUDA DLL 或其依赖缺失/驱动过旧。启动日志的 warn
+  会列出该子系统需要的 DLL 清单；`--device cuda` 可在两个关键 DLL 都加载失败时直接报错定位。
+  也可以用 `python scripts/check_dll_deps.py --dir <发行包目录>` 静态查缺件。
+- **显存不足**：`--gpu-layers 0`（LLM 走 CPU，ASR 仍可 CUDA）、`--no-qc`、
+  或 `--ctx-size 4096`（KV cache 与 ctx 成正比）。
+- **质检拖慢速度**：逐句质检每句增加一次 LLM 生成（GPU 上通常 <1s，CPU 上可能 5~15s）；
+  追求速度可 `--no-qc`。
+- **译文里出现原文/整批没翻**：看日志里的“回退原文”“整批翻译失败”计数，
+  收尾统计行 `翻译 N 条 / M 批：重试 …，位置兜底 …，回退原文 …` 会汇总。
+  常见原因是 `--batch-size` 太大导致 prompt/输出超预算，调小即可（程序也会自动对半拆）。
+- **字幕一行太长 / 一条太久**：调 `--max-line-width`（默认 40，即约 20 个汉字）与
+  `--max-cue-secs`（默认 7 秒）；不想要排版用 `--no-layout`。
+- **ffmpeg/ffprobe 找不到**：安装 FFmpeg 并加入 `PATH`。解码失败时错误信息里会带上
+  ffmpeg stderr 的最后若干行（`RUST_LOG=debug` 可看完整输出）。
+- **拖拽运行看不到日志**：给 exe 建快捷方式并在参数里加 `--log-file "%USERPROFILE%\Desktop\qsa.log"`，
+  或直接从终端运行。
 
 ## 📄 License
 
-[Unlicense](LICENSE)
+代码：[Unlicense](LICENSE)。发行包内含的第三方二进制组件许可见包内
+`THIRD-PARTY-NOTICES.txt`（llama.cpp MIT、ONNX Runtime MIT、sherpa-onnx Apache-2.0、
+NVIDIA cuDNN/CUDA 运行时按各自 SLA 再分发）。模型不包含在发行包内，需自行下载
+（Qwen3 系列为 Apache-2.0，Silero VAD 为 MIT）。
 
 ## 🙏 致谢
 

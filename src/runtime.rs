@@ -125,6 +125,11 @@ impl RuntimeInfo {
         Ok(info)
     }
 
+    /// exe 所在目录（用于解析模型/提示词等相对路径资源：拖拽启动时 CWD 不可控）。
+    pub fn exe_dir(&self) -> &Path {
+        &self.exe_dir
+    }
+
     /// 传给 sherpa-onnx 的 ASR provider 字符串。
     pub fn asr_provider(&self) -> &'static str {
         if self.asr_cuda {
@@ -234,6 +239,36 @@ pub fn enable_utf8_console() {
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
     }
+}
+
+/// 处理失败时在控制台等待回车，避免拖拽/双击启动时窗口一闪而过、看不到错误。
+///
+/// 以下情况直接返回，绝不阻塞：stdin 不是终端（重定向/管道/CI）、
+/// 环境变量 `CI` 存在、或 Windows 下没有附加控制台。
+pub fn pause_on_exit() {
+    use std::io::{IsTerminal, Write};
+
+    if std::env::var_os("CI").is_some() {
+        return;
+    }
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetConsoleWindow() -> *mut std::ffi::c_void;
+        }
+        if GetConsoleWindow().is_null() {
+            return;
+        }
+    }
+    let mut out = std::io::stderr();
+    let _ = writeln!(out, "\n处理未全部成功。按回车键退出（下次可用 --no-pause 跳过）...");
+    let _ = out.flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
 }
 
 // ============================================================================

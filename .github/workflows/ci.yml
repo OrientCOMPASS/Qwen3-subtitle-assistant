@@ -1,0 +1,441 @@
+# ============================================================================
+# 唯一的 CI 工作流。触发规则（按维护者要求收敛）：
+#
+#   push master / PR   -> 自动构建 + 单元测试 + 冒烟 + 端到端真实测试
+#   workflow_dispatch  -> 上述全部，外加「打包 CPU/CUDA12 发行包 + 创建 GitHub Release」
+#
+# 三个 job：
+#   build    编译 exe（纯 CPU 工具链，无需 CUDA Toolkit）+ cargo test + 冒烟
+#   e2e      needs build：真实日语视频（bilibili，缓存）+ 长文本回归 + 迁移目录回归
+#   release  needs build,e2e：仅手动 dispatch 且勾选 release 时运行
+#
+# 为什么 CI 不需要 CUDA Toolkit：exe 通过 dynamic-link/dynamic-backends 动态链接
+# llama.dll 与 ggml*.dll，CUDA 能力由运行时外置 DLL 提供（ggml-cuda.dll、
+# onnxruntime_providers_cuda.dll、cudart/cublas/cufft/cudnn）。这些 DLL 取自
+# llama.cpp / sherpa-onnx / NVIDIA PyPI 的官方预编译产物，由 scripts/package_dist.py
+# 组装，并在组装后用 scripts/check_dll_deps.py 做 PE 导入闭包检查（缺件即告警/失败）。
+# ============================================================================
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "构建并打包后创建 GitHub Release"
+        type: boolean
+        default: false
+      version:
+        description: "Release 版本号（留空 = v + Cargo.toml 版本）"
+        type: string
+        default: ""
+      e2e_media:
+        description: "e2e 媒体来源（none = 跳过真实视频用例，只跑回归用例）"
+        type: choice
+        default: "bilibili"
+        options: [bilibili, none]
+      video_url:
+        description: "自定义媒体 URL（覆盖 bilibili 候选）"
+        type: string
+        default: ""
+      strict_media:
+        description: "媒体拉取失败时判失败（默认降级为跳过真实视频用例）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # release job 创建 Release 需要
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_LOG: info
+  # e2e 真实测试媒体：bilibili 上的日语视频（1~5 分钟），按顺序尝试，第一个可用即用。
+  # 换视频只需改这里；下载结果进 actions/cache，后续运行不再访问 bilibili。
+  E2E_BVIDS: "BV16r421g797 BV1ccdQY8Ee8 BV1No4y117UC BV1jT42167f3"
+
+jobs:
+  # ------------------------------------------------------------------ 构建
+  build:
+    name: 构建 + 单元测试 + 冒烟
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # target/ 不入缓存：sherpa-onnx-sys 把预编译库解到 target/sherpa-onnx-prebuilt/，
+          # 该目录不在 rust-cache 的保存范围内，但 fingerprint 会被恢复——导致 build.rs
+          # 不重跑而链接器找不到 sherpa-onnx-c-api.lib (LNK1181)。
+          cache-targets: false
+          cache-on-failure: true
+
+      # llama-cpp-sys-2 的 build.rs 使用 bindgen，需要 libclang
+      - name: Ensure libclang (bindgen)
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "$env:ProgramFiles\LLVM\bin",
+            "${env:ChocolateyInstall}\lib\llvm\tools\LLVM\bin"
+          )
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host 'libclang not found, installing LLVM via choco ...'
+            choco install llvm --no-progress -y | Out-Null
+            $found = "$env:ProgramFiles\LLVM\bin"
+            if (-not (Test-Path (Join-Path $found 'libclang.dll'))) { throw 'LLVM installation failed' }
+          }
+          Write-Host "Using LIBCLANG_PATH=$found"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$found"
+
+      - name: Build release exe (dynamic-link, CPU toolchain only)
+        run: cargo build --release --locked
+
+      # 构建脚本本应把 DLL 拷到 target/release，但历史上多次失效（LNK/运行时缺件），
+      # 这里保留兜底收集，并显式校验关键 DLL 存在。
+      - name: Collect runtime DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $found = @()
+          Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" | ForEach-Object {
+            $outDir = Join-Path $_.FullName "out"
+            if (Test-Path $outDir) { $found += Get-ChildItem -Recurse $outDir -Filter *.dll -File }
+          }
+          if ($found.Count -eq 0) { throw "在构建输出目录中未找到任何 llama/ggml DLL" }
+          foreach ($dll in $found) { Copy-Item $dll.FullName target/release/ -Force }
+          foreach ($r in @("llama.dll","ggml.dll","ggml-base.dll","llama-common.dll")) {
+            if (-not (Test-Path "target/release/$r")) { throw "收集后仍缺少 $r" }
+          }
+          Get-ChildItem target/release -Filter *.dll |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+
+      # 纯函数单元测试：时间轴/折行/长 cue 拆分、JSON 提取与修复、模板渲染、
+      # 质检判决与相似度门槛、配置路径。测试二进制需要能找到原生 DLL。
+      - name: Unit tests (cargo test)
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\target\release;$env:PATH"
+          cargo test --release --locked -- --nocapture --test-threads 1
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          Write-Host "=== exe 静态导入表 ==="
+          pip install --quiet pefile
+          python -c "import pefile; pe=pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True); pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']]); print('\n'.join(sorted(e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT)))"
+
+          Write-Host "=== 逐个 LoadLibrary 验证导入项 ==="
+          python -c @"
+          import ctypes, pefile
+          pe = pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True)
+          pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+          k32 = ctypes.WinDLL('kernel32')
+          bad = 0
+          for e in pe.DIRECTORY_ENTRY_IMPORT:
+              name = e.dll.decode()
+              ok = bool(k32.LoadLibraryExW(name, None, 0x8))
+              print(('OK  ' if ok else 'FAIL'), name)
+              if not ok and not name.lower().startswith(('api-ms-', 'kernel', 'ntdll', 'bcrypt', 'vcruntime', 'msvcp')):
+                  bad += 1
+          raise SystemExit(1 if bad else 0)
+          "@
+
+          Write-Host "=== --version / --help ==="
+          & ./target/release/subtitle-assistant.exe --version
+          Write-Host "VERSION_EXIT=$LASTEXITCODE"
+          & ./target/release/subtitle-assistant.exe --help | Select-Object -First 8
+          Write-Host "HELP_EXIT=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { throw "--help 退出码非 0" }
+
+      - name: Upload runtime bundle (exe + DLL)
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-x64-runtime
+          path: |
+            target/release/subtitle-assistant.exe
+            target/release/*.dll
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------- 端到端测试
+  e2e:
+    name: e2e（真实日语视频 + 长文本回归 + 迁移目录回归）
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download runtime bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: win-x64-runtime
+          path: .          # 还原出 target/release/subtitle-assistant.exe 与 *.dll
+
+      - name: Console UTF-8
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "PYTHONIOENCODING=utf-8"
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+
+      - name: Install ffmpeg / ffprobe
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress -y | Out-Null
+          RefreshEnv
+          ffmpeg -version | Select-Object -First 1
+          ffprobe -version | Select-Object -First 1
+
+      - name: Install python deps (yt-dlp / pefile)
+        shell: pwsh
+        run: |
+          pip install --quiet --upgrade yt-dlp pefile
+          yt-dlp --version
+
+      # ---------------- 模型（缓存；用文档里的下载脚本，顺带验证脚本本身） ----------------
+      - name: Cache models (~2.5GB)
+        id: models-cache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: qwen3-models-v3
+
+      - name: Download models (cache miss)
+        if: steps.models-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/download_models.ps1
+          Get-ChildItem -Recurse models | Select-Object FullName, Length | Format-Table -AutoSize
+
+      # ---------------- 测试媒体（bilibili 日语视频，缓存） ----------------
+      - name: Cache e2e media
+        id: media-cache
+        if: inputs.e2e_media != 'none'
+        uses: actions/cache@v4
+        with:
+          path: media-cache
+          key: e2e-media-bilibili-v2
+
+      - name: Fetch media (cache miss)
+        if: inputs.e2e_media != 'none' && steps.media-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path media-cache | Out-Null
+          $bvids = @()
+          foreach ($b in "$env:E2E_BVIDS".Split(' ')) { if ($b) { $bvids += "--bvid"; $bvids += $b } }
+          $urlArgs = @()
+          if ("${{ inputs.video_url }}") { $urlArgs = @("--url", "${{ inputs.video_url }}") }
+          python scripts/fetch_media.py --out media-cache --min-secs 60 --max-secs 420 @urlArgs @bvids
+          $ok = $LASTEXITCODE -eq 0
+          Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_OK=$ok"
+          if (-not $ok) {
+            Write-Warning "媒体拉取失败（bilibili 风控或视频下线）。真实视频用例将被跳过。"
+            if ("${{ inputs.strict_media }}" -eq "true") { throw "strict_media=true，判定失败" }
+          }
+          Get-ChildItem media-cache -ErrorAction SilentlyContinue | Select-Object Name, Length
+
+      - name: Stage media
+        if: inputs.e2e_media != 'none'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path media | Out-Null
+          $f = Get-ChildItem media-cache -File -ErrorAction SilentlyContinue |
+               Where-Object { $_.Extension -match '\.(m4a|mp4|webm|mp3|wav|flv|mkv|media)$' } |
+               Sort-Object Length -Descending | Select-Object -First 1
+          if ($f) {
+            Copy-Item $f.FullName "media/test_video$($f.Extension)" -Force
+            Write-Host "使用测试媒体: media/test_video$($f.Extension) ($([math]::Round($f.Length/1MB,2)) MB)"
+            ffprobe -v error -show_entries format=duration -of csv=p=0 "media/test_video$($f.Extension)"
+            Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_FILE=media/test_video$($f.Extension)"
+          } else {
+            Write-Warning "没有可用媒体文件，真实视频用例将被跳过"
+            Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_FILE="
+          }
+
+      # ---------------- T1: 真实视频全流程（ASR -> 逐句质检 -> 摘要 -> 翻译 -> 排版） ----------------
+      - name: T1 真实日语视频全流程
+        shell: pwsh
+        run: |
+          if (-not $env:MEDIA_FILE) {
+            Write-Warning "跳过 T1（无媒体）。这不意味着通过：请用 workflow_dispatch 重试或换候选视频。"
+            Add-Content -Path $env:GITHUB_ENV -Value "T1_SKIPPED=1"
+            exit 0
+          }
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & ./target/release/subtitle-assistant.exe --no-pause --log-file media/t1.log $env:MEDIA_FILE
+          $code = $LASTEXITCODE
+          $sw.Stop()
+          Write-Host "T1 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
+          Get-ChildItem media | Select-Object Name, Length | Format-Table -AutoSize
+          if ($code -ne 0) { throw "T1 退出码非 0（详见 media/t1.log 末尾）" }
+
+      - name: T1 断言
+        shell: pwsh
+        run: |
+          if ($env:T1_SKIPPED) { Write-Warning "T1 已跳过"; exit 0 }
+          $srt = ($env:MEDIA_FILE -replace '\.[^.]+$','') + ".srt"
+          Write-Host "=== $srt 内容 ==="
+          Get-Content $srt -Encoding UTF8 | Select-Object -First 60
+          python scripts/check_e2e.py --name T1-真实视频 --srt $srt --log media/t1.log `
+            --min-cues 8 --target-lang zh --max-cue-secs 15 --max-line-width 44 `
+            --expect-qc --max-untranslated 2
+          if ($LASTEXITCODE -ne 0) { throw "T1 断言失败" }
+
+      # ---------------- T2: 长文本回归（旧版必然 abort 的路径） ----------------
+      # tests/fixtures/long_ja.srt 有 125 条、约 3500 字的日语转录：
+      #   * prompt > n_batch(2048) -> 旧版命中 llama.cpp 的 GGML_ASSERT 直接 abort
+      #   * --summary-chunk-tokens 1200 -> 强制走摘要 map-reduce 分块
+      - name: T2 长文本（--from-srt）回归
+        shell: pwsh
+        run: |
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & ./target/release/subtitle-assistant.exe --no-pause --from-srt `
+              --output-dir media --summary-chunk-tokens 1200 --batch-size 20 `
+              --log-file media/t2.log tests/fixtures/long_ja.srt
+          $code = $LASTEXITCODE
+          $sw.Stop()
+          Write-Host "T2 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
+          if ($code -ne 0) { throw "T2 退出码非 0（长文本路径回归失败，详见 media/t2.log）" }
+
+      - name: T2 断言
+        shell: pwsh
+        run: |
+          Write-Host "=== media/long_ja.translated.srt 前 40 行 ==="
+          Get-Content media/long_ja.translated.srt -Encoding UTF8 | Select-Object -First 40
+          python scripts/check_e2e.py --name T2-长文本回归 --srt media/long_ja.translated.srt `
+            --log media/t2.log --min-cues 120 --target-lang zh `
+            --max-cue-secs 9 --max-line-width 44 --min-summary-chunks 2 --max-untranslated 0
+          if ($LASTEXITCODE -ne 0) { throw "T2 断言失败" }
+
+      # ---------------- T3: 迁移目录回归（拖拽/快捷方式启动路径） ----------------
+      # 把 exe + DLL + prompts 拷到 TEMP，models 用 junction 指过去，然后从别的 CWD 启动。
+      # 旧版把资源路径写死成 CWD 相对路径，这种启动方式必然报"提示词目录不存在"。
+      - name: T3 迁移目录 + 非仓库 CWD 启动
+        shell: pwsh
+        run: |
+          $repo = $PWD.Path
+          $pkg = Join-Path $env:TEMP "qsa-pkg"
+          Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item target/release/*.dll $pkg/
+          Copy-Item target/release/subtitle-assistant.exe $pkg/
+          Copy-Item -Recurse prompts $pkg/prompts
+          New-Item -ItemType Junction -Path (Join-Path $pkg "models") -Target (Join-Path $repo "models") | Out-Null
+          # 只取前 6 条做快速用例
+          python -c "import pathlib; t=pathlib.Path(r'$repo/tests/fixtures/long_ja.srt').read_text(encoding='utf-8'); pathlib.Path(r'$repo/media/short_ja.srt').write_text('\n\n'.join(t.split('\n\n')[:6]), encoding='utf-8')"
+          $srtIn  = Join-Path $repo "media/short_ja.srt"
+          $outDir = Join-Path $env:TEMP "qsa-out"
+          $logOut = Join-Path $env:TEMP "qsa-out-t3.log"
+          Write-Host "从 CWD=$env:TEMP 启动 $pkg\subtitle-assistant.exe"
+          Push-Location $env:TEMP
+          try {
+            & (Join-Path $pkg "subtitle-assistant.exe") --no-pause --from-srt `
+                --output-dir $outDir --summary-chunk-tokens 30000 `
+                --log-file $logOut $srtIn
+            $code = $LASTEXITCODE
+          } finally { Pop-Location }
+          Write-Host "T3 退出码=$code"
+          Copy-Item $logOut (Join-Path $repo "media/t3.log") -Force
+          Get-ChildItem $outDir -ErrorAction SilentlyContinue | Select-Object Name, Length
+          Copy-Item (Join-Path $outDir "*.srt") (Join-Path $repo "media/t3.translated.srt") -Force -ErrorAction SilentlyContinue
+          if ($code -ne 0) { throw "T3 退出码非 0（exe 目录回退失效，详见 media/t3.log）" }
+
+      - name: T3 断言
+        shell: pwsh
+        run: |
+          python scripts/check_e2e.py --name T3-迁移目录 --srt media/t3.translated.srt --log media/t3.log `
+            --min-cues 5 --target-lang zh --max-line-width 44 --expect-log-contains "改用 exe 目录"
+          if ($LASTEXITCODE -ne 0) { throw "T3 断言失败" }
+
+      - name: Upload e2e results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: |
+            media/*.srt
+            media/*.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ----------------------------------------------------------------- 发布
+  release:
+    name: 打包发行包 + 创建 GitHub Release
+    needs: [build, e2e]
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download runtime bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: win-x64-runtime
+          path: .
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          if (-not $v) {
+            $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            $v = "v" + $m.Matches[0].Groups[1].Value
+          }
+          if ($v -notmatch '^v') { $v = "v$v" }
+          Write-Host "release version: $v"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Cache downloaded runtime packages (~1.9GB)
+        uses: actions/cache@v4
+        with:
+          path: .distcache
+          key: distcache-${{ hashFiles('scripts/package_dist.py') }}
+          restore-keys: distcache-
+
+      - name: Package CPU & CUDA12 distributions
+        shell: pwsh
+        run: |
+          pip install --quiet pefile
+          python scripts/package_dist.py `
+            --exe target/release/subtitle-assistant.exe `
+            --build-dir target/release `
+            --version ${{ steps.ver.outputs.version }} `
+            --out dist `
+            --cache .distcache `
+            --strict-deps
+
+      - name: Show SHA256SUMS
+        shell: pwsh
+        run: Get-Content dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS.txt
+          if-no-files-found: error

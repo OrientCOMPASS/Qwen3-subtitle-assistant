@@ -1,4 +1,9 @@
 /target
 /dist
 /.distcache
-*.srt
+/*.srt
+/media
+/media-cache
+/bundle
+# 测试夹具必须入库
+!tests/fixtures/*.srt

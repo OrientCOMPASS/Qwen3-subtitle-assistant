@@ -1,8 +1,8 @@
 [package]
 name = "subtitle-assistant"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "本地离线字幕转录与翻译助手（外置 DLL 运行时，支持 CUDA 加速与逐句 LLM 质检）"
+description = "本地离线字幕转录与翻译助手（外置 DLL 运行时 · CUDA 加速 · 逐句 LLM 质检 · 长视频分块摘要 · 字幕排版）"
 license = "Unlicense"
 
 [dependencies]
