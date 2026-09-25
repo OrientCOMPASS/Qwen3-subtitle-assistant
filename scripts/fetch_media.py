@@ -31,8 +31,15 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+# 关键：bilibili 的两套风控要分开对付（实测于数据中心 IP，2026-09）
+#   * api.bilibili.com / www.bilibili.com 的内容接口：浏览器 UA 一律 412
+#     （TLS 指纹模拟 curl_cffi 也无效），但朴素的 `curl/8.0` 直接放行；
+#   * upos-*.akamaized.net / *.bilivideo.com 的 CDN：`curl/*` UA 一律 403 Access Denied，
+#     必须用浏览器 UA + Referer。
+# 所以：接口用 API_UA，下载用 CDN_UA。
+API_UA = "curl/8.0"
+CDN_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 HOME = "https://www.bilibili.com/"
 
 
@@ -45,12 +52,12 @@ class Bili:
         self.cj = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.cj))
-        self.opener.addheaders = [("User-Agent", UA), ("Referer", HOME)]
+        self.opener.addheaders = [("User-Agent", API_UA), ("Referer", HOME)]
 
     def get(self, url: str, referer: str = HOME, tries: int = 3, sleep: float = 4.0):
         last = None
         for i in range(tries):
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": referer})
+            req = urllib.request.Request(url, headers={"User-Agent": API_UA, "Referer": referer})
             try:
                 with self.opener.open(req, timeout=40) as resp:
                     return resp.read()
@@ -108,8 +115,9 @@ class Bili:
         dash = data.get("dash") or {}
         audios = dash.get("audio") or []
         if audios:
-            # 取码率最低的一路：语音识别不需要高码率，也下载得最快
-            a = min(audios, key=lambda x: x.get("bandwidth") or 0)
+            # 取码率最高的一路：音频轨最大也只有 128kbps（3 分钟约 3MB），
+            # 而最低档是 31kbps 的 HE-AAC，对 ASR 音质不利。
+            a = max(audios, key=lambda x: x.get("bandwidth") or 0)
             url = a.get("baseUrl") or a.get("base_url")
             if not url:
                 raise RuntimeError("dash.audio 缺少 baseUrl")
@@ -126,13 +134,29 @@ class Bili:
             return url, "mp4"
         raise RuntimeError("playurl 既无 dash 也无 durl")
 
-    def download(self, url: str, referer: str, dest: Path) -> int:
+    def download(self, url: str, referer: str, dest: Path, tries: int = 3) -> int:
+        """从 CDN 下载。注意：这里必须用浏览器 UA + Referer，用 curl UA 会 403。"""
         tmp = dest.with_suffix(dest.suffix + ".part")
-        req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": referer})
-        with self.opener.open(req, timeout=120) as resp, open(tmp, "wb") as f:
-            shutil.copyfileobj(resp, f, 1024 * 256)
-        tmp.rename(dest)
-        return dest.stat().st_size
+        last = None
+        for i in range(tries):
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": CDN_UA, "Referer": referer,
+                                  "Origin": HOME.rstrip("/"), "Accept": "*/*"})
+                # 不走带 cookie 的 opener：CDN 不需要 cookie，且避免 API 侧 UA 泄漏到这里
+                with urllib.request.urlopen(req, timeout=180) as resp, open(tmp, "wb") as f:
+                    shutil.copyfileobj(resp, f, 1024 * 256)
+                tmp.rename(dest)
+                return dest.stat().st_size
+            except urllib.error.HTTPError as e:
+                last = f"HTTP {e.code}"
+                body = e.read(200).decode("utf-8", "replace").replace("\n", " ")
+                log(f"CDN 下载失败（{last}）: {body[:120]}")
+            except Exception as e:  # noqa: BLE001
+                last = f"{type(e).__name__}: {e}"
+                log(f"CDN 下载失败: {last}")
+            time.sleep(3 * (i + 1))
+        raise RuntimeError(f"CDN 下载失败（{tries} 次）: {last}")
 
 
 def ffprobe_duration(path: Path) -> float | None:
@@ -154,7 +178,7 @@ def try_ytdlp(url: str, out: Path) -> Path | None:
         return None
     log(f"yt-dlp 兜底: {url}")
     cmd = ["yt-dlp", "--no-playlist", "-f", "bestaudio/best",
-           "--user-agent", UA, "--add-header", f"Referer:{HOME}",
+           "--user-agent", API_UA, "--add-header", f"Referer:{HOME}",
            "-o", str(out.with_suffix(".%(ext)s")), url]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
@@ -192,7 +216,7 @@ def main() -> int:
         if args.url.startswith("http") and not ("bilibili.com" in args.url or "b23.tv" in args.url):
             dest = out_dir / (name + ".media")
             try:
-                req = urllib.request.Request(args.url, headers={"User-Agent": UA})
+                req = urllib.request.Request(args.url, headers={"User-Agent": CDN_UA})
                 with urllib.request.urlopen(req, timeout=180) as r, open(dest, "wb") as f:
                     shutil.copyfileobj(r, f, 1024 * 256)
             except Exception as e:  # noqa: BLE001
