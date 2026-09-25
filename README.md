@@ -294,20 +294,49 @@ python scripts/check_dll_deps.py --dir <发行包目录> --fail-on-missing --str
 全程无需 CUDA Toolkit；构建产物（exe + DLL）作为 artifact 传给后续 job。
 冒烟测试会打印 PE 导入表并逐个 `LoadLibrary` 验证。
 
+**增量构建**：`target/` 入 rust-cache，llama.cpp 的 CMake 产物与全部依赖 crate 都能复用，
+构建从 ~9.5 分钟降到分钟级；**唯独 release（dispatch 勾选 `release`）走全量构建**
+（`cache-targets: false` + 显式清空 `target`），保证发布物干净可复现。
+
+⚠️ 增量构建有个坑：rust-cache 的 `cleanTargetDir` 会把 `target/` 下**非 profile 目录**整个清空，
+而 sherpa-onnx-sys 恰好把预编译库解到 `target/sherpa-onnx-prebuilt/`
+（其 `build.rs`：`cache_root = <target>/sherpa-onnx-prebuilt`）。于是 fingerprint 恢复了、
+库却被删掉 → `LNK1181: sherpa-onnx-c-api.lib`（这正是旧版被迫 `cache-targets: false` 的原因）。
+本工作流把该目录单独用 `actions/cache` 存一份（key `sherpa-prebuilt-1.13.8-win-x64-shared`），
+构建前还原回 `target/`；升级 sherpa-onnx 版本时记得同步这个 key。
+
 **e2e**（`needs: build`，复用 artifact，不重复编译）：
 
 | 用例 | 内容 | 断言 |
 |---|---|---|
-| T1 真实视频 | bilibili 日语视频（>1 分钟，`scripts/fetch_media.py` 下载 + actions/cache 缓存）跑完整流程：ASR → 逐句质检 → 摘要 → 翻译 → 排版 | 字幕条数、最长 cue ≤15s、最宽行 ≤44、假名占比 ≤3%（确认真翻成中文）、回退原文 ≤2 条、质检计数自洽、日志无 `GGML_ASSERT`/panic |
-| T2 长文本回归 | `tests/fixtures/long_ja.srt`（125 条、约 3500 字日语）用 `--from-srt --summary-chunk-tokens 1200` 跑翻译 | 退出码 0（旧版这里必然 abort）、≥120 条、摘要分块 ≥2、回退原文 0 条 |
-| T3 迁移目录回归 | exe+DLL+prompts 拷到 `%TEMP%`，`models` 用 junction，从**非仓库 CWD** 启动 | 退出码 0，且日志出现“改用 exe 目录”（证明资源路径回退生效） |
+| T2a 长 prompt 回归 | `tests/fixtures/long_lines_ja.srt`（50 条 20 秒长 cue、约 7000 字）配 `--ctx-size 12288 --summary-chunk-tokens 10000`，强制整篇一次性喂给摘要 → prompt ~5000 token 远超 `n_batch`(2048) | 退出码 0（**v0.2 在此必然 `GGML_ASSERT` abort**）、日志出现「分块 prefill」、≥80 条、最长 cue ≤9s、最宽行 ≤44、回退原文 ≤5 条 |
+| T2b 摘要分块回归 | `long_ja.srt` 前 40 条配 `--summary-chunk-tokens 400`，强制全局摘要走 map-reduce | 退出码 0、≥40 条、日志「摘要分块 N」且 N ≥ 2 |
+| T3 迁移目录回归 | exe+DLL+prompts 拷到 `%TEMP%`，`models` 用 junction，从**非仓库 CWD** 启动 | 退出码 0，且日志出现「改用 exe 目录」（证明资源路径回退生效） |
+| T1 真实视频 | bilibili 日语视频（>1 分钟，`scripts/fetch_media.py` 下载 + actions/cache 缓存）跑完整流程：ASR → 逐句质检 → 摘要 → 翻译 → 排版 | 字幕条数、最长 cue ≤15s、最宽行 ≤44、假名占比 ≤3%（确认真翻成中文）、回退原文 ≤5 条、质检计数自洽、日志无 `GGML_ASSERT`/panic |
 
-关于 bilibili：它对数据中心 IP 有**请求级**风控（HTTP 412）。`fetch_media.py` 的做法是
-先访问首页拿 `buvid3` cookie，再用 view/playurl 两个接口取最低码率的音频轨（一次运行只发
-3 个请求），失败则换候选 BV、再退到 yt-dlp。下载成功后进 `actions/cache`
-（key `e2e-media-bilibili-v2`），后续运行不再访问 bilibili。若当次全部失败：默认**跳过 T1**
-并打 warning（T2/T3 照跑），dispatch 时勾选 `strict_media` 可改为直接判失败。
-换测试视频只需改 workflow 顶部的 `E2E_BVIDS`。
+三个回归用例都不依赖网络，排在真实视频用例之前跑，最快拿到关键反馈。
+模型缓存用 `actions/cache/restore` + `save(if: always())` 而非 `actions/cache`——后者的 post 步骤在 job 失败时会被跳过，2.7GB 模型会每轮重下。
+
+关于 bilibili 与数据中心 IP（实测结论，2026-09）：GitHub runner 的 IP 会被 bilibili 判 412，
+但**风控是针对 UA 的，且两套接口的要求正好相反**：
+
+| 目标 | 浏览器 UA（含 curl_cffi 的 chrome/safari/edge TLS 指纹模拟） | `curl/8.0` UA |
+|---|---|---|
+| `api.bilibili.com` / `www.bilibili.com` 内容接口 | **412** | **200 放行** |
+| `upos-*.akamaized.net` / `*.bilivideo.com` CDN | **206 正常** | **403 Access Denied** |
+
+所以 `scripts/fetch_media.py` 用两套 UA：接口侧（首页引导 cookie → view 取 cid/时长 →
+playurl 取音频流）走 `curl/8.0`，音频下载走浏览器 UA + Referer + Origin；
+音频轨取码率最高的一路（128kbps，3 分钟视频约 3MB；最低档是 31kbps HE-AAC，对 ASR 不利）。
+下载成功后进 `actions/cache`（key `e2e-media-bilibili-v2`），**CI 只需成功一次**，之后不再访问 bilibili。
+
+风控若再变，兜底路径按优先级：
+1. dispatch 时填 `video_url`（任意可直链下载的媒体 URL）；
+2. 在仓库 Settings → Secrets and variables → Variables 里设 `E2E_MEDIA_URL`，之后每次运行自动使用；
+3. 本地跑 `python scripts/fetch_media.py --bvid BV…`（住宅 IP 无风控）拿到文件后自行托管。
+
+全部失败时默认**跳过 T1** 并打 warning（T2a/T2b/T3 照跑），dispatch 勾选 `strict_media`
+可改为直接判失败。换测试视频只需改 workflow 顶部的 `E2E_BVIDS`。
 
 **release**（`needs: [build, e2e]`，仅手动 dispatch 且勾选 `release`）：
 `scripts/package_dist.py` 下载官方预编译 DLL 组装 CPU / CUDA12 两个发行包，

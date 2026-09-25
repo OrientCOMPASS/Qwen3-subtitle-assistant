@@ -196,27 +196,45 @@ jobs:
           python -c "import pefile; pe=pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True); pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']]); print('\n'.join(sorted(e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT)))"
 
           Write-Host "=== 逐个 LoadLibrary 验证导入项 ==="
+          # 必须用【exe 同目录的完整路径】加载：LOAD_WITH_ALTERED_SEARCH_PATH(0x8) 会让
+          # 依赖 DLL 也从该目录解析，这才等价于真实启动场景。
+          # 旧版用裸 DLL 名加载（搜索路径是 CWD=仓库根，而 DLL 在 target/release 下），
+          # 于是 llama.dll / sherpa-onnx-c-api.dll 永远 FAIL——但旧脚本只打印不判定，
+          # 这个"验证"其实一直是摆设。
           python -c @"
-          import ctypes, pefile
-          pe = pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True)
+          import ctypes, os, pefile
+          d = os.path.join('target', 'release')
+          pe = pefile.PE(os.path.join(d, 'subtitle-assistant.exe'), fast_load=True)
           pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
           k32 = ctypes.WinDLL('kernel32')
-          bad = 0
+          SYS = ('api-ms-', 'ext-ms-', 'kernel', 'ntdll', 'bcrypt', 'ucrtbase', 'vcruntime', 'msvcp', 'ws2_32', 'advapi32', 'user32', 'ole32', 'shell32', 'sechost', 'rpcrt4', 'crypt32', 'winmm', 'version', 'shlwapi', 'userenv', 'psapi', 'iphlpapi', 'wldap32', 'normaliz', 'dbghelp', 'gdi32', 'msvcrt')
+          bad = []
           for e in pe.DIRECTORY_ENTRY_IMPORT:
               name = e.dll.decode()
-              ok = bool(k32.LoadLibraryExW(name, None, 0x8))
-              print(('OK  ' if ok else 'FAIL'), name)
-              if not ok and not name.lower().startswith(('api-ms-', 'kernel', 'ntdll', 'bcrypt', 'vcruntime', 'msvcp')):
-                  bad += 1
+              local = os.path.join(d, name)
+              target = local if os.path.isfile(local) else name
+              ok = bool(k32.LoadLibraryExW(target, None, 0x8))
+              where = 'local' if os.path.isfile(local) else 'system'
+              print(('OK  ' if ok else 'FAIL'), f'{name:<28}', where)
+              if not ok and not name.lower().startswith(SYS):
+                  bad.append(name)
+          print('非系统导入项加载失败:', bad or '无')
           raise SystemExit(1 if bad else 0)
           "@
+          if ($LASTEXITCODE -ne 0) { throw "导入项加载验证失败（见上方 FAIL 行）" }
 
           Write-Host "=== --version / --help ==="
-          & ./target/release/subtitle-assistant.exe --version
-          Write-Host "VERSION_EXIT=$LASTEXITCODE"
-          & ./target/release/subtitle-assistant.exe --help | Select-Object -First 8
-          Write-Host "HELP_EXIT=$LASTEXITCODE"
-          if ($LASTEXITCODE -ne 0) { throw "--help 退出码非 0" }
+          $ver = & ./target/release/subtitle-assistant.exe --version 2>&1
+          $verExit = $LASTEXITCODE
+          Write-Host $ver
+          if ($verExit -ne 0) { throw "--version 退出码 $verExit" }
+          # 先整体捕获再截取：`--help | Select-Object -First N` 会提前关闭管道，
+          # 让上游原生命令被杀，$LASTEXITCODE 变成非 0（假失败）。
+          $help = & ./target/release/subtitle-assistant.exe --help 2>&1
+          $helpExit = $LASTEXITCODE
+          $help | Select-Object -First 10
+          Write-Host "HELP_EXIT=$helpExit"
+          if ($helpExit -ne 0) { throw "--help 退出码 $helpExit" }
 
       - name: Upload runtime bundle (exe + DLL)
         uses: actions/upload-artifact@v4
