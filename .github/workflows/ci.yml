@@ -279,7 +279,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: win-x64-runtime
-          path: .          # 还原出 target/release/subtitle-assistant.exe 与 *.dll
+          # upload-artifact 会以多个 path 的**最小公共祖先**作为压缩包根，
+          # 因此包内是 subtitle-assistant.exe / *.dll（不含 target/release 前缀），
+          # 必须显式下载到 target/release，否则 exe 会落在仓库根、后续步骤找不到。
+          path: target/release
 
       - name: Console UTF-8
         shell: pwsh
@@ -331,15 +334,16 @@ jobs:
           key: qwen3-models-v3
 
       # ---------------- 测试媒体（bilibili 日语视频，缓存） ----------------
-      - name: Cache e2e media
+      - name: Restore e2e media
         id: media-cache
         if: inputs.e2e_media != 'none'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: media-cache
           key: e2e-media-bilibili-v2
 
       - name: Fetch media (cache miss)
+        id: fetch-media
         if: inputs.e2e_media != 'none' && steps.media-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
@@ -359,6 +363,10 @@ jobs:
           $ok = $LASTEXITCODE -eq 0
           Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_OK=$ok"
           Get-ChildItem media-cache -ErrorAction SilentlyContinue | Select-Object Name, Length
+          # 只有真的拿到 >100KB 的媒体文件才允许写缓存（否则会缓存一个空目录，
+          # 之后每轮都"命中缓存"却无媒体可用，比不缓存更糟）
+          $got = @(Get-ChildItem media-cache -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 100KB })
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "has_media=$([bool]$got)".ToLower()
           if (-not $ok) {
             Write-Warning "媒体拉取失败（bilibili 对数据中心 IP 返回 412，或直链不可达）。T1 将跳过，T2/T3 照常执行。"
             if ("${{ inputs.strict_media }}" -eq "true") { throw "strict_media=true，判定失败" }
@@ -366,6 +374,14 @@ jobs:
           # 关键：pwsh 步骤末尾会 exit $LASTEXITCODE，必须显式归零，
           # 否则"降级跳过"会变成整步失败（上一轮就是这样红的）。
           exit 0
+
+      - name: Save e2e media
+        # always()：媒体只要成功拉到一次就永久缓存，之后再也不依赖 bilibili 是否放行
+        if: ${{ always() && inputs.e2e_media != 'none' && steps.media-cache.outputs.cache-hit != 'true' && steps.fetch-media.outputs.has_media == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: media-cache
+          key: e2e-media-bilibili-v2
 
       - name: Stage media
         if: inputs.e2e_media != 'none'
@@ -528,7 +544,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: win-x64-runtime
-          path: .
+          path: target/release   # 见 e2e job 中的说明：包内不含 target/release 前缀
 
       - name: Resolve version
         id: ver
