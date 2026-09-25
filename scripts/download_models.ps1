@@ -1,4 +1,4 @@
-# 一键下载运行所需的全部模型到程序目录的 models\ 下：
+﻿# 一键下载运行所需的全部模型到程序目录的 models\ 下：
 #   1. Qwen3-ASR 0.6B int8（sherpa-onnx 格式，GitHub Release）
 #   2. Silero VAD（GitHub Release）
 #   3. Qwen3-1.7B-Q8_0.gguf（HuggingFace，可用 -HfMirror 切换镜像）

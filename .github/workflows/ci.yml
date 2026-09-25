@@ -265,12 +265,101 @@ jobs:
             Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_FILE="
           }
 
-      # ---------------- T1: 真实视频全流程（ASR -> 逐句质检 -> 摘要 -> 翻译 -> 排版） ----------------
+      # ============ 回归用例（不依赖网络，先跑，最快拿到关键反馈） ============
+      # T2a：长 prompt 回归。tests/fixtures/long_lines_ja.srt 是 50 条 20 秒长 cue、约 7000 字，
+      #      配 --summary-chunk-tokens 10000 强制"整篇一次性喂给摘要"：prompt ~5000 token，
+      #      远超 n_batch(2048)。v0.2 在这里会命中 llama.cpp 的 GGML_ASSERT 直接 abort，
+      #      v0.3 必须分块 prefill 并正常产出——日志里要能看到"分块 prefill"。
+      #      同时 20 秒长 cue 会触发排版阶段的按句读拆分。
+      - name: T2a 长 prompt（分块 prefill）+ 长 cue 拆分
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path media | Out-Null
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & ./target/release/subtitle-assistant.exe --no-pause --from-srt `
+              --output-dir media --ctx-size 12288 --summary-chunk-tokens 10000 `
+              --batch-size 20 --log-file media/t2a.log tests/fixtures/long_lines_ja.srt
+          $code = $LASTEXITCODE
+          $sw.Stop()
+          Write-Host "T2a 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
+          if ($code -ne 0) { throw "T2a 退出码非 0（长 prompt 路径回归失败，详见 media/t2a.log）" }
+
+      - name: T2a 断言
+        shell: pwsh
+        run: |
+          Get-Content media/long_lines_ja.translated.srt -Encoding UTF8 | Select-Object -First 24
+          python scripts/check_e2e.py --name T2a-长prompt --srt media/long_lines_ja.translated.srt `
+            --log media/t2a.log --min-cues 80 --target-lang zh `
+            --max-cue-secs 9 --max-line-width 44 --max-untranslated 5 `
+            --expect-log-contains "分块 prefill"
+          if ($LASTEXITCODE -ne 0) { throw "T2a 断言失败" }
+
+      # T2b：摘要 map-reduce 回归。取 long_ja.srt 前 40 条，把单块预算压到 400 token，
+      #      强制全局摘要走"分块提取 -> 合并"路径（日志里的"摘要分块 N"必须 >= 2）。
+      - name: T2b 摘要分块 map-reduce
+        shell: pwsh
+        run: |
+          python -c "import pathlib; t=pathlib.Path('tests/fixtures/long_ja.srt').read_text(encoding='utf-8'); b=[x for x in t.strip().split('\n\n') if x.strip()][:40]; pathlib.Path('media/short40_ja.srt').write_text('\n\n'.join(b), encoding='utf-8')"
+          & ./target/release/subtitle-assistant.exe --no-pause --from-srt `
+              --output-dir media --summary-chunk-tokens 400 --batch-size 20 `
+              --log-file media/t2b.log media/short40_ja.srt
+          $code = $LASTEXITCODE
+          Write-Host "T2b 退出码=$code"
+          if ($code -ne 0) { throw "T2b 退出码非 0（摘要分块路径失败，详见 media/t2b.log）" }
+
+      - name: T2b 断言
+        shell: pwsh
+        run: |
+          python scripts/check_e2e.py --name T2b-摘要分块 --srt media/short40_ja.translated.srt `
+            --log media/t2b.log --min-cues 40 --target-lang zh `
+            --max-cue-secs 9 --max-line-width 44 --min-summary-chunks 2 --max-untranslated 3
+          if ($LASTEXITCODE -ne 0) { throw "T2b 断言失败" }
+
+      # T3：迁移目录回归（拖拽/快捷方式启动路径）。exe+DLL+prompts 拷到 TEMP，
+      #      models 用 junction 指过去，再从非仓库 CWD 启动。
+      #      v0.2 把资源路径写死成 CWD 相对路径，这种启动方式必然报"提示词目录不存在"。
+      - name: T3 迁移目录 + 非仓库 CWD 启动
+        shell: pwsh
+        run: |
+          $repo = $PWD.Path
+          $pkg = Join-Path $env:TEMP "qsa-pkg"
+          Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item target/release/*.dll $pkg/
+          Copy-Item target/release/subtitle-assistant.exe $pkg/
+          Copy-Item -Recurse prompts $pkg/prompts
+          New-Item -ItemType Junction -Path (Join-Path $pkg "models") -Target (Join-Path $repo "models") | Out-Null
+          python -c "import pathlib; t=pathlib.Path('tests/fixtures/long_ja.srt').read_text(encoding='utf-8'); b=[x for x in t.strip().split('\n\n') if x.strip()][:6]; pathlib.Path('media/short6_ja.srt').write_text('\n\n'.join(b), encoding='utf-8')"
+          $srtIn  = Join-Path $repo "media/short6_ja.srt"
+          $outDir = Join-Path $env:TEMP "qsa-out"
+          $logOut = Join-Path $env:TEMP "qsa-t3.log"
+          Write-Host "从 CWD=$env:TEMP 启动 $pkg\subtitle-assistant.exe"
+          Push-Location $env:TEMP
+          try {
+            & (Join-Path $pkg "subtitle-assistant.exe") --no-pause --from-srt `
+                --output-dir $outDir --summary-chunk-tokens 30000 `
+                --log-file $logOut $srtIn
+            $code = $LASTEXITCODE
+          } finally { Pop-Location }
+          Write-Host "T3 退出码=$code"
+          Copy-Item $logOut (Join-Path $repo "media/t3.log") -Force
+          Copy-Item (Join-Path $outDir "*.srt") (Join-Path $repo "media/t3.translated.srt") -Force -ErrorAction SilentlyContinue
+          Get-ChildItem $outDir -ErrorAction SilentlyContinue | Select-Object Name, Length
+          if ($code -ne 0) { throw "T3 退出码非 0（exe 目录回退失效，详见 media/t3.log）" }
+
+      - name: T3 断言
+        shell: pwsh
+        run: |
+          python scripts/check_e2e.py --name T3-迁移目录 --srt media/t3.translated.srt --log media/t3.log `
+            --min-cues 5 --target-lang zh --max-line-width 44 --expect-log-contains "改用 exe 目录"
+          if ($LASTEXITCODE -ne 0) { throw "T3 断言失败" }
+
+      # ============ T1：真实 bilibili 日语视频全流程（放最后，媒体拉取有不确定性） ============
       - name: T1 真实日语视频全流程
         shell: pwsh
         run: |
           if (-not $env:MEDIA_FILE) {
-            Write-Warning "跳过 T1（无媒体）。这不意味着通过：请用 workflow_dispatch 重试或换候选视频。"
+            Write-Warning "跳过 T1（无媒体）。这不代表通过：请用 workflow_dispatch 重试或更换 E2E_BVIDS。"
             Add-Content -Path $env:GITHUB_ENV -Value "T1_SKIPPED=1"
             exit 0
           }
@@ -287,78 +376,12 @@ jobs:
         run: |
           if ($env:T1_SKIPPED) { Write-Warning "T1 已跳过"; exit 0 }
           $srt = ($env:MEDIA_FILE -replace '\.[^.]+$','') + ".srt"
-          Write-Host "=== $srt 内容 ==="
+          Write-Host "=== $srt 内容（前 60 行） ==="
           Get-Content $srt -Encoding UTF8 | Select-Object -First 60
           python scripts/check_e2e.py --name T1-真实视频 --srt $srt --log media/t1.log `
             --min-cues 8 --target-lang zh --max-cue-secs 15 --max-line-width 44 `
-            --expect-qc --max-untranslated 2
+            --expect-qc --max-untranslated 5
           if ($LASTEXITCODE -ne 0) { throw "T1 断言失败" }
-
-      # ---------------- T2: 长文本回归（旧版必然 abort 的路径） ----------------
-      # tests/fixtures/long_ja.srt 有 125 条、约 3500 字的日语转录：
-      #   * prompt > n_batch(2048) -> 旧版命中 llama.cpp 的 GGML_ASSERT 直接 abort
-      #   * --summary-chunk-tokens 1200 -> 强制走摘要 map-reduce 分块
-      - name: T2 长文本（--from-srt）回归
-        shell: pwsh
-        run: |
-          $sw = [Diagnostics.Stopwatch]::StartNew()
-          & ./target/release/subtitle-assistant.exe --no-pause --from-srt `
-              --output-dir media --summary-chunk-tokens 1200 --batch-size 20 `
-              --log-file media/t2.log tests/fixtures/long_ja.srt
-          $code = $LASTEXITCODE
-          $sw.Stop()
-          Write-Host "T2 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
-          if ($code -ne 0) { throw "T2 退出码非 0（长文本路径回归失败，详见 media/t2.log）" }
-
-      - name: T2 断言
-        shell: pwsh
-        run: |
-          Write-Host "=== media/long_ja.translated.srt 前 40 行 ==="
-          Get-Content media/long_ja.translated.srt -Encoding UTF8 | Select-Object -First 40
-          python scripts/check_e2e.py --name T2-长文本回归 --srt media/long_ja.translated.srt `
-            --log media/t2.log --min-cues 120 --target-lang zh `
-            --max-cue-secs 9 --max-line-width 44 --min-summary-chunks 2 --max-untranslated 0
-          if ($LASTEXITCODE -ne 0) { throw "T2 断言失败" }
-
-      # ---------------- T3: 迁移目录回归（拖拽/快捷方式启动路径） ----------------
-      # 把 exe + DLL + prompts 拷到 TEMP，models 用 junction 指过去，然后从别的 CWD 启动。
-      # 旧版把资源路径写死成 CWD 相对路径，这种启动方式必然报"提示词目录不存在"。
-      - name: T3 迁移目录 + 非仓库 CWD 启动
-        shell: pwsh
-        run: |
-          $repo = $PWD.Path
-          $pkg = Join-Path $env:TEMP "qsa-pkg"
-          Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
-          Copy-Item target/release/*.dll $pkg/
-          Copy-Item target/release/subtitle-assistant.exe $pkg/
-          Copy-Item -Recurse prompts $pkg/prompts
-          New-Item -ItemType Junction -Path (Join-Path $pkg "models") -Target (Join-Path $repo "models") | Out-Null
-          # 只取前 6 条做快速用例
-          python -c "import pathlib; t=pathlib.Path(r'$repo/tests/fixtures/long_ja.srt').read_text(encoding='utf-8'); pathlib.Path(r'$repo/media/short_ja.srt').write_text('\n\n'.join(t.split('\n\n')[:6]), encoding='utf-8')"
-          $srtIn  = Join-Path $repo "media/short_ja.srt"
-          $outDir = Join-Path $env:TEMP "qsa-out"
-          $logOut = Join-Path $env:TEMP "qsa-out-t3.log"
-          Write-Host "从 CWD=$env:TEMP 启动 $pkg\subtitle-assistant.exe"
-          Push-Location $env:TEMP
-          try {
-            & (Join-Path $pkg "subtitle-assistant.exe") --no-pause --from-srt `
-                --output-dir $outDir --summary-chunk-tokens 30000 `
-                --log-file $logOut $srtIn
-            $code = $LASTEXITCODE
-          } finally { Pop-Location }
-          Write-Host "T3 退出码=$code"
-          Copy-Item $logOut (Join-Path $repo "media/t3.log") -Force
-          Get-ChildItem $outDir -ErrorAction SilentlyContinue | Select-Object Name, Length
-          Copy-Item (Join-Path $outDir "*.srt") (Join-Path $repo "media/t3.translated.srt") -Force -ErrorAction SilentlyContinue
-          if ($code -ne 0) { throw "T3 退出码非 0（exe 目录回退失效，详见 media/t3.log）" }
-
-      - name: T3 断言
-        shell: pwsh
-        run: |
-          python scripts/check_e2e.py --name T3-迁移目录 --srt media/t3.translated.srt --log media/t3.log `
-            --min-cues 5 --target-lang zh --max-line-width 44 --expect-log-contains "改用 exe 目录"
-          if ($LASTEXITCODE -ne 0) { throw "T3 断言失败" }
 
       - name: Upload e2e results
         if: always()

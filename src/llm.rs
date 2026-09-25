@@ -146,11 +146,11 @@ impl LlmSession<'_> {
             self.ctx.decode(&mut batch).context("解码 Prompt 失败")?;
         }
         if total > cap {
-            debug!(
-                "长 prompt 分 {} 块 prefill（n_batch={}，共 {} tokens）",
+            info!(
+                "长 prompt 触发分块 prefill：共 {} tokens，分 {} 块（n_batch={}）",
+                total,
                 (total + cap - 1) / cap,
-                cap,
-                total
+                cap
             );
         }
 
