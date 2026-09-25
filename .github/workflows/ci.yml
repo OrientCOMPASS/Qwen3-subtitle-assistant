@@ -71,13 +71,44 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # target/ 入缓存 -> 增量构建（llama.cpp 的 CMake 产物与全部依赖 crate 都能复用，
+      # 实测全量 ~9.5 分钟可降到 2~3 分钟）。
+      # 注意 rust-cache 的 cleanTargetDir 会把 target/ 下"非 profile"目录整个清空，
+      # 而 sherpa-onnx-sys 恰好把预编译库解到 target/sherpa-onnx-prebuilt/
+      # （build.rs: cache_root = <target>/sherpa-onnx-prebuilt）——fingerprint 被恢复但库被删掉，
+      # 就会 LNK1181。所以那个目录单独用 actions/cache 保一份，构建前还原回去。
+      # release 走全量构建（cache-targets: false + 显式清空 target），保证发布物干净可复现。
       - uses: Swatinem/rust-cache@v2
         with:
-          # target/ 不入缓存：sherpa-onnx-sys 把预编译库解到 target/sherpa-onnx-prebuilt/，
-          # 该目录不在 rust-cache 的保存范围内，但 fingerprint 会被恢复——导致 build.rs
-          # 不重跑而链接器找不到 sherpa-onnx-c-api.lib (LNK1181)。
-          cache-targets: false
+          cache-targets: ${{ inputs.release && 'false' || 'true' }}
           cache-on-failure: true
+
+      - name: Restore sherpa-onnx prebuilt libs
+        id: sherpa-cache
+        if: ${{ !inputs.release }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .sherpa-prebuilt
+          key: sherpa-prebuilt-1.13.8-win-x64-shared
+
+      - name: Stage sherpa-onnx prebuilt libs into target/
+        if: ${{ !inputs.release }}
+        shell: pwsh
+        run: |
+          if (Test-Path .sherpa-prebuilt) {
+            New-Item -ItemType Directory -Force -Path target/sherpa-onnx-prebuilt | Out-Null
+            Copy-Item -Recurse -Force .sherpa-prebuilt/* target/sherpa-onnx-prebuilt/
+            Write-Host "已还原 sherpa-onnx 预编译库:"
+            Get-ChildItem -Recurse target/sherpa-onnx-prebuilt | Measure-Object -Property Length -Sum |
+              Select-Object Count, @{n='MB';e={[math]::Round($_.Sum/1MB,1)}}
+          } else { Write-Host "无 sherpa 预编译库缓存（首次构建会自行下载）" }
+
+      - name: Full clean build (release)
+        if: inputs.release
+        shell: pwsh
+        run: |
+          Write-Host "release 构建：清空 target 做全量构建"
+          Remove-Item -Recurse -Force target -ErrorAction SilentlyContinue
 
       # llama-cpp-sys-2 的 build.rs 使用 bindgen，需要 libclang
       - name: Ensure libclang (bindgen)
@@ -106,18 +137,48 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $found = @()
-          Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" | ForEach-Object {
-            $outDir = Join-Path $_.FullName "out"
-            if (Test-Path $outDir) { $found += Get-ChildItem -Recurse $outDir -Filter *.dll -File }
+          $required = @("llama.dll","ggml.dll","ggml-base.dll","llama-common.dll")
+          $missing = @($required | Where-Object { -not (Test-Path "target/release/$_") })
+          if ($missing.Count -eq 0) {
+            Write-Host "target/release 已有全部关键 DLL（增量构建），跳过收集"
+          } else {
+            Write-Host "缺少: $($missing -join ', ')，从 llama-cpp-sys-2 构建输出收集"
+            $found = @()
+            Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                $outDir = Join-Path $_.FullName "out"
+                if (Test-Path $outDir) { $found += Get-ChildItem -Recurse $outDir -Filter *.dll -File }
+              }
+            if ($found.Count -eq 0) { throw "在构建输出目录中未找到任何 llama/ggml DLL" }
+            foreach ($dll in $found) { Copy-Item $dll.FullName target/release/ -Force }
           }
-          if ($found.Count -eq 0) { throw "在构建输出目录中未找到任何 llama/ggml DLL" }
-          foreach ($dll in $found) { Copy-Item $dll.FullName target/release/ -Force }
-          foreach ($r in @("llama.dll","ggml.dll","ggml-base.dll","llama-common.dll")) {
+          foreach ($r in $required) {
             if (-not (Test-Path "target/release/$r")) { throw "收集后仍缺少 $r" }
+          }
+          # sherpa-onnx-sys 的 DLL 由构建脚本拷入；增量构建下同样可能已在位
+          foreach ($r in @("sherpa-onnx-c-api.dll","onnxruntime.dll")) {
+            if (-not (Test-Path "target/release/$r")) { Write-Warning "缺少 $r（ASR 运行时会失败）" }
           }
           Get-ChildItem target/release -Filter *.dll |
             Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+
+      - name: Save sherpa-onnx prebuilt libs
+        if: ${{ always() && !inputs.release && steps.sherpa-cache.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          if (Test-Path target/sherpa-onnx-prebuilt) {
+            Remove-Item -Recurse -Force .sherpa-prebuilt -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path .sherpa-prebuilt | Out-Null
+            Copy-Item -Recurse -Force target/sherpa-onnx-prebuilt/* .sherpa-prebuilt/
+            Write-Host "已暂存 sherpa 预编译库供 actions/cache 保存"
+          } else { Write-Host "target/sherpa-onnx-prebuilt 不存在，跳过保存" }
+
+      - name: Cache sherpa-onnx prebuilt libs
+        if: ${{ always() && !inputs.release && steps.sherpa-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .sherpa-prebuilt
+          key: sherpa-prebuilt-1.13.8-win-x64-shared
 
       # 纯函数单元测试：时间轴/折行/长 cue 拆分、JSON 提取与修复、模板渲染、
       # 质检判决与相似度门槛、配置路径。测试二进制需要能找到原生 DLL。
@@ -204,20 +265,32 @@ jobs:
           yt-dlp --version
 
       # ---------------- 模型（缓存；用文档里的下载脚本，顺带验证脚本本身） ----------------
-      - name: Cache models (~2.5GB)
+      # 用 restore/save 而非 actions/cache：后者的 post 步骤在 job 失败时会被跳过，
+      # 导致 2.7GB 模型每次都要重下（上一轮就是这样白跑了两次）。
+      - name: Restore models (~2.7GB)
         id: models-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: models
           key: qwen3-models-v3
 
       - name: Download models (cache miss)
+        id: download-models
         if: steps.models-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/download_models.ps1
           Get-ChildItem -Recurse models | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Save models
+        # 必须 always()（否则 job 失败时 post 步骤被跳过、2.7GB 白下）；
+        # 但只在下载步骤成功时保存，避免把半成品写进缓存毒化后续所有运行。
+        if: ${{ always() && steps.models-cache.outputs.cache-hit != 'true' && steps.download-models.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: models
+          key: qwen3-models-v3
 
       # ---------------- 测试媒体（bilibili 日语视频，缓存） ----------------
       - name: Cache e2e media
@@ -236,16 +309,25 @@ jobs:
           New-Item -ItemType Directory -Force -Path media-cache | Out-Null
           $bvids = @()
           foreach ($b in "$env:E2E_BVIDS".Split(' ')) { if ($b) { $bvids += "--bvid"; $bvids += $b } }
+          # 直链优先级：dispatch 输入 > 仓库变量 E2E_MEDIA_URL > bilibili 候选
+          # （GitHub runner 的数据中心 IP 被 bilibili 硬封：view/视频页一律 412，
+          #   实测 4 个候选 BV + yt-dlp 全灭。维护者在本地跑 scripts/fetch_media.py 下载后，
+          #   把直链填到仓库变量 E2E_MEDIA_URL 即可，CI 会下载一次并永久缓存。）
+          $use = "${{ inputs.video_url }}"
+          if (-not $use) { $use = "${{ vars.E2E_MEDIA_URL }}" }
           $urlArgs = @()
-          if ("${{ inputs.video_url }}") { $urlArgs = @("--url", "${{ inputs.video_url }}") }
+          if ($use) { $urlArgs = @("--url", $use); Write-Host "使用直链: $use" }
           python scripts/fetch_media.py --out media-cache --min-secs 60 --max-secs 420 @urlArgs @bvids
           $ok = $LASTEXITCODE -eq 0
           Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_OK=$ok"
+          Get-ChildItem media-cache -ErrorAction SilentlyContinue | Select-Object Name, Length
           if (-not $ok) {
-            Write-Warning "媒体拉取失败（bilibili 风控或视频下线）。真实视频用例将被跳过。"
+            Write-Warning "媒体拉取失败（bilibili 对数据中心 IP 返回 412，或直链不可达）。T1 将跳过，T2/T3 照常执行。"
             if ("${{ inputs.strict_media }}" -eq "true") { throw "strict_media=true，判定失败" }
           }
-          Get-ChildItem media-cache -ErrorAction SilentlyContinue | Select-Object Name, Length
+          # 关键：pwsh 步骤末尾会 exit $LASTEXITCODE，必须显式归零，
+          # 否则"降级跳过"会变成整步失败（上一轮就是这样红的）。
+          exit 0
 
       - name: Stage media
         if: inputs.e2e_media != 'none'
