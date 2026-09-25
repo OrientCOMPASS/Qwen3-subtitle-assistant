@@ -44,6 +44,8 @@ jobs:
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # llama-cpp-sys-2 的 build.rs 使用 bindgen，需要 libclang
       - name: Ensure libclang (bindgen)
@@ -66,11 +68,36 @@ jobs:
       - name: Build release exe (dynamic-link, CPU toolchain only)
         run: cargo build --release --locked
 
-      - name: Smoke test (--version / --help)
+      - name: Smoke test (with full diagnostics)
         shell: pwsh
         run: |
-          ./target/release/subtitle-assistant.exe --version
-          ./target/release/subtitle-assistant.exe --help | Select-Object -First 5
+          Write-Host "=== target/release 产物清单 ==="
+          Get-ChildItem target/release -File | Where-Object { $_.Extension -in '.exe','.dll' } |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+
+          Write-Host "=== exe 静态导入表 ==="
+          pip install --quiet pefile
+          python -c "import pefile; pe=pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True); pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']]); print('\n'.join(sorted(e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT)))"
+
+          Write-Host "=== 缺失导入检测（逐个 LoadLibrary 验证） ==="
+          python -c @"
+          import ctypes, pefile
+          pe = pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True)
+          pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+          k32 = ctypes.WinDLL('kernel32')
+          for e in pe.DIRECTORY_ENTRY_IMPORT:
+              name = e.dll.decode()
+              ok = bool(k32.LoadLibraryExW(name, None, 0x8))
+              print(('OK  ' if ok else 'FAIL'), name)
+          "@
+
+          Write-Host "=== cmd /c 运行 ==="
+          cmd /c ".\target\release\subtitle-assistant.exe --version 2>&1 & echo CMD_EXIT=%ERRORLEVEL%"
+          Write-Host "=== pwsh 运行 ==="
+          & ./target/release/subtitle-assistant.exe --version
+          Write-Host "PS_VERSION_EXIT=$LASTEXITCODE"
+          & ./target/release/subtitle-assistant.exe --help | Select-Object -First 5
+          Write-Host "PS_HELP_EXIT=$LASTEXITCODE"
 
       # PR 只做编译验证，不组装发行包（省流量与时长）
       - name: Cache for runtime DLL downloads
