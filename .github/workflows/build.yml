@@ -68,6 +68,28 @@ jobs:
       - name: Build release exe (dynamic-link, CPU toolchain only)
         run: cargo build --release --locked
 
+      - name: Collect runtime DLLs (fallback for build-script copy)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "=== 搜索 llama-cpp-sys-2 构建输出中的全部 DLL ==="
+          $found = @()
+          Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" | ForEach-Object {
+            $outDir = Join-Path $_.FullName "out"
+            if (Test-Path $outDir) {
+              $dlls = Get-ChildItem -Recurse $outDir -Filter *.dll -File
+              $found += $dlls
+              $dlls | ForEach-Object { Write-Host "  found: $($_.FullName.Replace((Get-Location).Path, '.')) ($([math]::Round($_.Length/1MB,1)) MB)" }
+            }
+          }
+          if ($found.Count -eq 0) { throw "在构建输出目录中未找到任何 llama/ggml DLL" }
+          foreach ($dll in $found) { Copy-Item $dll.FullName target/release/ -Force }
+          foreach ($r in @("llama.dll","ggml.dll","ggml-base.dll","llama-common.dll")) {
+            if (-not (Test-Path "target/release/$r")) { throw "收集后仍缺少 $r" }
+          }
+          Write-Host "=== target/release DLL 清单 ==="
+          Get-ChildItem target/release -Filter *.dll | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+
       - name: Smoke test (with full diagnostics)
         shell: pwsh
         run: |
@@ -91,8 +113,6 @@ jobs:
               print(('OK  ' if ok else 'FAIL'), name)
           "@
 
-          Write-Host "=== cmd /c 运行 ==="
-          cmd /c ".\target\release\subtitle-assistant.exe --version 2>&1 & echo CMD_EXIT=%ERRORLEVEL%"
           Write-Host "=== pwsh 运行 ==="
           & ./target/release/subtitle-assistant.exe --version
           Write-Host "PS_VERSION_EXIT=$LASTEXITCODE"

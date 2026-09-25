@@ -56,8 +56,38 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$found"
 
+      - name: Install ffmpeg/ffprobe
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress -y | Out-Null
+          RefreshEnv
+          ffmpeg -version | Select-Object -First 1
+          ffprobe -version | Select-Object -First 1
+
       - name: Build exe (dynamic-link, CPU)
         run: cargo build --release --locked
+
+      - name: Collect runtime DLLs (fallback for build-script copy)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "=== 搜索 llama-cpp-sys-2 构建输出中的全部 DLL ==="
+          $found = @()
+          Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" | ForEach-Object {
+            $outDir = Join-Path $_.FullName "out"
+            if (Test-Path $outDir) {
+              $dlls = Get-ChildItem -Recurse $outDir -Filter *.dll -File
+              $found += $dlls
+              $dlls | ForEach-Object { Write-Host "  found: $($_.FullName.Replace((Get-Location).Path, '.')) ($([math]::Round($_.Length/1MB,1)) MB)" }
+            }
+          }
+          if ($found.Count -eq 0) { throw "在构建输出目录中未找到任何 llama/ggml DLL" }
+          foreach ($dll in $found) { Copy-Item $dll.FullName target/release/ -Force }
+          foreach ($r in @("llama.dll","ggml.dll","ggml-base.dll","llama-common.dll")) {
+            if (-not (Test-Path "target/release/$r")) { throw "收集后仍缺少 $r" }
+          }
+          Write-Host "=== target/release DLL 清单 ==="
+          Get-ChildItem target/release -Filter *.dll | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
 
       # ---------------- 模型（缓存） ----------------
       - name: Cache models (~2.1GB)
