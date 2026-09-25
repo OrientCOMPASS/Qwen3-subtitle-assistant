@@ -133,32 +133,48 @@ jobs:
 
       # 构建脚本本应把 DLL 拷到 target/release，但历史上多次失效（LNK/运行时缺件），
       # 这里保留兜底收集，并显式校验关键 DLL 存在。
+      # 增量构建的必备兜底：rust-cache 的 cleanProfileTarget 会删掉 target/release 下的
+      # 散落文件（exe 会被重新链接出来，但 DLL 不会），而两套 DLL 的"源头"不同：
+      #   llama/ggml*.dll        <- target/release/build/llama-cpp-sys-2-*/out（rust-cache 保留 build/）
+      #   sherpa-onnx-c-api.dll  <- target/sherpa-onnx-prebuilt/*/lib（只在 build.rs 重跑时才拷贝，
+      #                             增量构建下不重跑；该目录由本工作流单独缓存并在构建前还原）
+      # 少任何一个都会在运行时报"找不到 DLL"，所以这里显式补齐并校验。
       - name: Collect runtime DLLs
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $required = @("llama.dll","ggml.dll","ggml-base.dll","llama-common.dll")
-          $missing = @($required | Where-Object { -not (Test-Path "target/release/$_") })
-          if ($missing.Count -eq 0) {
-            Write-Host "target/release 已有全部关键 DLL（增量构建），跳过收集"
+          $required = @("llama.dll","ggml.dll","ggml-base.dll","llama-common.dll",
+                        "sherpa-onnx-c-api.dll","onnxruntime.dll")
+
+          # 1) llama.cpp / ggml：源头在 target/release/build/llama-cpp-sys-2-*/out（rust-cache 保留 build/）
+          $llamaOuts = Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue |
+                       ForEach-Object { Join-Path $_.FullName "out" }
+          foreach ($d in $llamaOuts) {
+            if (-not (Test-Path $d)) { continue }
+            Get-ChildItem -Recurse $d -Filter *.dll -File | ForEach-Object {
+              $dest = Join-Path "target/release" $_.Name
+              if (-not (Test-Path $dest)) { Copy-Item $_.FullName $dest -Force; Write-Host "  + llama : $($_.Name)" }
+            }
+          }
+
+          # 2) sherpa-onnx / onnxruntime：源头在 target/sherpa-onnx-prebuilt/*/lib
+          #    （build.rs 的 copy_windows_runtime_dlls 只在它重跑时执行，增量构建下不会重跑）
+          if (Test-Path "target/sherpa-onnx-prebuilt") {
+            Get-ChildItem -Recurse "target/sherpa-onnx-prebuilt" -Filter *.dll -File | ForEach-Object {
+              $dest = Join-Path "target/release" $_.Name
+              if (-not (Test-Path $dest)) { Copy-Item $_.FullName $dest -Force; Write-Host "  + sherpa: $($_.Name)" }
+            }
           } else {
-            Write-Host "缺少: $($missing -join ', ')，从 llama-cpp-sys-2 构建输出收集"
-            $found = @()
-            Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                $outDir = Join-Path $_.FullName "out"
-                if (Test-Path $outDir) { $found += Get-ChildItem -Recurse $outDir -Filter *.dll -File }
-              }
-            if ($found.Count -eq 0) { throw "在构建输出目录中未找到任何 llama/ggml DLL" }
-            foreach ($dll in $found) { Copy-Item $dll.FullName target/release/ -Force }
+            Write-Warning "target/sherpa-onnx-prebuilt 不存在（首次构建时由 sherpa-onnx-sys 下载）"
           }
-          foreach ($r in $required) {
-            if (-not (Test-Path "target/release/$r")) { throw "收集后仍缺少 $r" }
+
+          $missing = @($required | Where-Object { -not (Test-Path "target/release/$_") })
+          if ($missing.Count -gt 0) {
+            Write-Host "target/release 现有 DLL:"
+            Get-ChildItem target/release -Filter *.dll | Select-Object -ExpandProperty Name
+            throw "缺少运行时 DLL: $($missing -join ', ')"
           }
-          # sherpa-onnx-sys 的 DLL 由构建脚本拷入；增量构建下同样可能已在位
-          foreach ($r in @("sherpa-onnx-c-api.dll","onnxruntime.dll")) {
-            if (-not (Test-Path "target/release/$r")) { Write-Warning "缺少 $r（ASR 运行时会失败）" }
-          }
+          Write-Host "=== target/release DLL 清单 ==="
           Get-ChildItem target/release -Filter *.dll |
             Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
 
