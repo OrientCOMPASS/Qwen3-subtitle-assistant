@@ -401,8 +401,13 @@ impl<'a, 'b> Translator<'a, 'b> {
         let tokens = self.session.count_tokens(&prompt);
         let budget = self.prompt_budget();
         if tokens > budget && batch.len() > 1 {
-            return self.split_and_retry(gctx, context, batch, depth,
-                format!("prompt {} tokens 超预算 {}", tokens, budget));
+            return self.split_and_retry(
+                gctx,
+                context,
+                batch,
+                depth,
+                format!("prompt {} tokens 超预算 {}", tokens, budget),
+            );
         }
         if tokens > budget {
             warn!(
@@ -433,8 +438,13 @@ impl<'a, 'b> Translator<'a, 'b> {
             );
             let ratio = copied.len() as f32 / batch.len().max(1) as f32;
             if ratio >= 0.2 && batch.len() > 1 {
-                return self.split_and_retry(gctx, context, batch, depth,
-                    format!("照抄比例 {:.0%}", ratio));
+                return self.split_and_retry(
+                    gctx,
+                    context,
+                    batch,
+                    depth,
+                    format!("照抄比例 {:.0}%", ratio * 100.0),
+                );
             }
         }
         Ok(items)
