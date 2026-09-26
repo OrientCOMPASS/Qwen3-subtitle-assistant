@@ -136,6 +136,10 @@ def main() -> int:
     ap.add_argument("--max-kana-ratio", type=float, default=0.15,
                     help="全局假名占比上限。注意这个指标会被合理保留的专有名词抬高"
                          "（实测一条 おせんべい 就占 8%%），主判据请用 --max-foreign-cues")
+    ap.add_argument("--kana-floor-chars", type=int, default=8,
+                    help="全局假名占比的绝对字符地板：短文件里几个零散假名不该判红"
+                         "（CI 实测 195 字的字幕里一条混排 cue「やったね、愤怒了。」就是 2.2%%）。"
+                         "整条未翻译/整批照抄由 --max-foreign-cues、--max-kana-cues 逐条抓")
     ap.add_argument("--max-kana-cues", type=int, default=-1,
                     help="允许残留假名的 cue 条数（逐条检测，比全局占比灵敏得多："
                          "零散残留几个假名时全局占比可能只有 3~4%，但条数一眼就能看出来）；-1=不检查")
@@ -212,8 +216,14 @@ def main() -> int:
               + (f"（例: {foreign[0]['text'][:40]}…）" if foreign else ""))
 
     if args.target_lang == "zh":
-        check(ratios["kana"] <= args.max_kana_ratio,
-              f"假名占比 {ratios['kana']:.1%} <= {args.max_kana_ratio:.0%}（说明已译成中文而非残留日语原文）")
+        # 上限取「相对占比」与「绝对字符地板」中宽松的那个：占比对短文件过于苛刻，
+        # 地板对长文件几乎不起作用（680 字时 8 字 = 1.2% < 2%），所以两头都合理。
+        n_chars = max(len([c for c in full_text if not c.isspace()]), 1)
+        kana_limit = max(args.max_kana_ratio, args.kana_floor_chars / n_chars)
+        check(ratios["kana"] <= kana_limit,
+              f"假名占比 {ratios['kana']:.1%} <= {kana_limit:.1%}"
+              f"（--max-kana-ratio {args.max_kana_ratio:.0%} 与 {args.kana_floor_chars} 字地板取宽，"
+              f"全文 {n_chars} 字；说明已译成中文而非残留日语原文）")
         check(ratios["cjk"] >= 0.3, f"汉字占比 {ratios['cjk']:.0%} >= 30%")
 
     if args.log:
