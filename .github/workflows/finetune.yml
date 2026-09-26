@@ -754,15 +754,13 @@ jobs:
           else
             pip install --quiet transformers sentencepiece protobuf
           fi
-          for name in llama-b11201-bin-ubuntu-x64.zip llama-b11201-bin-ubuntu-24.04-x64.zip; do
-            if curl -sL --fail --retry 2 -o llama-bin.zip "https://github.com/ggml-org/llama.cpp/releases/download/b11201/$name"; then
-              echo "下载成功: $name"; break
-            fi
-          done
-          test -f llama-bin.zip
-          mkdir -p llama-bin && cd llama-bin && python3 -c "import zipfile; zipfile.ZipFile('../llama-bin.zip').extractall('.')"
-          find . -name "llama-quantize" -o -name "llama-server" | head
-          chmod +x $(find . -type f -name "llama-*" ! -name "*.dll")
+          # ubuntu 预编译是 .tar.gz（windows 才是 .zip——E2 首跑 404 实测教训）
+          curl -sL --fail --retry 3 -o llama-bin.tar.gz \
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11201/llama-b11201-bin-ubuntu-x64.tar.gz"
+          mkdir -p llama-bin
+          tar -xzf llama-bin.tar.gz -C llama-bin
+          find llama-bin -type f \( -name "llama-quantize" -o -name "llama-server" \)
+          chmod +x $(find llama-bin -type f -name "llama-*")
 
       - name: 下载日语测试音频
         run: |
