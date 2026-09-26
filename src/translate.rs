@@ -133,7 +133,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let from = translated.len();
                     self.merge_batch(batch, &items, &mut translated);
                     if self.cfg.review_enabled {
-                        self.review_batch(&gctx, batch, &mut translated[from..]);
+                        self.review_and_polish(&gctx, batch, &mut translated[from..]);
                     }
                 }
                 Err(e) => {
@@ -403,9 +403,9 @@ impl<'a, 'b> Translator<'a, 'b> {
     // 分批翻译
     // ========================================================================
 
-    /// 批次翻译。只在 **prompt 超出 token 预算** 时对半拆分；
-    /// 译文质量不达标（照抄原文）走"换种子重新抽取"，不再靠拆批解决——
-    /// 实测拆批会级联到单条仍判不合格，最后整批回退原文，比部分翻译更差。
+    /// 批次翻译。两种情况下对半拆分：① prompt 超出 token 预算；② 重抽用尽后仍有条目
+    /// 照抄原文（照抄是规模问题，不是采样问题）。拆到 4 条以下就不再拆，
+    /// 避免级联到单条后因缺乏上下文而质量更差。
     fn translate_batch_adaptive(
         &mut self,
         gctx: &GlobalContext,
@@ -431,7 +431,21 @@ impl<'a, 'b> Translator<'a, 'b> {
                 tokens, budget
             );
         }
-        self.translate_once(&prompt, batch)
+        let items = self.translate_once(&prompt, batch)?;
+        // 照抄的根因是"输入输出同形"这个吸引子，换种子重抽经常无效（CI 实测连抽 3 次
+        // 都是同样那 12 条）。规模才是决定因素，所以这里改成**拆半重试**。
+        // 下限 4 条：避免级联拆到单条后因缺乏上下文而质量更差（v0.2 的老问题）。
+        let copies = count_copies(batch, &items);
+        if copies > 0 && batch.len() >= 4 && depth < 3 {
+            return self.split_and_retry(
+                gctx,
+                context,
+                batch,
+                depth,
+                format!("{} / {} 条照抄原文", copies, batch.len()),
+            );
+        }
+        Ok(items)
     }
 
     /// 拆半重试；深度受限时不再拆，直接返回当前结果或错误。
@@ -460,16 +474,101 @@ impl<'a, 'b> Translator<'a, 'b> {
         Ok(out)
     }
 
+    /// 自检 + 定向二审。
+    ///
+    /// 实测有两种不同的失败模式：
+    ///   ① 整条照抄原文（批内翻译时模型偷懒）——由照抄检测 + 换种子重抽处理；
+    ///   ② **零散残留**：整句翻对了，但夹着没译的假名/日文词（おせんべい、キャラ 之类）。
+    ///      这种在"整条未翻译"的统计里完全看不出来，只能逐字符查源文字系统。
+    /// 第②种需要一轮**只针对残留条目**的定向审校，比整批重审便宜得多。
+    fn review_and_polish(
+        &mut self,
+        gctx: &GlobalContext,
+        batch: &[SubtitleSegment],
+        out: &mut [SubtitleSegment],
+    ) {
+        self.review_batch(gctx, batch, out, false);
+
+        let script = self.cfg.residual_script.as_str();
+        if script == "none" {
+            return;
+        }
+        let idx: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| has_residual_script(&s.text, script))
+            .map(|(i, _)| i)
+            .collect();
+        if idx.is_empty() {
+            return;
+        }
+        warn!(
+            "[审校] {} 条译文仍残留源语言文字（{}），做第二轮定向审校",
+            idx.len(),
+            script
+        );
+        let srcs: Vec<SubtitleSegment> = idx.iter().map(|&i| batch[i].clone()).collect();
+        let mut sub: Vec<SubtitleSegment> = idx.iter().map(|&i| out[i].clone()).collect();
+        self.review_batch(gctx, &srcs, &mut sub, true);
+        for (k, &i) in idx.iter().enumerate() {
+            out[i].text = sub[k].text.clone();
+        }
+        let still = sub
+            .iter()
+            .filter(|s| has_residual_script(&s.text, script))
+            .count();
+        self.stats.residual += still;
+        if still > 0 {
+            warn!("[审校] 二审后仍有 {} 条残留源语言文字", still);
+        } else {
+            info!("[审校] 二审后残留源语言文字已清零（本轮修正 {} 条）", idx.len());
+        }
+    }
+
     /// 译文自检：把「原文 + 当前译文」交回 LLM，让它以质检员身份挑出不达标的条目。
     ///
     /// 动机（实测）：日翻中时模型会残留假名、或直接把日文词抄下来（例如 おせんべい
     /// 没译成"仙贝"）。这类问题在批内翻译时很难自查，但换一个"质检员"身份再审一遍
     /// 就能挑出来。自检失败不影响主流程：任何异常都只 warn 并保留原译文。
+    /// 审校入口：先按字符预算切块，再逐块送审。
+    ///
+    /// 与翻译同理，一次送审的条目越多越长，模型越容易"照抄"：CI 实测把 13 条长句
+    /// 一起送审时，模型把日文原样当作"修正后的译文"返回，全部被静默跳过，
+    /// 日志上只留下一句"检查 13 条，修正 0 条"，既看不出原因也无从排查。
     fn review_batch(
         &mut self,
         gctx: &GlobalContext,
         sources: &[SubtitleSegment],
         out: &mut [SubtitleSegment],
+        strict: bool,
+    ) {
+        const CHUNK_CHARS: usize = 240;
+        const CHUNK_MAX: usize = 8;
+        let n = out.len().min(sources.len());
+        let mut start = 0usize;
+        while start < n {
+            let mut chars = 0usize;
+            let mut end = start;
+            while end < n {
+                let add = out[end].text.chars().count() + sources[end].text.chars().count();
+                if end > start && (end - start >= CHUNK_MAX || chars + add > CHUNK_CHARS) {
+                    break;
+                }
+                chars += add;
+                end += 1;
+            }
+            self.review_chunk(gctx, &sources[start..end], &mut out[start..end], strict);
+            start = end;
+        }
+    }
+
+    /// 单块审校（真正的 LLM 调用）。
+    fn review_chunk(
+        &mut self,
+        gctx: &GlobalContext,
+        sources: &[SubtitleSegment],
+        out: &mut [SubtitleSegment],
+        strict: bool,
     ) {
         if out.is_empty() {
             return;
@@ -492,15 +591,22 @@ impl<'a, 'b> Translator<'a, 'b> {
         vars.insert("glossary".to_string(), gctx.glossary_as_text());
         vars.insert("pairs".to_string(), format!("[{}]", pairs.join(",")));
         let prompt = match self.prompts.render("review_batch.txt", &vars) {
-            Ok(p) => p,
+            Ok(mut p) => {
+                if strict {
+                    p.push_str(STRICT_HINT);
+                }
+                p
+            }
             Err(e) => {
                 warn!("[审校] 提示词渲染失败，跳过自检: {:#}", e);
                 return;
             }
         };
 
-        let max_new =
-            (self.cfg.translate_tokens_per_item * out.len() + 256).clamp(512, 6144) as u32;
+        // 同 translate_once：生成上限随字数伸缩，避免长句批次被截断
+        let out_chars: usize = out.iter().map(|s| s.text.chars().count()).sum();
+        let max_new = (self.cfg.translate_tokens_per_item * out.len() + out_chars + 256)
+            .clamp(512, 8192) as u32;
         let attempts = 2usize;
         for attempt in 1..=attempts {
             // 种子偏移 100：让审校与翻译走不同的采样轨迹
@@ -529,6 +635,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 return;
             }
             let mut applied = 0usize;
+            let mut echoed = 0usize;
             for f in &fixes {
                 let new_text = f.t.trim();
                 if new_text.is_empty() {
@@ -539,6 +646,9 @@ impl<'a, 'b> Translator<'a, 'b> {
                     continue;
                 };
                 if out[pos].text.trim() == new_text {
+                    // 模型把当前译文原样返回＝没给出任何修正。以前是静默 continue，
+                    // 导致"检查 13 条，修正 0 条"这种无从排查的日志。
+                    echoed += 1;
                     continue;
                 }
                 // 审校结果本身也可能照抄原文，那就没有意义
@@ -558,6 +668,12 @@ impl<'a, 'b> Translator<'a, 'b> {
             }
             self.stats.review_fixed += applied;
             info!("[审校] 检查 {} 条，修正 {} 条", out.len(), applied);
+            if echoed > 0 {
+                warn!(
+                    "[审校] {} 条被原样返回（模型没给出修正，通常是这批太长或太像原文）",
+                    echoed
+                );
+            }
             return;
         }
         warn!("[审校] {} 次尝试均失败，保留原译文", attempts);
@@ -584,28 +700,16 @@ impl<'a, 'b> Translator<'a, 'b> {
             },
         );
         vars.insert("glossary".to_string(), gctx.glossary_as_text());
-        // 上下文/待翻译都只带 i + t：时间轴由 Rust 侧保留，不让模型回显
-        let ctx_compact: Vec<SubtitleSegment> = context
-            .iter()
-            .map(|s| SubtitleSegment {
-                index: s.index,
-                start_ms: 0,
-                end_ms: 0,
-                text: s.text.clone(),
-            })
-            .collect();
+        // 待翻译内容用「编号) 纯文本行」渲染，**不再用与输出同形的 JSON**（见 numbered_lines）
         vars.insert(
             "context".to_string(),
-            if ctx_compact.is_empty() {
+            if context.is_empty() {
                 "（无）".to_string()
             } else {
-                SubtitleSegment::compact_json_list(&ctx_compact)
+                numbered_lines(context)
             },
         );
-        vars.insert(
-            "batch".to_string(),
-            SubtitleSegment::compact_json_list(batch),
-        );
+        vars.insert("batch".to_string(), numbered_lines(batch));
         self.prompts.render("translate_batch.txt", &vars)
     }
 
@@ -616,9 +720,11 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn translate_once(&mut self, prompt: &str, batch: &[SubtitleSegment]) -> Result<Vec<TranslateItem>> {
         let attempts = self.cfg.max_retries.max(1);
         let batch_len = batch.len();
-        // 生成上限随条数伸缩：宁可给足，也不要因为截断而整批重来
-        let max_new =
-            (self.cfg.translate_tokens_per_item * batch_len + 256).clamp(512, 6144) as u32;
+        // 生成上限随「条数 + 原文字数」伸缩：中文输出约 1 token/字，只按条数算的话
+        // 长句批次会被截断 -> 条目缺失 -> 回退原文 -> 表现出来就像"照抄"。
+        let src_chars: usize = batch.iter().map(|s| s.text.chars().count()).sum();
+        let max_new = (self.cfg.translate_tokens_per_item * batch_len + src_chars + 256)
+            .clamp(512, 8192) as u32;
         let hint_copy = format!(
             "\n\n【重要】你上一次把原文照抄回来了，没有翻译。请重新输出 JSON 数组，\
              形如 [{{\"i\":1,\"t\":\"译文\"}}]，每条 t 都必须是{}，条数与输入一致，\
@@ -629,6 +735,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         let mut last_err = anyhow::anyhow!("未执行");
         let mut attempt_prompt = prompt.to_string();
         let mut best: Option<(Vec<TranslateItem>, usize)> = None;
+        // 照抄时把模型原始输出留个片段，否则"12 条照抄"完全无法归因
+        let mut last_snippet = String::new();
 
         for attempt in 1..=attempts {
             let raw = match self.session.chat(
@@ -684,6 +792,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 batch_len
             );
             self.stats.retries += 1;
+            last_snippet = raw.chars().take(200).collect();
             attempt_prompt = format!("{}{}", prompt, hint_copy);
             if best.as_ref().map(|(_, c)| copies < *c).unwrap_or(true) {
                 best = Some((items, copies));
@@ -692,13 +801,32 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         if let Some((items, copies)) = best {
             warn!(
-                "[翻译] {} 次抽取后仍有 {} 条疑似照抄，采用其中最好的一次（不回退整批原文）",
-                attempts, copies
+                "[翻译] {} 次抽取后仍有 {} 条疑似照抄，采用其中最好的一次（不回退整批原文）；\
+                 模型原始输出片段: {}…",
+                attempts,
+                copies,
+                last_snippet.replace('\n', " ")
             );
             return Ok(items);
         }
         Err(last_err)
     }
+}
+
+/// 把一批字幕渲染成「编号) 文本」的纯文本行（换行压成 " / "）。
+///
+/// **为什么不用 JSON**：输入与输出同形是照抄的温床。此前输入是
+/// `[{"i":1,"t":"原文"}]`，输出也要求 `[{"i":1,"t":"译文"}]`——对 1.7B 模型来说，
+/// 把输入数组原样吐回来就是一个"格式完全正确"的答案，于是长批次直接照抄。
+/// CI 实测（BV16r421g797）：710 字 / 20 条的批次有 12 条照抄，换 3 次种子结果一样；
+/// 同一片源里 225 字 / 16 条的批次却全部正常——规模是决定性因素，重抽不是。
+/// 改成纯文本行后，照抄输入不再构成合法的 JSON 输出，这个吸引子被结构性打断，
+/// 顺带也不再需要对原文做 JSON 转义（少一类解析失败）。
+fn numbered_lines(segs: &[SubtitleSegment]) -> String {
+    segs.iter()
+        .map(|s| format!("{}) {}", s.index, s.text.replace('\n', " / ").trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 统计一批里"疑似照抄原文"的条数。
@@ -741,6 +869,20 @@ pub fn plan_batches(segments: &[SubtitleSegment], batch_size: usize, batch_chars
     out
 }
 
+/// 译文里是否仍残留源语言文字。
+///
+/// 目前支持日语假名（本项目的默认场景是日翻中）。中文译文里出现假名，
+/// 几乎只可能是没翻译干净的残留——中文本身不使用假名。
+pub fn has_residual_script(text: &str, script: &str) -> bool {
+    match script {
+        "kana" => text
+            .chars()
+            .any(|c| ('\u{3040}'..='\u{30ff}').contains(&c)),
+        "hangul" => text.chars().any(|c| ('\u{ac00}'..='\u{d7af}').contains(&c)),
+        _ => false,
+    }
+}
+
 /// 译文是否只是把原文抄了回来。
 ///
 /// 同语言翻译（如繁转简）时这个判定会偏保守，但本项目默认是跨语言字幕翻译，
@@ -767,6 +909,12 @@ fn looks_copied(source: &str, translated: &str) -> bool {
     }
     char_similarity(s, t) >= COPY_THRESHOLD
 }
+
+/// 第二轮定向审校追加的提示（针对"整句翻对了但夹着没译的源语言文字"）。
+const STRICT_HINT: &str = "\n\n【第二轮·重点】下面这些条目的译文里**仍然残留日文假名或日文词**。\
+请把它们重写为纯中文：专有名词用中文通用译名或音译（おせんべい->仙贝、キャラ->角色、\
+ほうとう->宝刀面、スカイツリー->天空树），实在没有通用译名时用中文描述性说法，\
+**译文中不允许出现任何假名**。只输出需要修改的条目。\n/no_think";
 
 /// 解析失败后追加的格式提醒（重试时生效——贪心解码下原样重发只会得到同样的坏输出）。
 const HINT_ARRAY: &str = "\n\n【重要】你上一次的输出不是合法 JSON 数组。现在请只输出 JSON 数组，形如 [{\"i\":1,\"t\":\"译文\"}]，条数与输入完全一致，t 必须是目标语言的译文（严禁照抄原文），不要输出思考过程、解释或代码块标记。\n/no_think";
@@ -798,6 +946,34 @@ mod tests {
         assert!(!looks_copied("今日。", "今日。"));
         assert!(!looks_copied("戦争", "戦争"));
         assert!(!looks_copied("皆さんに。", "各位。"));
+    }
+
+    #[test]
+    fn residual_script_detection() {
+        // 中文译文里出现假名 == 没翻干净
+        assert!(has_residual_script("而我的喜欢的キャラのおもちゃ却完全不被消费", "kana"));
+        assert!(has_residual_script("どっしり構えようと。", "kana"));
+        // 纯中文（含汉字与标点）不算残留
+        assert!(!has_residual_script("老人唯一的财产是一匹马，还有三个儿子。", "kana"));
+        assert!(!has_residual_script("iPS 细胞与 Wi-Fi、ACTA 等拉丁词不算假名残留", "kana"));
+        // 关闭检测 / 其它文字系统
+        assert!(!has_residual_script("キャラ", "none"));
+        assert!(has_residual_script("한국어 테스트", "hangul"));
+        assert!(!has_residual_script("キャラ", "hangul"));
+    }
+
+    #[test]
+    fn translate_input_is_plain_lines_not_json() {
+        // 回归锁：待翻译输入若与输出同为 [{"i":..,"t":..}]，1.7B 模型会直接把输入
+        // 数组原样抄回来（CI 实测：710 字/20 条的批次有 12 条照抄，换 3 次种子无效；
+        // 同片源 225 字/16 条的批次全部正常）。纯文本行让"照抄"不再构成合法输出。
+        let v = vec![seg(3, "しばらくすると戦争が"), seg(7, "第一行\n第二行")];
+        let out = super::numbered_lines(&v);
+        assert_eq!(out, "3) しばらくすると戦争が\n7) 第一行 / 第二行");
+        assert!(
+            !out.contains('{') && !out.contains("\"t\""),
+            "输入里不应再出现 JSON 结构: {out}"
+        );
     }
 
     #[test]

@@ -92,15 +92,21 @@ pub struct Args {
     #[arg(long, default_value = "")]
     pub asr_hotwords: String,
 
-    /// Qwen3-ASR 单段最多生成的 token 数（默认 128 偏小，长语音段会被截断）
-    #[arg(long, default_value_t = 256)]
+    /// Qwen3-ASR 单段最多生成的 token 数。
+    /// 注意它与 --asr-max-total-len、--vad-buffer-secs 是**联动的**：
+    /// 音频 token 率 12.5Hz，512 的总预算要分给 prompt + 音频 + 生成，
+    /// 每加大 128 个生成 token，可处理的语音段就缩短约 10 秒。
+    #[arg(long, default_value_t = 128)]
     pub asr_max_new_tokens: i32,
 
-    /// Qwen3-ASR 的最大总序列长度（音频 token + 文本 token）
-    #[arg(long, default_value_t = 1024)]
+    /// Qwen3-ASR 的最大总序列长度（prompt + 音频 token + 生成 token）。
+    /// **传大于导出模型 KV 容量的值没有意义**：sherpa-onnx 会静默 clamp 到模型上限
+    /// （现有 ONNX 导出均为 512），需要更长音频得重新导出 decoder。
+    #[arg(long, default_value_t = 512)]
     pub asr_max_total_len: i32,
 
-    /// Silero VAD 缓冲区秒数（也是单条语音段的长度上限）
+    /// Silero VAD 缓冲区秒数（单条语音段长度上限）。
+    /// 超过模型单段音频上限时会自动收敛并 warn（上限由上面两个参数反推）。
     #[arg(long, default_value_t = 60.0)]
     pub vad_buffer_secs: f32,
 
@@ -159,6 +165,11 @@ pub struct Args {
     #[arg(long, default_value = "自动检测（视频原语言）")]
     pub source_lang: String,
 
+    /// 残留检测的源文字系统：kana=日语假名（默认，日翻中场景）、hangul=谚文、none=不检测。
+    /// 命中残留的条目会触发一轮定向二审（只审这些条目，比整批重审便宜）。
+    #[arg(long, default_value = "kana")]
+    pub residual_script: String,
+
     /// 单行字幕最大显示宽度（CJK 计 2、ASCII 计 1；40 ≈ 20 个汉字）。0=不折行
     #[arg(long, default_value_t = 40)]
     pub max_line_width: usize,
@@ -181,6 +192,12 @@ pub struct Args {
     /// 跳过 ASR：把输入当作已有的 .srt 直接做质检+翻译（可用于重跑翻译、二次修正）
     #[arg(long)]
     pub from_srt: bool,
+
+    /// 只做转录（+可选质检），写出 .raw.srt / .verified.srt 后停止，不加载翻译 LLM。
+    /// 用途：单独考察 ASR 行为（例如验证 --asr-hotwords 这个 context 通道
+    /// 能否让模型直接输出目标语言），以及"只要原文字幕"的场景。
+    #[arg(long)]
+    pub asr_only: bool,
 
     /// 输出目录（默认与源文件同目录）
     #[arg(long)]

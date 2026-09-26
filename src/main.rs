@@ -149,6 +149,9 @@ fn run(args: cli::Args) -> Result<usize> {
         cfg.seed
     );
 
+    if cfg.asr_only && !cfg.qc_enabled {
+        info!("--asr-only 且未开启质检：本次运行不会加载翻译 LLM");
+    }
     let failed = if cfg.from_srt {
         run_from_srt(&args.files, &cfg, &prompts, &rt)?
     } else if cfg.qc_enabled {
@@ -287,6 +290,17 @@ fn process_with_qc(
         raw_log.len()
     );
 
+    if cfg.asr_only {
+        let out = cfg.verified_srt_path(input);
+        info!(
+            "✔ --asr-only：只转录不翻译，已完成（{} 条）。原文 {:?}，质检后 {:?}",
+            verified.len(),
+            cfg.raw_srt_path(input),
+            out
+        );
+        return Ok(out);
+    }
+
     // ---------- 阶段 2: 翻译（复用同一 LLM 会话） ----------
     info!("▶ 阶段 2: 全局摘要提取与分批翻译...");
     let translated = translate_and_layout(session, prompts, cfg, verified)?;
@@ -343,6 +357,12 @@ fn process_linear(
     };
     srt::write_srt(&cfg.raw_srt_path(input), &segments).ok();
     anyhow::ensure!(!segments.is_empty(), "未识别到任何语音内容，跳过翻译。");
+
+    if cfg.asr_only {
+        let out = cfg.raw_srt_path(input);
+        info!("✔ --asr-only：只转录不翻译，已完成（{} 条）-> {:?}", segments.len(), out);
+        return Ok(out);
+    }
 
     info!("▶ 阶段 2: 加载 LLM 并开始翻译...");
     let llm = new_llm(cfg, rt)?;

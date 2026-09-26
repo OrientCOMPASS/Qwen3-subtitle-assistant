@@ -15,6 +15,7 @@ pub struct Config {
     // ---- 翻译 ----
     pub target_lang: String,
     pub source_lang: String,
+    pub residual_script: String,
     pub batch_size: usize,
     pub batch_chars: usize,
     pub context_size: usize,
@@ -56,6 +57,7 @@ pub struct Config {
 
     // ---- 运行方式 ----
     pub from_srt: bool,
+    pub asr_only: bool,
     pub output_dir: Option<PathBuf>,
 }
 
@@ -100,6 +102,12 @@ impl Config {
             args.max_cue_secs
         };
 
+        if args.from_srt && args.asr_only {
+            anyhow::bail!("--from-srt 与 --asr-only 互斥（前者跳过 ASR，后者跳过翻译）");
+        }
+        if args.asr_only && args.no_review {
+            info!("--asr-only 模式下不会翻译，--no-review 无实际作用");
+        }
         if args.from_srt {
             for f in &args.files {
                 if f.extension().and_then(|e| e.to_str()) != Some("srt") {
@@ -115,6 +123,14 @@ impl Config {
             prompts_dir,
             target_lang: args.target_lang.clone(),
             source_lang: args.source_lang.clone(),
+            residual_script: match args.residual_script.trim().to_ascii_lowercase().as_str() {
+                "kana" | "hangul" => args.residual_script.trim().to_ascii_lowercase(),
+                "none" | "" => "none".to_string(),
+                other => {
+                    warn!("--residual-script {:?} 不支持（可选 kana/hangul/none），按 none 处理", other);
+                    "none".to_string()
+                }
+            },
             batch_size,
             batch_chars,
             context_size: args.context_size,
@@ -155,6 +171,7 @@ impl Config {
             layout_enabled: !args.no_layout,
             review_enabled: !args.no_review,
             from_srt: args.from_srt,
+            asr_only: args.asr_only,
             output_dir: args.output_dir.clone(),
         };
         info!("使用 LLM 模型: {:?}", cfg.llm_model);
@@ -381,11 +398,13 @@ mod tests {
             context_size: 2,
             target_lang: "简体中文".into(),
             source_lang: "日语".into(),
+            residual_script: "kana".into(),
             max_line_width: 40,
             max_cue_secs: 7.0,
             no_layout: false,
             no_review: true,
             from_srt: false,
+            asr_only: false,
             output_dir: None,
             log_file: None,
             no_pause: true,

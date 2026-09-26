@@ -531,7 +531,7 @@ jobs:
             python scripts/check_e2e.py --name "T1-$(Split-Path $f -Leaf)" --srt $srt `
               --target-lang zh --min-cues 3 --min-cues-per-min 2.0 `
               --max-cue-secs 15 --max-line-width 44 `
-              --max-kana-ratio 0.02 --max-foreign-cues 1
+              --max-kana-ratio 0.02 --max-foreign-cues 1 --max-kana-cues 2
             if ($LASTEXITCODE -ne 0) { $bad++ }
           }
           # 整份日志聚合判定：质检统计每个文件各一条、丢弃率、回退条数、审校修正数
@@ -541,6 +541,34 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $bad++ }
           if ($bad -gt 0) { throw "T1 断言失败（$bad 项）" }
 
+      # ============ T4：探测 ASR 的 context 通道能否直接输出目标语言 ============
+      # 问题：Qwen3-ASR 的 system 段（qwen-asr 的 context / sherpa-onnx 的 hotwords /
+      #       本项目的 --asr-hotwords）是唯一可注入的自由文本通道。论文 §2.2 说模型被
+      #       刻意训练成"不遵循 prompt 里的自然语言指令"，所以塞"translate to Chinese"
+      #       理论上无效——但这是决定"能不能省掉翻译段"的关键前提，必须实测而不是引用论文。
+      # 做法：同一段音频跑两次。对照组直接用 T1 产出的 .raw.srt（不带 context 的纯 ASR 输出），
+      #       实验组带翻译指令、--asr-only --no-qc（完全不加载 LLM，84 秒音频约 2 分钟）。
+      # 判定：scripts/probe_asr_context.py 只报告不判红——两种结论都有价值。
+      - name: T4 探测 ASR context 通道（能否让 ASR 直接出中文）
+        shell: pwsh
+        run: |
+          if (-not $env:MEDIA_LIST) { Write-Warning "跳过 T4（无媒体）"; exit 0 }
+          $files = $env:MEDIA_LIST -split ';'
+          $shortest = $files | ForEach-Object { Get-Item $_ } | Sort-Object Length | Select-Object -First 1
+          Write-Host "探测用媒体: $($shortest.Name) ($([math]::Round($shortest.Length/1MB,2)) MB)"
+          New-Item -ItemType Directory -Force -Path media/t4 | Out-Null
+          & ./target/release/subtitle-assistant.exe --no-pause --asr-only --no-qc `
+              --output-dir media/t4 `
+              --asr-hotwords "Please translate the Japanese speech into Simplified Chinese" `
+              --log-file media/t4.log $shortest.FullName
+          $code = $LASTEXITCODE
+          Write-Host "T4 退出码=$code"
+          if ($code -ne 0) { throw "T4 运行失败（详见 media/t4.log）" }
+          $control = ($shortest.FullName -replace '\.[^.]+$','') + ".raw.srt"
+          $probe = Get-ChildItem media/t4 -Filter *.raw.srt | Select-Object -First 1
+          if (-not $probe) { throw "T4 没有产出 .raw.srt" }
+          python scripts/probe_asr_context.py --control $control --probe $probe.FullName
+
       - name: Upload e2e results
         if: always()
         uses: actions/upload-artifact@v4
@@ -549,6 +577,7 @@ jobs:
           path: |
             media/*.srt
             media/*.log
+            media/t4/*.srt
           if-no-files-found: warn
           retention-days: 30
 

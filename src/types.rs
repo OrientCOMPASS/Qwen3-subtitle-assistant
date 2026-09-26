@@ -19,24 +19,6 @@ impl SubtitleSegment {
         (self.end_ms.saturating_sub(self.start_ms)) as f64 / 1000.0
     }
 
-    /// 紧凑序列化（喂给 LLM 用）：只带序号与文本。
-    ///
-    /// 旧版把 `start_ms`/`end_ms` 也塞进 prompt 并要求模型原样回显，
-    /// 既浪费 token 又让解析对小模型的输出格式极其敏感；时间轴始终由
-    /// Rust 侧保留，模型只需要"第 i 条 -> 译文"。
-    pub fn compact_json_list(segments: &[SubtitleSegment]) -> String {
-        let items: Vec<String> = segments
-            .iter()
-            .map(|s| {
-                format!(
-                    "{{\"i\":{},\"t\":{}}}",
-                    s.index,
-                    serde_json::to_string(&s.text).unwrap_or_else(|_| "\"\"".into())
-                )
-            })
-            .collect();
-        format!("[{}]", items.join(","))
-    }
 }
 
 /// LLM 翻译批次的输出单元（`[{"i":1,"t":"译文"}, ...]`）。
@@ -205,6 +187,8 @@ pub struct TranslateStats {
     pub reviewed: usize,
     /// 自检后实际修正的条数
     pub review_fixed: usize,
+    /// 两轮审校后仍残留源语言文字（如假名）的条数
+    pub residual: usize,
     /// 全局摘要被切成的块数（1 = 未触发分块）
     pub summary_chunks: usize,
     /// 因 prompt 超预算而被对半拆分的次数
@@ -214,7 +198,7 @@ pub struct TranslateStats {
 impl TranslateStats {
     pub fn summary(&self) -> String {
         format!(
-            "翻译 {} 条 / {} 批：重试 {}，拆分 {}，整批失败 {}，位置兜底 {}，照抄 {}，未翻译 {}，自检 {}/修正 {}，摘要分块 {}",
+            "翻译 {} 条 / {} 批：重试 {}，拆分 {}，整批失败 {}，位置兜底 {}，照抄 {}，未翻译 {}，自检 {}/修正 {}，残留 {}，摘要分块 {}",
             self.segments,
             self.batches,
             self.retries,
@@ -225,6 +209,7 @@ impl TranslateStats {
             self.untranslated,
             self.reviewed,
             self.review_fixed,
+            self.residual,
             self.summary_chunks
         )
     }
@@ -243,13 +228,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn compact_json_escapes_and_keeps_only_i_t() {
-        let v = vec![seg(1, 0, 1000, "他说\"好\""), seg(2, 1000, 2000, "第二句")];
-        let j = SubtitleSegment::compact_json_list(&v);
-        assert_eq!(j, r#"[{"i":1,"t":"他说\"好\""},{"i":2,"t":"第二句"}]"#);
-        assert!(!j.contains("start_ms"));
-    }
 
     #[test]
     fn translate_item_accepts_aliases() {

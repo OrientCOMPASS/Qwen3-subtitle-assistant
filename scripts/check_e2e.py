@@ -136,6 +136,9 @@ def main() -> int:
     ap.add_argument("--max-kana-ratio", type=float, default=0.15,
                     help="全局假名占比上限。注意这个指标会被合理保留的专有名词抬高"
                          "（实测一条 おせんべい 就占 8%%），主判据请用 --max-foreign-cues")
+    ap.add_argument("--max-kana-cues", type=int, default=-1,
+                    help="允许残留假名的 cue 条数（逐条检测，比全局占比灵敏得多："
+                         "零散残留几个假名时全局占比可能只有 3~4%，但条数一眼就能看出来）；-1=不检查")
     ap.add_argument("--max-foreign-cues", type=int, default=-1,
                     help="允许「基本没翻译」的 cue 条数（该 cue 假名占比 > 40%%）；-1=不检查。"
                          "比全局假名占比更准：专有名词保留原文不会被误判，整批照抄则一定被抓到")
@@ -191,6 +194,16 @@ def main() -> int:
     check(all(c["end"] > c["start"] for c in cues), "所有 cue 的 end > start")
     overlaps = sum(1 for a, b in zip(cues, cues[1:]) if b["start"] < a["end"] - 1)
     check(overlaps == 0, f"相邻 cue 无重叠（重叠 {overlaps} 处）")
+
+    if args.target_lang == "zh" and args.max_kana_cues >= 0:
+        kana_cues = [c for c in cues if KANA.search(c["text"])]
+        sample = ""
+        if kana_cues:
+            frag = KANA.search(kana_cues[0]["text"])
+            ctx = kana_cues[0]["text"][max(0, frag.start() - 12):frag.start() + 14]
+            sample = f"（例: …{ctx}…）"
+        check(len(kana_cues) <= args.max_kana_cues,
+              f"残留假名的 cue {len(kana_cues)} 条 <= {args.max_kana_cues}{sample}")
 
     if args.target_lang == "zh" and args.max_foreign_cues >= 0:
         foreign = [c for c in cues if script_ratio(c["text"])["kana"] > 0.40]
