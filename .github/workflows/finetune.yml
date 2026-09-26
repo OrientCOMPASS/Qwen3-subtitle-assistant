@@ -1,7 +1,8 @@
 # ============================================================================
 # Qwen3-ASR -> S2TT（日语语音直接输出中文字幕）微调实验。
 #
-# 只在 exp/asr-s2tt 分支上跑，不影响 master 的 ci.yml。
+# 全部模式仅手动触发（workflow_dispatch），push 不消耗 runner；产品回归在 ci.yml。
+# 源于 exp/asr-s2tt 实验分支，随双版本路线并入 master。
 #
 # 两种模式：
 #   cpu-smoke（默认，GitHub 托管 runner）：4 条样本 + 2 步 LoRA，**只验证管线可跑通**
