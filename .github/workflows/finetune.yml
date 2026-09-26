@@ -76,9 +76,12 @@ jobs:
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
           # qwen-asr 会锁定 transformers==4.57.6 / accelerate==1.12.0
           pip install --quiet qwen-asr peft datasets soundfile librosa
-          python -c "import torch, transformers, peft, qwen_asr; \
+          # 注意：qwen-asr 0.0.6 的 __init__.py 里 __all__ 声明了 __version__ 却从未定义它
+          # （上游 packaging bug），所以版本号只能从 importlib.metadata 取。
+          python -c "import importlib.metadata as md, torch, transformers, peft, qwen_asr; \
             print('torch', torch.__version__, '| transformers', transformers.__version__, \
-                  '| peft', peft.__version__, '| qwen-asr', qwen_asr.__version__)"
+                  '| peft', peft.__version__, '| qwen-asr', md.version('qwen-asr')); \
+            print('Qwen3ASRModel:', qwen_asr.Qwen3ASRModel)"
 
       - name: 构造数据（FLEURS ja_jp + stub 伪翻译）
         run: |
