@@ -22,34 +22,55 @@
 |---|---|---|
 | A. PyTorch sidecar | Rust 起 Python 子进程跑 transformers+LoRA | **否**（产品形态）：要求用户装 Python 运行时、常驻 ~2.4GB、拖拽即用的单 exe 不再自足。保留作 CI 评测工具（`s2tt_pipeline.py` 已承担） |
 | B1. 全量重导出 ONNX | HF 合并权重 → 自研导出器 → int8 量化 | **否**：无公开导出脚本可抄（README 已知坑），工作量与不确定性全场最高 |
-| B2. **手术式补丁官方 decoder.int8.onnx** | 只把 ΔW=B·A·(α/r) 写回官方包里的 LM 解码器权重 | **推荐**：LoRA 只挂 7 类投影（q/k/v/o/gate/up/down），**音频塔、projector、tokenizer、encoder、conv_frontend 全部原样复用**；产物是普通 sherpa-onnx 模型目录，运行时零改动 |
+| B2. **手术式补丁官方 int8 ONNX** | 把 ΔW=B·A·(α/r) 写回官方包里被 LoRA 命中的权重张量 | **推荐**：产物是普通 sherpa-onnx 模型目录，运行时与 Rust 加载侧零改动 |
+
+**Gate 1 首跑（run 36250220762）在真实官方包上实测出三个修正设计假设的事实**：
+
+1. **LoRA 不止命中 LM 解码器**：peft 按模块名匹配 target_modules，音频编码器
+   18 层的 q/k/v_proj 也被挂了 LoRA——适配器共 **250 个模块 = LM 196（28 层×7 类）
+   + 音频塔 54（18 层×3 类）**。补丁须同时覆盖 `decoder.int8.onnx` 与
+   `encoder.int8.onnx`（「音频塔不用动」不成立；`conv_frontend.onnx`/tokenizer 仍原样复用）；
+2. **权重名被导出器匿名化**：197 个量化 MatMul 权重全叫 `onnx::MatMul_N_quantized/
+   _scale/_zero_point`（197 = LM 196 + 1 个额外量化 MatMul），按投影名匹配全部落空。
+   → 探针 v2 改为**按值匹配**：反量化后与 HF 基座 safetensors 逐元素比对
+   （形状预过滤 + 转置摆位自动试探 + 唯一性 margin + 误差上限拒配），机制已在
+   合成夹具上全路径单测（匿名量化/fp32-Gemm/int8 对称无 zp/跨文件音频塔/诱饵层
+   唯一性/负路径）；
+3. **官方 0.6B 包全部投影都是 per-channel uint8**：社区「Q/K/V/O 保 FP32」的说法
+   不适用于 k2-fsa 官方包（那是 1.7B 社区导出的规则）——补丁器必须处理
+   「反量化→加 ΔW→重量化」，削顶率由探针实测决定沿用原 scale 还是重算。
 
 B2 的产物形态：
 
 ```
 models/sherpa-onnx-qwen3-asr-0.6B-s2tt-int8/
 ├── conv_frontend.onnx      # 原样复制
-├── encoder.int8.onnx       # 原样复制
-├── decoder.int8.onnx       # ← 唯一被补丁的文件
+├── encoder.int8.onnx       # ← 补丁（音频塔 q/k/v × 18 层）
+├── decoder.int8.onnx       # ← 补丁（LM 7 类投影 × 28 层）
 └── tokenizer/…             # 原样复制
 ```
 
-## 3. B2 的前置事实与风险（Gate 1 = `inspect_onnx_lora.py`）
+## 3. B2 的前置事实与风险（Gate 1 = `inspect_onnx_lora.py`，v2 按值匹配）
 
-补丁正确性押在四个事实上，探针逐项核查（合成夹具已验证探针机制本身：
-fp32/uint8、转置/非转置、axis 0/1、ΔW 独立复算全对）：
+补丁正确性押在四个事实上，探针 v2 逐项核查（机制已在合成夹具上全路径单测：
+匿名量化/fp32-Gemm/int8 对称无 zp/uint8 非对称带 zp、axis 0/1、转置摆位、
+跨文件音频塔、诱饵层唯一性、误差上限拒配、ΔW 独立复算全对）：
 
-1. **张量地图**：decoder 里 7 类投影是否都能按名字找到；哪些 fp32（社区经验：
-   Q/K/V/O 常保 fp32 防 repetition collapse——对我们反而是好事，fp32 张量加 ΔW 无损）、
-   哪些 per-channel QUInt8（gate/up/down），scale/zp 张量与量化 axis 各是什么；
-2. **HF↔ONNX 同源性**：抽样层反量化后与 HF 基座 safetensors 逐元素对比（rel < 2e-2）。
-   不同源（导出器另做过折叠/吸收）则补丁映射不成立；
+1. **张量地图**：decoder+encoder 里全部量化权重（DequantizeLinear/MatMulInteger/
+   QLinearMatMul 的数据输入）与 fp32 大二维权重，连同 scale/zp 张量、量化 axis、
+   消费节点位置；权重名已被匿名化（§2 事实 2），映射靠**按值匹配**：反量化后与
+   HF 基座 safetensors 比对，形状预过滤+转置试探，要求最优匹配 rel_err < 0.05
+   且与次优拉开 2 倍（唯一性），否则宁判未匹配也不错配；
+2. **HF↔ONNX 同源性**：值匹配本身就逐张量给出 rel_err（量化噪声量级 ~1e-3）；
+   250 个适配器模块必须**全部**映射到 ONNX 张量（含音频塔 54 个）才 GO；
 3. **ΔW 幅度**：||ΔW||_F/||W||_F 逐模块报告（LoRA r=32 预期 ~1e-2 量级）；
 4. **削顶率**：模拟「反量化→加 ΔW→按**原** scale/zp 重量化」，统计被 clip 的元素占比。
    <1% → 直接按原 scale 写回；≥1% → 补丁器按新 range 重算该通道 scale（仍可行，多一步）。
 
-**兜底**：若导出器没保留权重名（`onnx::MatMul_12345` 式命名），探针会打印全部
-initializer 命名模式聚类，转「按形状+值匹配 HF 权重」做图手术（复杂度上升但不判死）。
+**残留风险**：若某个被 LoRA 命中的权重在 ONNX 里被导出器折叠/吸收进别的算子
+（值匹配找不到同源张量），该模块无法补丁——探针会以 NO-GO 明示，届时降级到
+「重训一个只挂 LM 且可映射的适配器」或路线 A。197 个量化 MatMul 与 196+embed
+的账目差 1（多出的那个由 v2 值匹配指认，可能是 tied lm_head 或 projector）。
 
 ## 4. 验证链（三道闸，全在 CI，不过闸不发布）
 

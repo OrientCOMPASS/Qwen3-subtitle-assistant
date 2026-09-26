@@ -1,38 +1,39 @@
 #!/usr/bin/env python3
-"""ONNX 权重补丁可行性探针——「LoRA 合并 → 官方 decoder.int8.onnx 手术式补丁」的前置事实核查。
+"""ONNX 权重补丁可行性探针 v2——按值匹配（应对导出器匿名化权重名）。
 
-路线背景（详见 finetune/INTEGRATION.md）：产品 ASR 走 sherpa-onnx 的官方 int8 ONNX
-包（conv_frontend / encoder.int8 / decoder.int8 / tokenizer）。S2TT LoRA 只挂在 LM
-解码器的 q/k/v/o/gate/up/down 投影上——**音频塔与 projector 完全没动**，所以理论上
-只需把 ΔW = B·A·(α/r) 写回 decoder.int8.onnx 的对应权重张量，encoder/conv_frontend/
-tokenizer 原样复制，即得到「快速直出版」模型目录，sherpa-onnx 与 Rust 侧零改动。
+v1 在真实的 k2-fsa 官方包上实测（run 36250220762）发现两个推翻设计假设的事实：
+  1. **权重名被 torch.onnx 导出器匿名化**：197 个量化 MatMul 权重全叫
+     `onnx::MatMul_N_quantized/_scale/_zero_point`，按 q_proj/down_proj 名字一个都找不到
+     （197 = 28 层 × 7 类投影 196 + 1 个额外的量化 MatMul，embed_tokens 反而保留了名字）；
+  2. **LoRA 也命中了音频塔**：peft 按模块名匹配 target_modules，音频编码器 18 层的
+     q/k/v_proj 同样被挂了 LoRA（54 个模块），适配器共 250 个模块——所以补丁必须
+     同时覆盖 decoder.int8.onnx 和 encoder.int8.onnx（「音频塔不用动」不成立）。
 
-本探针不写补丁，只回答补丁的全部前置事实：
-  1. **张量地图**：decoder.int8.onnx 里全部命中 7 类投影的 initializer——名称模式、
-     dtype（fp32 还是 uint8/int8 量化）、形状、scale/zero_point 伴生张量、消费节点
-     op（MatMul/Gemm/MatMulInteger/DequantizeLinear）与转置关系；
-  2. **HF↔ONNX 对应性**：抽样若干层，把 ONNX 权重（量化的先反量化）与 HF 基座
-     safetensors 逐元素对比（自动试「同向/转置」两种摆位）——补丁映射的正确性全押在这；
-  3. **ΔW 幅度与量化风险**：对每个目标模块计算 ||ΔW||_F/||W||_F；对量化张量模拟
-     「反量化 → 加 ΔW → 按原 per-channel scale/zp 重量化」：统计削顶元素占比与
-     重量化 MSE——直接量化「按原 scale 写回」会不会把权重推出表示范围。
+v2 的匹配策略（不再依赖名字）：
+  * 从图里扫出全部量化权重（DequantizeLinear / MatMulInteger / QLinearMatMul 的
+    数据输入 + scale/zp/axis）；
+  * 反量化后与 HF 基座 safetensors **按值匹配**：形状预过滤（含转置摆位），
+    误差最小者胜出，且要求与次优拉开 2 倍以上差距（唯一性）；
+  * 适配器模块 → HF key 用直接拼接（`thinker.` 前缀探测），再经映射表找到 ONNX 张量；
+  * 对每个适配器模块计算 ΔW=B·A·(α/r) 的相对幅度，并模拟「反量化→加 ΔW→按原
+    scale/zp 重量化」的削顶率与 MSE——决定补丁器能否沿用原 scale。
 
-go/no-go 判据（打印在末尾，也写进 JSON）：
-  * 7 类投影都能在 decoder 里找到（缺一类 = 导出器做过折叠/改名，路线要重估）；
-  * HF↔ONNX 抽样最大绝对差 < 2e-2（反量化误差量级以内，说明是同源权重）；
-  * 削顶元素占比 < 1%（超出则需按新 range 重算 scale——仍可行，但要多带一步）。
+go/no-go 判据：
+  * 250 个适配器模块全部映射到 ONNX 张量（GO-mapping）；
+  * 抽样对应性 rel_err < 2e-2（同源权重）；
+  * 削顶率 < 1% → 直接沿用原 scale；否则补丁器按新 range 重算 scale（仍可行）。
 
-用法（CI：finetune.yml 的 onnx-inspect 模式；模型目录与 HF 基座都在 runner 缓存里）：
+用法（CI：finetune.yml mode=onnx-inspect）：
   python finetune/inspect_onnx_lora.py \
       --model-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 \
-      --hf-model Qwen/Qwen3-ASR-0.6B \
-      --adapter art/out/real/lora \
+      --hf-model Qwen/Qwen3-ASR-0.6B --adapter art/out/real/lora \
       --out out/inspect/onnx_patch_report.json
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import re
 import sys
@@ -57,157 +58,109 @@ def _hard_exit(code: int) -> "NoReturn":
     os._exit(code)
 
 
-# ------------------------------------------------------------------ ONNX 结构
-
 def norm_pattern(name: str) -> str:
-    """把张量名里的数字归一化成 N，聚出命名模式。"""
     return re.sub(r"\d+", "N", name)
 
 
-def build_tensor_map(model) -> dict:
-    import onnx
+# ------------------------------------------------------------------ ONNX 图扫描
 
-    inits = {t.name: t for t in model.graph.initializer}
-    # 谁消费了哪个 initializer（op、输入位置、Gemm 转置属性）
-    consumers: dict[str, list] = defaultdict(list)
-    for node in model.graph.node:
-        for pos, inp in enumerate(node.input):
-            if inp in inits:
-                attrs = {a.name: (a.i if a.type == onnx.AttributeProto.INT else a.f)
-                         for a in node.attribute}
-                consumers[inp].append({
-                    "op": node.op_type, "pos": pos,
-                    "transA": attrs.get("transA"), "transB": attrs.get("transB"),
-                })
-    return inits, consumers
+def scan_quant_entries(model, fname: str) -> list[dict]:
+    """扫出全部「量化权重 + scale/zp/axis」条目。
 
-
-def find_scale_zp(inits: dict, consumers: dict, name: str):
-    """找量化张量的 scale/zero_point：先按命名约定，再看 DequantizeLinear/MatMulInteger 的输入。"""
-    for suf in ("_scale", "_quant_scale", "_quantization_scale"):
-        if name + suf in inits:
-            scale = name + suf
-            zp = None
-            for z in (name + "_zero_point", name + "_zp", name + "_quant_zero_point"):
-                if z in inits:
-                    zp = z
-                    break
-            return scale, zp
-    # 从消费节点反查：DequantizeLinear(x, scale, zp) / MatMulInteger(A, B, A_zp, B_zp)
-    for c in consumers.get(name, []):
-        pass  # 节点级信息在外层扫描时补齐（这里只处理命名约定命中）
-    return None, None
-
-
-def collect_qparam_names(model) -> set:
-    """全图扫一遍：所有被当作 scale/zero_point 用的 initializer 名（要从目标里排除）。"""
-    names = set()
-    for node in model.graph.node:
+    覆盖三种消费形态：
+      DequantizeLinear(w, scale[, zp], axis=a) -> MatMul
+      MatMulInteger(A, B[, A_zp, B_zp])（scale 在图外，本探针记 flag）
+      QLinearMatMul(a, a_s, a_zp, b, b_s, b_zp, ...)
+    """
+    init_names = {t.name for t in model.graph.initializer}
+    entries: dict[str, dict] = {}
+    flags: list[str] = []
+    for idx, node in enumerate(model.graph.node):
         ins = list(node.input)
-        if node.op_type in ("DequantizeLinear", "QuantizeLinear"):
-            names.update(i for i in ins[1:3] if i)
-        elif node.op_type == "MatMulInteger":
-            names.update(i for i in ins[2:4] if i)
-        elif node.op_type == "QLinearMatMul":
-            names.update(ins[i] for i in (1, 2, 4, 5, 6, 7) if i < len(ins) and ins[i])
-    return names
-
-
-def scan_nodes_for_qparams(model, target_names: set) -> dict:
-    """扫全图：对每个目标量化张量，从 DequantizeLinear / MatMulInteger / QLinearMatMul
-    的输入位置找出 scale / zero_point 张量名。"""
-    import onnx  # noqa: F401
-
-    found: dict[str, dict] = defaultdict(dict)
-    for node in model.graph.node:
-        ins = list(node.input)
-        if node.op_type == "DequantizeLinear" and ins and ins[0] in target_names:
+        if node.op_type == "DequantizeLinear" and ins and ins[0] in init_names:
             axis = next((a.i for a in node.attribute if a.name == "axis"), None)
-            if len(ins) > 1:
-                found[ins[0]]["scale"] = ins[1]
+            e = entries.setdefault(ins[0], {"w": ins[0], "file": fname, "node_idx": idx, "op": node.op_type})
+            if len(ins) > 1 and ins[1]:
+                e["scale"] = ins[1]
             if len(ins) > 2 and ins[2]:
-                found[ins[0]]["zp"] = ins[2]
+                e["zp"] = ins[2]
             if axis is not None:
-                found[ins[0]]["axis"] = int(axis)
+                e["axis"] = int(axis)
         elif node.op_type == "MatMulInteger":
-            # (A, B, A_zero_point, B_zero_point)
-            for pos, tname in enumerate(ins[:2]):
-                if tname in target_names:
+            for pos in (0, 1):
+                if len(ins) > pos and ins[pos] in init_names:
+                    e = entries.setdefault(ins[pos], {"w": ins[pos], "file": fname,
+                                                      "node_idx": idx, "op": node.op_type})
                     zpos = pos + 2
                     if len(ins) > zpos and ins[zpos]:
-                        found[tname]["zp"] = ins[zpos]
+                        e["zp"] = ins[zpos]
+                    if "scale" not in e:
+                        flags.append(f"{ins[pos]}: MatMulInteger 无内联 scale（在图外 Mul，需另找）")
         elif node.op_type == "QLinearMatMul":
-            # (a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp)
             for tpos, spos, zpos in ((0, 1, 2), (3, 4, 5)):
-                if len(ins) > zpos and ins[tpos] in target_names:
-                    found[ins[tpos]]["scale"] = ins[spos]
+                if len(ins) > max(tpos, spos, zpos) and ins[tpos] in init_names:
+                    e = entries.setdefault(ins[tpos], {"w": ins[tpos], "file": fname,
+                                                       "node_idx": idx, "op": node.op_type})
+                    e["scale"] = ins[spos]
                     if ins[zpos]:
-                        found[ins[tpos]]["zp"] = ins[zpos]
-    return dict(found)
+                        e["zp"] = ins[zpos]
+    return list(entries.values()), flags
 
 
-# ------------------------------------------------------------------ HF 基座权重
+# ------------------------------------------------------------------ HF 基座
 
-def hf_lazy_open(hf_model: str):
-    """按 key 惰性读取 HF 基座权重（bf16 -> float32 numpy），不整包进内存。"""
-    import numpy as np
+def hf_open(hf_model: str):
     from safetensors import safe_open
 
     root = Path(hf_model)
     if not root.is_dir():
-        from huggingface_hub import snapshot_download  # 惰性：本地目录时不需要该依赖
+        from huggingface_hub import snapshot_download
 
         root = Path(snapshot_download(hf_model, allow_patterns=["*.safetensors", "*.json"]))
     files = sorted(root.glob("*.safetensors"))
     if not files:
         raise SystemExit(f"HF 模型目录里没有 safetensors: {root}")
     handles = [safe_open(str(f), framework="np") for f in files]
-    index: dict[str, object] = {}
+    t_handles = None
+    index: dict[str, tuple] = {}
+    shapes: dict[str, tuple] = {}
     for h in handles:
         for k in h.keys():
             index[k] = h
-
-    def get(key: str):
-        h = index.get(key)
-        if h is None:
-            return None
-        t = h.get_tensor(key)
-        # safetensors numpy 后端不支持 bf16：这类 key 换 torch 读
-        return np.asarray(t, dtype=np.float32)
-
-    def get_torch(key: str):
-        import torch
-        from safetensors.torch import safe_open as t_open
-
-        h = index.get(key)
-        if h is None:
-            return None
-        # 重新用 torch 打开同一文件
-        path = h.filename
-        with t_open(path, framework="pt") as th:
-            return th.get_tensor(key).float().numpy()
+            shapes[k] = tuple(h.get_slice(k).get_shape())
 
     def fetch(key: str):
+        import numpy as np
+
+        h = index[key]
         try:
-            v = get(key)
-        except Exception:  # bf16 等 numpy 读不了的 dtype
-            v = get_torch(key)
-        return v
+            return np.asarray(h.get_tensor(key), dtype=np.float32)
+        except Exception:  # bf16 等 numpy 读不了的 dtype -> torch
+            nonlocal t_handles
+            from safetensors.torch import safe_open as t_open
 
-    return index, fetch
+            if t_handles is None:
+                t_handles = {str(f): t_open(str(f), framework="pt") for f in files}
+            th = t_handles[h.filename]
+            return th.get_tensor(key).float().numpy()
 
-
-def find_hf_key(index: dict, layer: int, proj: str):
-    """在 HF key 里找 `layers.{layer}...{proj}.weight`（thinker 的 language_model 部分）。"""
-    pat = re.compile(rf"layers\.{layer}\..*\b{proj}\.weight$")
-    cands = [k for k in index if pat.search(k) and "lora" not in k]
-    # 排除音频塔（audio_tower / visual 等），只要 language_model/thinker 文本侧
-    pref = [k for k in cands if ("language_model" in k or "thinker" in k)]
-    pick = (pref or cands)
-    return pick[0] if pick else None
+    return index, shapes, fetch
 
 
-# ------------------------------------------------------------------ 适配器 ΔW
+def hf_key_for_module(index: dict, mod: str):
+    """适配器模块名 -> HF key。真实 peft 模块名如 model.layers.N.self_attn.q_proj /
+    audio_tower.layers.N.self_attn.q_proj，HF key 为 thinker.<mod>.weight（前缀探测）。"""
+    for cand in (f"thinker.{mod}.weight", f"{mod}.weight"):
+        if cand in index:
+            return cand
+    # 兜底：模糊匹配结尾
+    suf = f".{mod.split('.', 1)[-1]}.weight" if "." in mod else None
+    tail = mod.split("layers.", 1)[-1]
+    cands = [k for k in index if k.endswith(tail + ".weight") or (suf and k.endswith(suf))]
+    return cands[0] if len(cands) == 1 else None
+
+
+# ------------------------------------------------------------------ 适配器
 
 def load_adapter(adapter_dir: Path):
     import numpy as np
@@ -223,17 +176,64 @@ def load_adapter(adapter_dir: Path):
         with safe_open(str(f), framework="np") as h:
             for k in h.keys():
                 m = re.match(r"base_model\.model\.(.*)\.lora_(A|B)\.weight$", k)
-                if not m:
-                    continue
-                per_module[m.group(1)][m.group(2)] = np.asarray(h.get_tensor(k), dtype=np.float32)
+                if m:
+                    per_module[m.group(1)][m.group(2)] = np.asarray(h.get_tensor(k), dtype=np.float32)
     return r, alpha, scaling, dict(per_module)
 
 
-def module_layer_proj(mod: str):
-    m = re.search(r"layers\.(\d+)\..*?\b(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$", mod)
-    if not m:
-        return None, None
-    return int(m.group(1)), m.group(2)
+# ------------------------------------------------------------------ 值匹配
+
+def dequant(entry, inits):
+    """按 axis 反量化成 fp32 numpy；返回 (W, scale_bcast, zp_bcast, quantized)。"""
+    import numpy as np
+    from onnx import numpy_helper
+
+    W = numpy_helper.to_array(inits[entry["w"]])
+    if entry.get("scale") is None:
+        return W.astype(np.float32), None, None, False
+    scale = numpy_helper.to_array(inits[entry["scale"]]).astype(np.float64)
+    zp = (numpy_helper.to_array(inits[entry["zp"]]).astype(np.float64)
+          if entry.get("zp") else np.float64(0.0))
+    if scale.size == 1:
+        s_b = scale.reshape([1] * W.ndim)
+        z_b = np.reshape(zp, [1] * W.ndim) if np.ndim(zp) else zp
+    else:
+        axis = entry.get("axis", 1 if W.ndim == 2 else 0) % W.ndim
+        if scale.size != W.shape[axis] and W.ndim == 2:
+            axis = 1 - axis  # 标注与实际不符时试另一轴
+        shp = [1] * W.ndim
+        shp[axis] = scale.size
+        s_b = scale.reshape(shp)
+        z_b = zp.reshape(shp) if np.size(zp) == scale.size else zp
+    Wf = (W.astype(np.float64) - z_b) * s_b
+    return Wf.astype(np.float32), s_b, z_b, True
+
+
+def match_one(Wd, hf_by_shape, hf_fetch, cache, max_rel: float):
+    """在 HF 权重里找与 Wd 值最匹配者（自动试转置摆位）。返回 (key, transposed, rel_err, second_rel)。
+
+    误差下限都超过 max_rel 则判为「HF 里没有它的同源权重」（返回 None）——
+    宁缺毋滥：错误映射比未映射危险得多。
+    """
+    import numpy as np
+
+    results = []
+    for transposed in (False, True):
+        Wt = Wd.T if transposed else Wd
+        for key in hf_by_shape.get(Wt.shape, ()):
+            Whf = cache.get(key)
+            if Whf is None:
+                Whf = hf_fetch(key)
+                cache[key] = Whf
+            denom = max(1e-9, float(np.abs(Whf).mean()))
+            rel = float(np.abs(Whf.astype(np.float32) - Wt).mean()) / denom
+            results.append((rel, key, transposed))
+    if not results or results and min(r[0] for r in results) > max_rel:
+        return None
+    results.sort()
+    best = results[0]
+    second = results[1][0] if len(results) > 1 else float("inf")
+    return best[1], best[2], best[0], second
 
 
 # ------------------------------------------------------------------ 主流程
@@ -241,10 +241,16 @@ def module_layer_proj(mod: str):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True, help="sherpa-onnx-qwen3-asr-*-int8 目录")
-    ap.add_argument("--decoder", default="decoder.int8.onnx")
     ap.add_argument("--hf-model", default="Qwen/Qwen3-ASR-0.6B")
-    ap.add_argument("--adapter", required=True, help="LoRA 适配器目录")
-    ap.add_argument("--sample-layers", type=int, default=4, help="HF↔ONNX 对应性抽样的层数")
+    ap.add_argument("--adapter", required=True)
+    ap.add_argument("--files", default="", help="逗号分隔的 onnx 文件名（默认目录下全部 *.onnx）")
+    ap.add_argument("--skip-name-pattern", default="embed_tokens",
+                    help="名字命中该模式的量化张量跳过值匹配（如 embed_tokens，LoRA 不碰）")
+    ap.add_argument("--min-elems", type=int, default=1024,
+                    help="无量化包装的 fp32 二维 initializer 也纳入值匹配的元素数下限"
+                         "（兼容「Q/K/V/O 保 fp32」的混合摆位导出）")
+    ap.add_argument("--max-match-rel", type=float, default=0.05,
+                    help="值匹配的平均相对误差上限，超过视为 HF 里没有同源权重")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -256,250 +262,192 @@ def main() -> int:
 
     import numpy as np
     import onnx
-    from onnx import numpy_helper
 
     t0 = time.time()
     model_dir = Path(args.model_dir)
-    dec = model_dir / args.decoder
-    log(f"模型目录: {model_dir}")
-    for p in sorted(model_dir.rglob("*")):
-        if p.is_file():
-            log(f"  {p.relative_to(model_dir)}  {p.stat().st_size/1e6:.1f}MB")
-    if not dec.is_file():
-        cands = sorted(model_dir.glob("*decoder*.onnx"))
-        if not cands:
-            raise SystemExit(f"找不到 decoder: {dec}")
-        dec = cands[0]
-    log(f"加载 {dec.name} ...")
-    model = onnx.load(str(dec))
-    log(f"onnx 加载完成 {time.time()-t0:.1f}s，opset={[ (o.domain or 'ai.onnx', o.version) for o in model.opset_import ]}")
+    files = ([model_dir / f for f in args.files.split(",")] if args.files
+             else sorted(model_dir.glob("*.onnx")))
+    log(f"模型目录: {model_dir}；待扫文件: {[f.name for f in files]}")
 
-    inits, consumers = build_tensor_map(model)
-    log(f"initializer 总数 {len(inits)}，节点总数 {len(model.graph.node)}")
-
-    # ---- 1) 目标张量地图 ----
-    qparam_names = collect_qparam_names(model)
-    targets = {}
-    for name in inits:
-        if name in qparam_names:
-            continue
-        hit = next((p for p in PROJ_TYPES if p in name), None)
-        if hit and re.search(r"layers\.\d+", name):
-            targets[name] = hit
-    log(f"命中 7 类投影的 initializer: {len(targets)} 个（已排除 {len(qparam_names)} 个 scale/zp 伴生张量）")
-    if not targets:
-        # 导出器可能没保留权重名（如 onnx::MatMul_1234）——把所有 initializer 的
-        # 命名模式聚出来供人工比对，探针结论转为 NO-GO?（需要按值匹配做图手术）
-        allpats = defaultdict(int)
-        for name in inits:
-            allpats[norm_pattern(name)] += 1
-        log("!! 未命中任何投影名，全部 initializer 命名模式（前 40）:")
-        for pat, n in sorted(allpats.items(), key=lambda kv: -kv[1])[:40]:
-            log(f"  {n:5d} × {pat}")
-
-    qparams = scan_nodes_for_qparams(model, set(targets))
-
-    DTYPE = {1: "float32", 2: "uint8", 3: "int8", 6: "int32", 7: "int64", 10: "float16", 11: "double", 16: "bfloat16"}
-    tensor_map = []
-    by_proj = defaultdict(list)
-    patterns = defaultdict(int)
-    for name, proj in sorted(targets.items()):
-        t = inits[name]
-        dt = DTYPE.get(t.data_type, str(t.data_type))
-        cons = consumers.get(name, [])
-        qp = qparams.get(name, {})
-        # 命名约定兜底
-        if not qp:
-            s, z = find_scale_zp(inits, consumers, name)
-            if s:
-                qp = {"scale": s, **({"zp": z} if z else {})}
-        entry = {
-            "name": name, "proj": proj, "dtype": dt, "shape": list(t.dims),
-            "consumers": cons[:3], "scale": qp.get("scale"), "zp": qp.get("zp"),
-            "axis": qp.get("axis"),
+    # ---- 1) 扫全部 onnx 文件的量化条目 ----
+    all_entries, scan_flags, file_info = [], [], {}
+    for f in files:
+        m = onnx.load(str(f))
+        inits_meta = {t.name: (list(t.dims), t.data_type) for t in m.graph.initializer}
+        ents, fl = scan_quant_entries(m, f.name)
+        # 无量化包装的 fp32 大二维权重也纳入匹配（混合摆位导出时 Q/K/V/O 可能是 fp32）
+        quant_names = {e["w"] for e in ents}
+        for name, (dims, dt) in inits_meta.items():
+            if (dt == 1 and len(dims) == 2 and dims[0] * dims[1] >= args.min_elems
+                    and name not in quant_names
+                    and not re.search(r"(_scale|_zero_point|_zp)$", name)):
+                ents.append({"w": name, "file": f.name, "node_idx": None,
+                             "op": "fp32-initializer", "scale": None})
+        pats = defaultdict(int)
+        for name in inits_meta:
+            pats[norm_pattern(name)] += 1
+        file_info[f.name] = {
+            "size_mb": round(f.stat().st_size / 1e6, 1),
+            "initializers": len(inits_meta), "nodes": len(m.graph.node),
+            "quant_entries": len(ents),
+            "top_patterns": dict(sorted(pats.items(), key=lambda kv: -kv[1])[:12]),
         }
-        tensor_map.append(entry)
-        by_proj[proj].append(entry)
-        patterns[norm_pattern(name)] += 1
-
-    log("命名模式聚类:")
-    for pat, n in sorted(patterns.items()):
-        log(f"  {n:4d} × {pat}")
-    log("按投影类型统计:")
-    for proj in PROJ_TYPES:
-        ents = by_proj.get(proj, [])
-        dts = defaultdict(int)
+        log(f"  {f.name}: {f.stat().st_size/1e6:.1f}MB  initializer {len(inits_meta)}  "
+            f"节点 {len(m.graph.node)}  可匹配权重 {len(ents)}")
         for e in ents:
-            dts[e["dtype"]] += 1
-        ops = defaultdict(int)
-        for e in ents:
-            for c in e["consumers"]:
-                ops[c["op"]] += 1
-        log(f"  {proj:10s} {len(ents):3d} 个  dtype={dict(dts)}  消费op={dict(ops)}"
-            + ("" if ents else "  <<< 缺失！"))
+            e["shape"] = inits_meta[e["w"]][0]
+            e["dtype"] = inits_meta[e["w"]][1]
+        all_entries.extend(ents)
+        scan_flags.extend(fl)
+        del m
+        gc.collect()
+    log(f"可匹配权重条目合计 {len(all_entries)}；扫描 flags {len(scan_flags)}")
 
-    # ---- 2) 适配器 ΔW ----
+    # ---- 2) HF 索引 ----
+    hf_index, hf_shapes, hf_fetch = hf_open(args.hf_model)
+    log(f"HF key 总数 {len(hf_index)}；样例: {list(hf_index)[:3]}")
+    hf_by_shape = defaultdict(list)
+    for k, shp in hf_shapes.items():
+        if len(shp) == 2 and shp[0] * shp[1] >= args.min_elems:
+            hf_by_shape[shp].append(k)
+
+    # ---- 3) 值匹配（重新逐文件加载，控制内存峰值） ----
+    DTYPE = {1: "float32", 2: "uint8", 3: "int8", 7: "int64", 10: "float16", 16: "bfloat16"}
+    cache: dict = {}
+    mapping: dict[str, dict] = {}      # hf_key -> entry+match 信息
+    unmatched_onnx, skipped = [], []
+    rel_errs = []
+    for f in files:
+        m = onnx.load(str(f))
+        inits = {t.name: t for t in m.graph.initializer}
+        for e in [x for x in all_entries if x["file"] == f.name]:
+            if args.skip_name_pattern and args.skip_name_pattern in e["w"]:
+                skipped.append(e["w"])
+                continue
+            Wd, _, _, _ = dequant(e, inits)
+            res = match_one(Wd, hf_by_shape, hf_fetch, cache, args.max_match_rel)
+            del Wd
+            if res is None:
+                unmatched_onnx.append({"w": e["w"], "shape": e["shape"]})
+                continue
+            key, transposed, rel, second = res
+            uniq = second > 2 * max(rel, 1e-9)
+            e.update({"hf_key": key, "transposed": bool(transposed),
+                      "rel_err": round(rel, 6), "unique": bool(uniq),
+                      "dtype_s": DTYPE.get(e["dtype"], str(e["dtype"]))})
+            if not uniq:
+                scan_flags.append(f"{e['w']}: 值匹配不唯一（best {rel:.2e} vs second {second:.2e}）")
+            if key in mapping:
+                scan_flags.append(f"{key}: 被多个 ONNX 张量匹配（{mapping[key]['w']} 与 {e['w']}）")
+            mapping[key] = e
+            rel_errs.append(rel)
+        del m, inits
+        gc.collect()
+        log(f"  {f.name}: 累计映射 {len(mapping)}，HF 缓存 {len(cache)} 张量")
+
+    log(f"值匹配完成 {time.time()-t0:.1f}s：映射 {len(mapping)}，未匹配 ONNX 张量 {len(unmatched_onnx)}，"
+        f"跳过 {len(skipped)}（{args.skip_name_pattern!r}）")
+    if rel_errs:
+        log(f"匹配 rel_err: 最大 {max(rel_errs):.2e} / 中位 {sorted(rel_errs)[len(rel_errs)//2]:.2e}")
+
+    # ---- 4) 适配器模块 -> ONNX，ΔW 与削顶模拟 ----
     r, alpha, scaling, per_module = load_adapter(Path(args.adapter))
-    log(f"适配器: r={r} alpha={alpha} scaling={scaling:.3f} 模块数 {len(per_module)}")
+    log(f"适配器: r={r} alpha={alpha} scaling={scaling:.3f} 模块 {len(per_module)}")
+    dw_stats, unmapped_mods = [], []
+    worst_clip, worst_rel, worst_match_rel = 0.0, 0.0, 0.0
+    for mod, ab in sorted(per_module.items()):
+        if "A" not in ab or "B" not in ab:
+            unmapped_mods.append(mod + "(缺A/B)")
+            continue
+        dW = (ab["B"] @ ab["A"]) * scaling      # (N, K)，HF Linear 摆位
+        hf_key = hf_key_for_module(hf_index, mod)
+        e = mapping.get(hf_key) if hf_key else None
+        if e is None:
+            unmapped_mods.append(mod)
+            continue
+        if tuple(dW.shape) != hf_shapes[hf_key]:
+            unmapped_mods.append(f"{mod}(形状 {dW.shape} != HF {hf_shapes[hf_key]})")
+            continue
+        rel_dw = float(np.linalg.norm(dW) / max(1e-12, np.linalg.norm(cache.get(hf_key) if hf_key in cache else hf_fetch(hf_key))))
+        worst_rel = max(worst_rel, rel_dw)
+        worst_match_rel = max(worst_match_rel, e["rel_err"])
+        st = {"module": mod, "file": e["file"], "w": e["w"], "dtype": e["dtype_s"],
+              "transposed": e["transposed"], "rel_dw": round(rel_dw, 5),
+              "match_rel_err": e["rel_err"]}
+        # 削顶模拟需要重新反量化该张量（按需加载所在文件的那一个 initializer）
+        dw_stats.append(st)
+    log(f"适配器映射: {len(dw_stats)}/{len(per_module)}；未映射 {len(unmapped_mods)}")
+    if unmapped_mods:
+        log("  未映射示例: " + "; ".join(unmapped_mods[:6]))
 
-    # ONNX 名 -> (layer, proj)，与适配器模块配对
-    def onnx_layer(name):
-        m = re.search(r"layers\.(\d+)", name)
-        return int(m.group(1)) if m else None
+    # 削顶模拟：按文件分组，避免反复加载
+    clip_flags = []
+    by_file = defaultdict(list)
+    for st in dw_stats:
+        by_file[st["file"]].append(st)
+    for fname, sts in by_file.items():
+        m = onnx.load(str(model_dir / fname))
+        inits = {t.name: t for t in m.graph.initializer}
+        for st in sts:
+            e = mapping[hf_key_for_module(hf_index, st["module"])]
+            if e.get("scale") is None:
+                continue  # fp32 张量：直接加 ΔW，无损
+            mod = st["module"]
+            dW = (per_module[mod]["B"] @ per_module[mod]["A"]) * scaling
+            Wd, s_b, z_b, _ = dequant(e, inits)
+            dW_o = dW.T if st["transposed"] else dW
+            Wp = Wd.astype(np.float64) + dW_o
+            q = Wp / s_b + (z_b if z_b is not None else 0.0)
+            lo, hi = (0, 255) if e["dtype"] == 2 else (-128, 127)
+            clip = float(np.mean((q < lo) | (q > hi)))
+            qc = np.clip(np.rint(q), lo, hi)
+            mse = float(np.mean(((qc - (z_b if z_b is not None else 0.0)) * s_b - Wp) ** 2))
+            st["clip_frac"] = round(clip, 6)
+            st["requant_mse"] = round(mse, 10)
+            worst_clip = max(worst_clip, clip)
+            if clip >= 0.01:
+                clip_flags.append(f"{st['module']} clip={clip:.2%}")
+            del Wd, Wp, q, qc
+        del m, inits
+        gc.collect()
 
-    onnx_by_lp = {}
-    for e in tensor_map:
-        onnx_by_lp[(onnx_layer(e["name"]), e["proj"])] = e
+    log(f"ΔW 相对幅度最大 {worst_rel:.4f}；重量化削顶最坏 {worst_clip:.4%}；"
+        f"匹配误差最大 {worst_match_rel:.2e}")
 
-    hf_index, hf_fetch = hf_lazy_open(args.hf_model)
-    log(f"HF 基座 key 总数 {len(hf_index)}")
+    # ---- 5) verdict ----
+    verdict = []
+    n_mods = len(per_module)
+    if len(dw_stats) == n_mods:
+        verdict.append(f"GO-mapping: 适配器 {n_mods}/{n_mods} 模块全部映射到 ONNX 张量"
+                       f"（含音频塔；跨 {[f.name for f in files]}）")
+    else:
+        verdict.append(f"NO-GO? 适配器映射 {len(dw_stats)}/{n_mods}，未映射示例: {unmapped_mods[:4]}")
+    if worst_match_rel < 2e-2 and rel_errs:
+        verdict.append(f"GO-同源: HF↔ONNX 值匹配最大 rel_err {worst_match_rel:.2e} < 2e-2")
+    else:
+        verdict.append(f"NO-GO? 值匹配误差过大: {worst_match_rel:.2e}")
+    if worst_clip < 0.01:
+        verdict.append(f"GO-量化: 按原 scale 重量化削顶 {worst_clip:.4%} < 1%")
+    else:
+        verdict.append(f"谨慎-量化: 削顶 {worst_clip:.2%} >= 1%（{len(clip_flags)} 个模块），"
+                       "补丁需按新 range 重算 scale/zp")
 
     report = {
-        "decoder": str(dec), "tensor_map_patterns": dict(patterns),
-        "per_proj": {p: len(by_proj.get(p, [])) for p in PROJ_TYPES},
-        "lora": {"r": r, "alpha": alpha, "scaling": scaling, "modules": len(per_module)},
-        "hf_onnx_match": [], "dw_stats": [], "flags": [],
+        "files": file_info, "scan_flags": scan_flags[:40],
+        "hf_key_samples": list(hf_index)[:6],
+        "mapping_size": len(mapping), "unmatched_onnx": unmatched_onnx[:20],
+        "skipped": skipped, "adapter_modules": n_mods, "adapter_mapped": len(dw_stats),
+        "unmapped_modules": unmapped_mods[:40],
+        "worst": {"rel_dw": round(worst_rel, 5), "clip_frac": round(worst_clip, 6),
+                  "match_rel_err": round(worst_match_rel, 8)},
+        "dw_stats_sample": dw_stats[:12] + dw_stats[-6:],
+        "verdict": verdict, "seconds": round(time.time() - t0, 1),
     }
-
-    sample_layers = sorted({module_layer_proj(m)[0] for m in per_module
-                            if module_layer_proj(m)[0] is not None})
-    picks = (sample_layers[: args.sample_layers // 2 + 1]
-             + sample_layers[-(args.sample_layers // 2):]) if sample_layers else []
-    picks = sorted(set(picks))[: args.sample_layers]
-
-    worst_clip = 0.0
-    worst_rel = 0.0
-    matched = mismatched = unverified = 0
-    for mod, ab in sorted(per_module.items()):
-        layer, proj = module_layer_proj(mod)
-        if layer is None:
-            continue
-        if "A" not in ab or "B" not in ab:
-            report["flags"].append(f"{mod}: 缺 A 或 B")
-            continue
-        A, B = ab["A"], ab["B"]            # A: (r, K)  B: (N, r)
-        dW = (B @ A) * scaling             # (N, K)，HF Linear weight 摆位
-        e = onnx_by_lp.get((layer, proj))
-        if e is None:
-            report["flags"].append(f"ONNX 里找不到 layer{layer}.{proj}")
-            mismatched += 1
-            continue
-        W_onnx = numpy_helper.to_array(inits[e["name"]])
-        # 反量化（axis 感知：per-channel scale/zp 沿 DequantizeLinear 的 axis 摆放）
-        quantized = e["dtype"] in ("uint8", "int8")
-        if quantized:
-            sname, zname = e.get("scale"), e.get("zp")
-            if not sname:
-                report["flags"].append(f"{e['name']}: 量化张量找不到 scale")
-                unverified += 1
-                continue
-            scale = numpy_helper.to_array(inits[sname]).astype(np.float64)
-            zp = (numpy_helper.to_array(inits[zname]).astype(np.float64)
-                  if zname and zname in inits else np.float64(0.0))
-            axis = e.get("axis")
-            if axis is None:
-                axis = 1 if W_onnx.ndim == 2 else 0
-            axis %= W_onnx.ndim
-            if scale.size == 1:
-                s_bcast = scale.reshape([1] * W_onnx.ndim)
-                z_bcast = np.reshape(zp, [1] * W_onnx.ndim) if np.ndim(zp) else zp
-            else:
-                if scale.size != W_onnx.shape[axis]:
-                    # axis 标注与实际 scale 长度不符（或按命名约定兜底猜错）：试另一轴
-                    other = 1 - axis if W_onnx.ndim == 2 else None
-                    if other is not None and scale.size == W_onnx.shape[other]:
-                        axis = other
-                        report["flags"].append(f"{e['name']}: scale 长度按 axis={axis} 修正")
-                    else:
-                        report["flags"].append(
-                            f"{e['name']}: scale 长度 {scale.size} 与形状 {list(W_onnx.shape)} 对不上")
-                        unverified += 1
-                        continue
-                shp = [1] * W_onnx.ndim
-                shp[axis] = scale.size
-                s_bcast = scale.reshape(shp)
-                z_bcast = zp.reshape(shp) if np.size(zp) == scale.size else zp
-            Wf = (W_onnx.astype(np.float64) - z_bcast) * s_bcast
-        else:
-            Wf = W_onnx.astype(np.float64)
-        # 摆位：ONNX 可能是 (K,N)（MatMul B 输入）或 (N,K)
-        transposed = Wf.shape == (dW.shape[1], dW.shape[0]) and Wf.shape != dW.shape
-        Wc = Wf.T if transposed else Wf
-        if Wc.shape != dW.shape:
-            report["flags"].append(f"{e['name']}: 形状对不上 onnx={Wf.shape} dW={dW.shape}")
-            unverified += 1
-            continue
-
-        # HF↔ONNX 对应性（抽样层）
-        if layer in picks:
-            hf_key = find_hf_key(hf_index, layer, proj)
-            if hf_key:
-                Whf = hf_fetch(hf_key)
-                if Whf is not None and Whf.shape == Wc.shape:
-                    diff = float(np.abs(Whf.astype(np.float64) - Wc).max())
-                    rel = diff / max(1e-9, float(np.abs(Whf).max()))
-                    report["hf_onnx_match"].append({
-                        "layer": layer, "proj": proj, "hf_key": hf_key,
-                        "onnx": e["name"], "dtype": e["dtype"],
-                        "transposed": bool(transposed),
-                        "max_abs_diff": round(diff, 6), "rel": round(rel, 6)})
-                    log(f"  对应性 layer{layer}.{proj}: dtype={e['dtype']} transposed={transposed} "
-                        f"max|Δ|={diff:.2e} rel={rel:.2e}")
-                    if rel < 2e-2:
-                        matched += 1
-                    else:
-                        mismatched += 1
-                else:
-                    unverified += 1
-            else:
-                report["flags"].append(f"HF key 未找到 layer{layer}.{proj}")
-                unverified += 1
-
-        # ΔW 幅度 + 量化写回风险（模拟全部在 ONNX 存储摆位上做）
-        rel_dw = float(np.linalg.norm(dW) / max(1e-12, np.linalg.norm(Wc)))
-        worst_rel = max(worst_rel, rel_dw)
-        st = {"layer": layer, "proj": proj, "dtype": e["dtype"],
-              "rel_dw": round(rel_dw, 5)}
-        if quantized:
-            dW_o = dW.T if transposed else dW
-            Wp = Wf + dW_o
-            # round-trip 模拟：dequant q->(q-z)*s；requant W->W/s+z（沿用原 scale/zp）
-            q = Wp / s_bcast + z_bcast
-            lo, hi = (0, 255) if e["dtype"] == "uint8" else (-128, 127)
-            clip_frac = float(np.mean((q < lo) | (q > hi)))
-            qc = np.clip(np.rint(q), lo, hi)
-            recon = (qc - z_bcast) * s_bcast
-            mse = float(np.mean((recon - Wp) ** 2))
-            st.update({"clip_frac": round(clip_frac, 6),
-                       "requant_mse": round(mse, 10)})
-            worst_clip = max(worst_clip, clip_frac)
-        report["dw_stats"].append(st)
-
-    log(f"ΔW 相对幅度: 最大 {worst_rel:.4f}（{len(report['dw_stats'])} 个模块）")
-    log(f"量化写回模拟: 最坏削顶占比 {worst_clip:.4%}")
-
-    # ---- go/no-go ----
-    missing = [p for p in PROJ_TYPES if not by_proj.get(p)]
-    verdict = []
-    if missing:
-        verdict.append(f"NO-GO? decoder 缺投影类型: {missing}（可能被导出器折叠/改名，需人工看图）")
-    if mismatched and not matched:
-        verdict.append("NO-GO? HF↔ONNX 权重对应性全部失败（不同源或映射错误）")
-    elif matched:
-        verdict.append(f"GO: HF↔ONNX 对应性抽样 {matched} 层通过（rel<2e-2）")
-    if worst_clip < 0.01:
-        verdict.append(f"GO: 按原 scale 重量化削顶 {worst_clip:.4%} < 1%")
-    else:
-        verdict.append(f"谨慎: 削顶 {worst_clip:.2%} >= 1%，补丁需按新 range 重算 scale")
-    report["verdict"] = verdict
-    report["tensor_map_sample"] = tensor_map[:24]
-    report["seconds"] = round(time.time() - t0, 1)
-
     log("=" * 62)
     for v in verdict:
         log("  " + v)
-    if report["flags"]:
-        log(f"  flags({len(report['flags'])}): " + "; ".join(report["flags"][:8]))
+    if scan_flags:
+        log(f"  scan_flags({len(scan_flags)}): " + "; ".join(scan_flags[:6]))
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
