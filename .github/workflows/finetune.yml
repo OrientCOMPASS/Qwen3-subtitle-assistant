@@ -20,10 +20,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调(用提交的对照表，无需 API key)；gpu-train=GPU 真实训练"
+        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调(用提交的对照表，无需 API key)；gpu-train=GPU 真实训练；onnx-inspect=ONNX 权重补丁可行性探针"
         type: choice
         default: "cpu-smoke"
-        options: [cpu-smoke, real-mini, gpu-train]
+        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect]
       model:
         description: "基座模型"
         type: choice
@@ -42,17 +42,26 @@ on:
         type: choice
         default: "stub"
         options: [stub, api]
+      adapter_run:
+        description: "onnx-inspect 用：s2tt-real-mini 适配器所在 run id"
+        type: string
+        default: "36238661344"
+
+permissions:
+  contents: read
+  actions: read   # onnx-inspect 跨 run 下载适配器 artifact 需要
 
 env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: utf-8
   HF_HUB_DISABLE_PROGRESS_BARS: "1"
   TOKENIZERS_PARALLELISM: "false"
+  ADAPTER_RUN: ${{ inputs.adapter_run || '36238661344' }}
 
 jobs:
   cpu-smoke:
     name: CPU 管线冒烟（非质量验证）
-    if: ${{ inputs.mode != 'gpu-train' }}
+    if: ${{ inputs.mode == 'cpu-smoke' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -392,3 +401,75 @@ jobs:
             out/s2tt/eval_report.json
           if-no-files-found: warn
           retention-days: 90
+
+  # ------------------------------------------------------------------ ONNX 探针
+  # 「快速直出版」的落地路线 B2：不重写导出器，而是把 LoRA 的 ΔW=B·A·(α/r) 手术式
+  # 写回官方 sherpa-onnx decoder.int8.onnx（LoRA 只挂 LM 解码器 7 类投影，音频塔/
+  # projector/tokenizer 原样复用）。本 job 是动手术前的全部前置事实核查：
+  # 张量地图（命名/dtype/量化 axis/scale-zp）、HF↔ONNX 同源抽样、ΔW 幅度、
+  # 按原 scale 重量化的削顶率。详见 finetune/INTEGRATION.md 与脚本 docstring。
+  onnx-inspect:
+    name: ONNX 权重补丁可行性探针（LoRA→decoder.int8）
+    if: ${{ inputs.mode == 'onnx-inspect' }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Console UTF-8
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 还原产品模型缓存（sherpa-onnx int8 包，master CI 建好）
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: qwen3-models-v4-0.6B
+          fail-on-cache-miss: true
+
+      - name: Cache HuggingFace 基座（windows key，s2tt-e2e 已建）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-0.6B-win-v1
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet onnx safetensors huggingface_hub numpy
+
+      - name: 下载 LoRA 适配器（real-mini 产物）
+        uses: actions/download-artifact@v4
+        with:
+          name: s2tt-real-mini
+          run-id: ${{ env.ADAPTER_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: art
+
+      - name: 运行探针
+        shell: pwsh
+        run: |
+          python finetune/inspect_onnx_lora.py `
+            --model-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
+            --hf-model Qwen/Qwen3-ASR-0.6B `
+            --adapter art/out/real/lora `
+            --sample-layers 6 `
+            --out out/inspect/onnx_patch_report.json
+          if ($LASTEXITCODE -ne 0) { throw "探针运行失败" }
+
+      - name: 上传探针报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-onnx-inspect
+          path: out/inspect/onnx_patch_report.json
+          if-no-files-found: warn
+          retention-days: 60

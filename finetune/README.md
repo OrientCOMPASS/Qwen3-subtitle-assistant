@@ -1,7 +1,9 @@
 # Qwen3-ASR → S2TT 微调实验（日语语音直接输出中文字幕）
 
-这是 `exp/asr-s2tt` 分支的实验代码，目标是验证：**能否把 Qwen3-ASR 微调成"听日语、写中文"**，
-从而省掉现有管线的第二段（ASR 出日语 → LLM 翻译成中文）。
+本目录是 S2TT（speech-to-text-translation）实验线的代码与记录（源于 `exp/asr-s2tt`
+分支，已并入 master），目标是验证并落地：**把 Qwen3-ASR 微调成"听日语、写中文"**，
+从而省掉现有管线的第二段（ASR 出日语 → LLM 翻译成中文），成为「快速直出版」；
+现有两段式管线保留为「精翻版」。落地设计见 `INTEGRATION.md`。
 
 完整的可行性分析（含论文出处、路线对比、成本估算）见仓库根目录的
 `qwen3-asr-s2tt-feasibility.md`（在 master 分支的工作区报告里）。本文件只讲怎么跑。
@@ -51,10 +53,14 @@ system role；sherpa-onnx 侧对应 `hotwords` 字段，其源码注释写明
 
 | 文件 | 作用 |
 |---|---|
+| `INTEGRATION.md` | **推理落地设计**：双版本形态、路线对比（sidecar/重导出/权重补丁）、三道验证闸、Rust 侧最小改动清单 |
 | `prepare_data.py` | 造数据：FLEURS ja_jp（CC-BY-4.0，流式读取）或自备 wav 目录 → JSONL；翻译后端 `none`/`stub`/`api`/`table`；`--silence-samples N` 混入合成静音/低噪样本（目标 `language None<asr_text>`），保住基座的「静音→空输出」行为 |
 | `sft_lora.py` | 训练：官方数据管线 + peft LoRA + CPU 兜底 + `--max-steps/--max-samples` |
 | `eval_s2tt.py` | 评测三项：翻译是否生效（带 prompt 输出假名占比要低）、是否遗忘（不带 prompt 仍出日语）、静音行为（**翻译/转写两种模式都要空**；`--silence-only` 单测静音，供基座模型归因诊断；另报 `transcribed_leak_count`——转写模式整条泄漏成译文的样本数） |
-| `.github/workflows/finetune.yml` | CI：`cpu-smoke`（托管 runner，只验证管线）、`real-mini`（托管 runner CPU **真实**微调，用提交的对照表）与 `gpu-train`（self-hosted + gpu，放量训练） |
+| `s2tt_pipeline.py` | **无 LLM 端到端管线**（§11）：ffmpeg → silero-vad → 微调 ASR（context 任务开关）→ 空输出段丢弃 → 产品同款排版 → SRT；兼作 PyTorch sidecar 路线的评测工具 |
+| `inspect_onnx_lora.py` | ONNX 权重补丁可行性探针（INTEGRATION.md §3 / Gate 1）：张量地图、HF↔ONNX 同源抽样、ΔW 幅度、重量化削顶率 |
+| `probe_context_pytorch.py` | T4 交叉验证：官方未量化实现的 context 通道行为 |
+| `.github/workflows/finetune.yml` | CI：`cpu-smoke` / `real-mini`（CPU 真实微调）/ `gpu-train` / `onnx-inspect` |
 
 ---
 
@@ -154,17 +160,16 @@ CI 里对应 `gpu-train` job，需要一个带 `self-hosted` + `gpu` 标签的 r
 * `qwen-asr` 锁 `transformers==4.57.6`、`accelerate==1.12.0`；装 vLLM 后端要额外
   `pip install "qwen-asr[vllm]"`（会拉 vllm==0.14.0）。
 
-## 5. 本分支的 CI（已精简）
-
-实验分支不承载产品回归，push 到本分支**不触发任何 workflow**：
+## 5. 实验线 CI（全部仅手动触发，与产品 ci.yml 并存互不干扰）
 
 | workflow | 触发 | 干什么 | 耗时 |
 |---|---|---|---|
 | `probe.yml` | 仅手动 | **T4**：不做微调，只把指令塞进 ASR 的 system 段（`--asr-hotwords`），看能否直出中文；可选用官方未量化实现交叉验证，把"量化丢能力"和"context 通道本就不能翻译"区分开 | ~5 min（可选交叉验证 +6 min） |
-| `finetune.yml` | 仅手动 | 微调实验：`cpu-smoke`（stub 冒烟）/ `real-mini`（CPU 真实微调）/ `gpu-train`（GPU 训练） | 8–70 min |
+| `finetune.yml` | 仅手动 | `cpu-smoke`（stub 冒烟）/ `real-mini`（CPU 真实微调，见 §10）/ `gpu-train`（GPU 训练）/ `onnx-inspect`（LoRA→官方 decoder.int8 权重补丁的前置事实探针，见 INTEGRATION.md §3） | 5–70 min |
+| `s2tt-e2e.yml` | 仅手动 | **无 LLM 后处理端到端**（见 §11）：微调 ASR 直出中文字幕 vs master 两段式基线三方对照，windows runner，复用适配器 artifact 与媒体缓存 | 8–15 min |
 
-产品回归（构建 / 单测 / 迁移目录 / 摘要分块 / 真实视频全流程）在 master 的 `ci.yml`。
-本分支合并回 master 时会带上那套 CI。
+实测记录：§10（微调本身：静音回归与修复、三项判定）；§11（端到端：两个真实视频、
+质量差距、丢弃策略）。推理落地设计：`INTEGRATION.md`（双版本形态、路线对比、三道验证闸）。
 
 ### T4 结论（已实测，2026-09-26）
 
