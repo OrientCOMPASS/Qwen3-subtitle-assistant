@@ -541,33 +541,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $bad++ }
           if ($bad -gt 0) { throw "T1 断言失败（$bad 项）" }
 
-      # ============ T4：探测 ASR 的 context 通道能否直接输出目标语言 ============
-      # 问题：Qwen3-ASR 的 system 段（qwen-asr 的 context / sherpa-onnx 的 hotwords /
-      #       本项目的 --asr-hotwords）是唯一可注入的自由文本通道。论文 §2.2 说模型被
-      #       刻意训练成"不遵循 prompt 里的自然语言指令"，所以塞"translate to Chinese"
-      #       理论上无效——但这是决定"能不能省掉翻译段"的关键前提，必须实测而不是引用论文。
-      # 做法：同一段音频跑两次。对照组直接用 T1 产出的 .raw.srt（不带 context 的纯 ASR 输出），
-      #       实验组带翻译指令、--asr-only --no-qc（完全不加载 LLM，84 秒音频约 2 分钟）。
-      # 判定：scripts/probe_asr_context.py 只报告不判红——两种结论都有价值。
-      - name: T4 探测 ASR context 通道（能否让 ASR 直接出中文）
-        shell: pwsh
-        run: |
-          if (-not $env:MEDIA_LIST) { Write-Warning "跳过 T4（无媒体）"; exit 0 }
-          $files = $env:MEDIA_LIST -split ';'
-          $shortest = $files | ForEach-Object { Get-Item $_ } | Sort-Object Length | Select-Object -First 1
-          Write-Host "探测用媒体: $($shortest.Name) ($([math]::Round($shortest.Length/1MB,2)) MB)"
-          New-Item -ItemType Directory -Force -Path media/t4 | Out-Null
-          & ./target/release/subtitle-assistant.exe --no-pause --asr-only --no-qc `
-              --output-dir media/t4 `
-              --asr-hotwords "Please translate the Japanese speech into Simplified Chinese" `
-              --log-file media/t4.log $shortest.FullName
-          $code = $LASTEXITCODE
-          Write-Host "T4 退出码=$code"
-          if ($code -ne 0) { throw "T4 运行失败（详见 media/t4.log）" }
-          $control = ($shortest.FullName -replace '\.[^.]+$','') + ".raw.srt"
-          $probe = Get-ChildItem media/t4 -Filter *.raw.srt | Select-Object -First 1
-          if (-not $probe) { throw "T4 没有产出 .raw.srt" }
-          python scripts/probe_asr_context.py --control $control --probe $probe.FullName
+      # ============ T4 已移出产品 CI ============
+      # 「不做微调、只把指令塞进 ASR 的 system 段能否直出目标语言」是研究问题，
+      # 不是产品回归：答案不会随每次 push 改变，留在 push 流水线里只是白烧
+      # 4 分钟 runner。探针已搬到实验分支 exp/asr-s2tt 的 probe.yml（手动触发，
+      # 复用这里的 win-x64-runtime 产物与模型/媒体缓存，不重新编译）。
+      # scripts/probe_asr_context.py 与 --asr-only 留在 master，供探针与
+      # 「只要原文字幕」的场景使用。
 
       - name: Upload e2e results
         if: always()

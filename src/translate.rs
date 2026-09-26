@@ -10,17 +10,22 @@
 //! 4. **照抄检测 + 对半拆分重试**：译文与原文相似度过高即判定为没翻译，
 //!    把批次拆小重来（小批次成功率高得多）；
 //! 5. **匹配不再静默回退**：索引对不上时按位置兜底，兜底不了才回退原文，
-//!    每次都 warn 并计数，收尾打印统计（CI 可据此断言）。
+//!    每次都 warn 并计数，收尾打印统计（CI 可据此断言）；
+//! 6. **索引模式自适应**（`match_items`）：prompt 用绝对索引编号，但模型常从 1
+//!    重排，CI 实测因此让一整批 15 条译文全部作废、回退成日语原文；
+//! 7. **术语表目标语过滤**（`sanitize_glossary`）：摘要模型会把 `戦争 -> War`
+//!    这类英文目标语写进术语表，而术语表会灌进每一批 prompt，等于用错误术语
+//!    污染全部译文。
 
 use crate::config::Config;
 use crate::llm::{parse_json, LlmSession, Sampling};
 use crate::prompt::PromptStore;
 use crate::qc::char_similarity;
 use crate::srt::format_timestamp;
-use crate::types::{GlobalContext, SubtitleSegment, TranslateItem, TranslateStats};
+use crate::types::{GlobalContext, GlossaryItem, SubtitleSegment, TranslateItem, TranslateStats};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 
 const SYSTEM_PROMPT: &str =
@@ -74,7 +79,8 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         // ---------- 阶段 1：全局上下文（摘要 + 术语表） ----------
         info!("▶ 提取全局视频上下文（摘要与术语表）...");
-        let gctx = self.extract_global_context(&segments);
+        let mut gctx = self.extract_global_context(&segments);
+        sanitize_glossary(&mut gctx, &self.cfg.target_lang);
         info!(
             "✔ 全局摘要 {} 字、术语 {} 条（分块 {}）。",
             gctx.summary.chars().count(),
@@ -170,32 +176,29 @@ impl<'a, 'b> Translator<'a, 'b> {
         Ok(translated)
     }
 
-    /// 把模型返回的译文并回字幕；索引对不上时按位置兜底，仍失败才回退原文。
+    /// 把模型返回的译文并回字幕。
+    ///
+    /// 两处 CI 实测出来的坑（BV16r421g797）：
+    ///
+    /// 1. **索引模式不固定**。prompt 里的行号用的是字幕绝对索引（批次 2 就是
+    ///    `21) … 35) …`），但 1.7B 模型经常无视输入编号、从 1 重新排号。那一批
+    ///    模型返回了 13 条 `i=1..13`，按绝对索引一条都匹配不上，15 条全部回退成
+    ///    日语原文。所以先数两种模式各命中多少条，用命中多的那种匹配。
+    /// 2. **位置兜底不该要求条数相等**。旧实现 `items.len() == batch.len()` 在
+    ///    模型少返回几条时（输出被 max_new_tokens 截断）直接放弃兜底，把 13 条
+    ///    好译文连同 2 条缺失一起丢回原文。现在按顺序把没用上的译文填进还空着
+    ///    的槽位，只有真缺的那几条才回退。
     fn merge_batch(
         &mut self,
         batch: &[SubtitleSegment],
         items: &[TranslateItem],
         out: &mut Vec<SubtitleSegment>,
     ) {
-        let positional_ok = items.len() == batch.len();
+        let (slot, positional) = match_items(batch, items);
+        self.stats.positional += positional;
+
         for (pos, seg) in batch.iter().enumerate() {
-            let by_index = items.iter().find(|it| it.i == seg.index as i64);
-            let item = match by_index {
-                Some(it) => Some(it),
-                None => {
-                    if positional_ok {
-                        self.stats.positional += 1;
-                        warn!(
-                            "第 {} 条（index={}）未按索引返回，改用位置兜底",
-                            pos + 1,
-                            seg.index
-                        );
-                        items.get(pos)
-                    } else {
-                        None
-                    }
-                }
-            };
+            let item = slot[pos].map(|k| &items[k]);
 
             let text = item
                 .map(|it| it.t.trim().to_string())
@@ -869,6 +872,121 @@ pub fn plan_batches(segments: &[SubtitleSegment], batch_size: usize, batch_chars
     out
 }
 
+/// 决定批次里每条字幕该用哪一条返回项。
+///
+/// 返回 `(slots, positional_count)`：`slots[p]` 是批内第 p 条字幕应采用的
+/// `items` 下标，`None` 表示模型没给译文（调用方回退原文）。
+///
+/// 为什么要"索引模式自适应"：prompt 里的行号用的是字幕的绝对索引（批次 2 就是
+/// `21) … 35) …`），但 CI 实测 1.7B 模型经常无视输入编号、从 1 重新排号
+/// （BV16r421g797 批次 2 返回 13 条 `i=1..13`，按绝对索引一条都匹配不上，
+/// 15 条全部回退成日语原文，假名占比冲到 14%）。所以先数两种模式各命中多少条，
+/// 用命中多的那种匹配。
+///
+/// 位置兜底也不再要求条数相等：模型输出被 max_new_tokens 截断而少返回几条时，
+/// 旧实现 `items.len() == batch.len()` 会直接放弃兜底，把已经译好的 13 条连同
+/// 缺失的 2 条一起丢回原文。现在按顺序把没用上的译文填进还空着的槽位。
+fn match_items(batch: &[SubtitleSegment], items: &[TranslateItem]) -> (Vec<Option<usize>>, usize) {
+    let abs_hits = items
+        .iter()
+        .filter(|it| batch.iter().any(|s| s.index as i64 == it.i))
+        .count();
+    let rel_hits = items
+        .iter()
+        .filter(|it| it.i >= 1 && it.i <= batch.len() as i64)
+        .count();
+    let relative = rel_hits > abs_hits;
+    if relative {
+        debug!(
+            "[翻译] 模型按批内序号返回（相对命中 {} / 绝对命中 {}），改用相对索引匹配",
+            rel_hits, abs_hits
+        );
+    }
+
+    let mut slot: Vec<Option<usize>> = vec![None; batch.len()];
+    let mut used = vec![false; items.len()];
+    for (pos, seg) in batch.iter().enumerate() {
+        let want = if relative {
+            (pos + 1) as i64
+        } else {
+            seg.index as i64
+        };
+        for (k, it) in items.iter().enumerate() {
+            if !used[k] && it.i == want {
+                slot[pos] = Some(k);
+                used[k] = true;
+                break;
+            }
+        }
+    }
+
+    let leftover: Vec<usize> = (0..items.len()).filter(|k| !used[*k]).collect();
+    let mut li = 0;
+    let mut positional = 0;
+    for (pos, s) in slot.iter_mut().enumerate() {
+        if s.is_some() {
+            continue;
+        }
+        match leftover.get(li) {
+            Some(&k) => {
+                *s = Some(k);
+                li += 1;
+                positional += 1;
+                warn!(
+                    "第 {} 条（index={}）未按索引返回，改用位置兜底",
+                    pos + 1,
+                    batch[pos].index
+                );
+            }
+            None => break,
+        }
+    }
+    (slot, positional)
+}
+
+/// 术语表目标语过滤：宁可少给术语，也不给错术语。
+///
+/// CI 实测（BV16r421g797）摘要模型给出的 8 条术语里有 6 条目标是英文
+/// （`バンジー -> Bangzi`、`おじいさん -> Old Man`、`戦争 -> War`、
+/// `村人 -> Villagers`），另有 1 条把 ASR 的误听固化成"专名"
+/// （`採用がうま -> 采用之才`——原文其实是「塞翁が馬」）。术语表会被塞进每一批
+/// 翻译的 prompt，等于用错误术语污染全部输出，实测就产出了
+/// 「バンジー，采用之才。」这种译文。
+///
+/// 丢弃规则：
+/// - 原文或目标为空、两者相同（等于没翻译）；
+/// - 目标语里残留假名（目标不是日语时）；
+/// - 目标是中文却一个汉字都没有（英文/罗马音不是中文术语）。
+fn sanitize_glossary(gctx: &mut GlobalContext, target_lang: &str) {
+    let tl = target_lang.to_lowercase();
+    let want_han = target_lang.contains("中文") || tl.contains("zh") || tl.contains("chinese");
+    let target_is_ja = target_lang.contains("日") || tl.contains("ja") || tl.contains("japanese");
+    let before = gctx.glossary.len();
+    let mut dropped: Vec<String> = Vec::new();
+    gctx.glossary.retain(|g| {
+        let src = g.source.trim();
+        let tgt = g.target.trim();
+        let bad = src.is_empty()
+            || tgt.is_empty()
+            || src == tgt
+            || (!target_is_ja && has_residual_script(tgt, "kana"))
+            || (want_han && !tgt.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)));
+        if bad {
+            dropped.push(format!("{} -> {}", src, tgt));
+        }
+        !bad
+    });
+    if !dropped.is_empty() {
+        warn!(
+            "⚠ 术语表丢弃 {} / {} 条（目标语不是{}、残留原文或与原文相同）：{}",
+            dropped.len(),
+            before,
+            target_lang,
+            dropped.join("；")
+        );
+    }
+}
+
 /// 译文里是否仍残留源语言文字。
 ///
 /// 目前支持日语假名（本项目的默认场景是日翻中）。中文译文里出现假名，
@@ -960,6 +1078,109 @@ mod tests {
         assert!(!has_residual_script("キャラ", "none"));
         assert!(has_residual_script("한국어 테스트", "hangul"));
         assert!(!has_residual_script("キャラ", "hangul"));
+    }
+
+    fn item(i: i64, t: &str) -> TranslateItem {
+        TranslateItem {
+            i,
+            t: t.to_string(),
+        }
+    }
+
+    /// CI 实测：prompt 里给的是绝对索引（21..25），但 1.7B 模型从 1 重新排号。
+    /// 旧实现按绝对索引匹配 -> 一条都对不上 -> 整批回退成日语原文。
+    #[test]
+    fn match_items_handles_model_renumbering_from_one() {
+        let batch: Vec<_> = (21..=25).map(|i| seg(i, "日本語の原文")).collect();
+        let items = vec![
+            item(1, "中文一"),
+            item(2, "中文二"),
+            item(3, "中文三"),
+            item(4, "中文四"),
+            item(5, "中文五"),
+        ];
+        let (slot, positional) = match_items(&batch, &items);
+        assert_eq!(positional, 0, "相对索引命中时不该走位置兜底");
+        assert_eq!(
+            slot,
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            "5 条译文应全部按相对序号对上"
+        );
+    }
+
+    /// 模型输出被截断、只返回前 3 条时：旧实现因条数不等直接放弃兜底，
+    /// 把 3 条好译文连同 2 条缺失一起丢回原文（CI 实测 15 条全回退）。
+    #[test]
+    fn match_items_salvages_partial_return() {
+        let batch: Vec<_> = (21..=25).map(|i| seg(i, "日本語の原文")).collect();
+        let items = vec![item(1, "中文一"), item(2, "中文二"), item(3, "中文三")];
+        let (slot, _positional) = match_items(&batch, &items);
+        assert_eq!(slot[0], Some(0));
+        assert_eq!(slot[1], Some(1));
+        assert_eq!(slot[2], Some(2));
+        assert_eq!(slot[3], None, "真缺的那两条才回退原文");
+        assert_eq!(slot[4], None);
+    }
+
+    /// 模型确实按绝对索引返回时，不能因为"相对模式也命中"而错位。
+    #[test]
+    fn match_items_prefers_absolute_when_it_wins() {
+        let batch: Vec<_> = (21..=23).map(|i| seg(i, "日本語の原文")).collect();
+        let items = vec![item(21, "中文廿一"), item(22, "中文廿二"), item(23, "中文廿三")];
+        let (slot, positional) = match_items(&batch, &items);
+        assert_eq!(positional, 0);
+        assert_eq!(slot, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    /// 同一条译文不能被填进两个槽位（模型重复返回同一个 i 时）。
+    #[test]
+    fn match_items_never_reuses_one_item_twice() {
+        let batch: Vec<_> = (1..=3).map(|i| seg(i, "日本語の原文")).collect();
+        let items = vec![item(1, "中文一"), item(1, "中文一（重复）")];
+        let (slot, _positional) = match_items(&batch, &items);
+        assert_eq!(slot[0], Some(0));
+        assert!(slot[1].is_none() || slot[1] == Some(1));
+        let filled: Vec<_> = slot.iter().flatten().collect();
+        assert_eq!(filled.len(), filled.iter().collect::<std::collections::HashSet<_>>().len());
+    }
+
+    /// CI 实测（BV16r421g797）：摘要模型给的 8 条术语里 6 条目标是英文，
+    /// 术语表会被塞进每一批 prompt，于是产出了「バンジー，采用之才。」这种译文。
+    #[test]
+    fn sanitize_glossary_drops_wrong_language_targets() {
+        let mut gctx = GlobalContext {
+            summary: "视频讲述塞翁失马的故事".into(),
+            glossary: vec![
+                GlossaryItem { source: "バンジー".into(), target: "Bangzi".into(), note: None },
+                GlossaryItem { source: "おじいさん".into(), target: "Old Man".into(), note: None },
+                GlossaryItem { source: "戦争".into(), target: "War".into(), note: None },
+                GlossaryItem { source: "村人".into(), target: "Villagers".into(), note: None },
+                GlossaryItem { source: "ムラビト".into(), target: "Murabito".into(), note: None },
+                GlossaryItem { source: "塞翁が馬".into(), target: "塞翁失马".into(), note: None },
+                GlossaryItem { source: "採用がうま".into(), target: "采用之才".into(), note: None },
+                GlossaryItem { source: "村人".into(), target: "むらびと".into(), note: None },
+                GlossaryItem { source: "戦争".into(), target: "戦争".into(), note: None },
+                GlossaryItem { source: "".into(), target: "空原文".into(), note: None },
+            ],
+        };
+        sanitize_glossary(&mut gctx, "简体中文");
+        let kept: Vec<_> = gctx.glossary.iter().map(|g| g.target.as_str()).collect();
+        assert_eq!(kept, vec!["塞翁失马", "采用之才"], "只该留下目标语是中文的条目");
+        assert!(!gctx.summary.is_empty(), "摘要不受影响");
+    }
+
+    /// 目标语是日语时不能把假名当"残留"丢掉。
+    #[test]
+    fn sanitize_glossary_keeps_kana_when_target_is_japanese() {
+        let mut gctx = GlobalContext {
+            summary: "s".into(),
+            glossary: vec![
+                GlossaryItem { source: "仙贝".into(), target: "おせんべい".into(), note: None },
+                GlossaryItem { source: "村庄".into(), target: "村".into(), note: None },
+            ],
+        };
+        sanitize_glossary(&mut gctx, "日本語");
+        assert_eq!(gctx.glossary.len(), 2);
     }
 
     #[test]
