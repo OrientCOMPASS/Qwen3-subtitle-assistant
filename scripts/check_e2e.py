@@ -130,7 +130,9 @@ def main() -> int:
                     help="期望日志里出现几条质检统计（多文件批处理时等于文件数）")
     ap.add_argument("--min-summary-chunks", type=int, default=0)
     ap.add_argument("--max-untranslated", type=int, default=0)
-    ap.add_argument("--max-kana-ratio", type=float, default=0.03)
+    ap.add_argument("--max-kana-ratio", type=float, default=0.15,
+                    help="全局假名占比上限。注意这个指标会被合理保留的专有名词抬高"
+                         "（实测一条 おせんべい 就占 8%%），主判据请用 --max-foreign-cues")
     ap.add_argument("--max-foreign-cues", type=int, default=-1,
                     help="允许「基本没翻译」的 cue 条数（该 cue 假名占比 > 40%%）；-1=不检查。"
                          "比全局假名占比更准：专有名词保留原文不会被误判，整批照抄则一定被抓到")
