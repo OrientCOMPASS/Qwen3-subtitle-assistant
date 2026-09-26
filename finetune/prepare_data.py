@@ -178,6 +178,46 @@ class NoneTranslator:
         return text
 
 
+class TableTranslator:
+    """查固定对照表（TSV：日文<TAB>中文）。
+
+    用途：在**没有任何 API key** 的情况下做真实微调实验——先让 CI 把它抽到的日语
+    转写导出（--dump-transcripts），人工/离线翻译成对照表提交进仓库，再用本后端训练。
+    表小但真实，足以验证"模型是否开始输出中文"这个关键问题。
+    """
+
+    name = "table"
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.table: dict[str, str] = {}
+        if not path.is_file():
+            raise SystemExit(f"对照表不存在: {path}")
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            if "\t" in line:
+                src, dst = line.split("\t", 1)
+            else:
+                continue
+            src, dst = src.strip(), dst.strip()
+            if src and dst:
+                self.table[src] = dst
+        log(f"对照表 {path}: {len(self.table)} 条")
+
+    def __call__(self, text: str) -> str:
+        key = text.strip()
+        if key in self.table:
+            return self.table[key]
+        # 未命中：退化为标点归一后的模糊匹配（去掉首尾空白与句末标点差异）
+        norm = key.rstrip("。.、！？!?")
+        for k, v in self.table.items():
+            if k.rstrip("。.、！？!?") == norm:
+                return v
+        raise KeyError(key)
+
+
 class ApiTranslator:
     """OpenAI 兼容 /chat/completions。带磁盘缓存与重试，可断点续跑。"""
 
@@ -245,7 +285,13 @@ def main() -> int:
     ap.add_argument("--max-audio-secs", type=float, default=20.0)
     ap.add_argument("--asr-ratio", type=float, default=0.5,
                     help="混入的 日语->日语 ASR 样本比例（防遗忘），0~1")
-    ap.add_argument("--translator", choices=["none", "stub", "api"], default="stub")
+    ap.add_argument("--translator", choices=["none", "stub", "api", "table"], default="stub")
+    ap.add_argument("--table", default="finetune/parallel_ja_zh.tsv",
+                    help="--translator table 用的对照表（日文<TAB>中文，# 开头为注释）")
+    ap.add_argument("--dump-transcripts", default="",
+                    help="把抽到的日语转写逐行写到该文件（供离线翻译成对照表）")
+    ap.add_argument("--skip-untranslated", action="store_true",
+                    help="table 模式下对照表未命中的样本直接跳过（而不是报错）")
     ap.add_argument("--api-base", default="")
     ap.add_argument("--api-model", default="")
     ap.add_argument("--api-key-env", default="", help="存放 API key 的环境变量名")
@@ -275,6 +321,8 @@ def main() -> int:
             ap.error("--translator api 需要 --api-base 与 --api-model")
         key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
         tr = ApiTranslator(args.api_base, args.api_model, key, Path(args.cache), args.target_lang)
+    elif args.translator == "table":
+        tr = TableTranslator(Path(args.table))
     elif args.translator == "stub":
         log("!! 使用 stub 伪翻译：仅供 CI 跑通管线，产出的模型没有任何翻译能力 !!")
         tr = StubTranslator()
@@ -293,21 +341,39 @@ def main() -> int:
 
     train_lines: list[str] = []
     eval_lines: list[str] = []
-    n_mt = n_asr = 0
+    n_mt = n_asr = n_skipped = 0
+    dump_fh = open(args.dump_transcripts, "w", encoding="utf-8") if args.dump_transcripts else None
     for i, (arr, text) in enumerate(src):
         wav = audio_dir / f"ja_{i:06d}.wav"
         if not wav.is_file():
             sf.write(str(wav), arr, 16000, subtype="PCM_16")
+        if dump_fh is not None:
+            dump_fh.write(text.strip() + "\n")
         is_eval = i >= args.limit
         # 每条样本按 asr_ratio 决定做"翻译"还是"转写"任务
         as_translate = (random.random() >= args.asr_ratio)
         if as_translate and not is_eval:
-            target = tr(text)
+            try:
+                target = tr(text)
+            except KeyError:
+                if args.skip_untranslated:
+                    n_skipped += 1
+                    continue
+                raise
             prompt = args.prompt
             n_mt += 1
         elif is_eval:
             # 评测集两种任务各存一份，便于检查任务开关与是否遗忘
-            target = tr(text) if args.translator != "none" else text
+            if args.translator == "none":
+                target = text
+            else:
+                try:
+                    target = tr(text)
+                except KeyError:
+                    if args.skip_untranslated:
+                        n_skipped += 1
+                        continue
+                    raise
             prompt = args.prompt
             n_mt += 1
         else:
@@ -325,6 +391,12 @@ def main() -> int:
         if (i + 1) % 25 == 0:
             log(f"已处理 {i + 1} 条（翻译 {n_mt} / 转写 {n_asr}）")
 
+    if dump_fh is not None:
+        dump_fh.close()
+        log(f"已导出日语转写 {n_mt + n_asr + n_skipped} 行 -> {args.dump_transcripts}"
+            "（离线翻译成对照表后可用 --translator table 训练）")
+    if n_skipped:
+        log(f"对照表未命中而跳过 {n_skipped} 条")
     Path(args.out).write_text("\n".join(train_lines) + "\n", encoding="utf-8")
     Path(args.eval_out).write_text("\n".join(eval_lines) + "\n", encoding="utf-8")
     log(f"训练集 {len(train_lines)} 条 -> {args.out}")

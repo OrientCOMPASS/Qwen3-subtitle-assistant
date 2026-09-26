@@ -21,10 +21,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式"
+        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调(用提交的对照表，无需 API key)；gpu-train=GPU 真实训练"
         type: choice
         default: "cpu-smoke"
-        options: [cpu-smoke, gpu-train]
+        options: [cpu-smoke, real-mini, gpu-train]
       model:
         description: "基座模型"
         type: choice
@@ -93,6 +93,19 @@ jobs:
           python -c "import json;l=open('data/train.jsonl',encoding='utf-8').readline();d=json.loads(l);d['audio']='...'+d['audio'][-24:];print(json.dumps(d,ensure_ascii=False,indent=2))"
           wc -l data/train.jsonl data/eval.jsonl
 
+      - name: 导出 FLEURS 转写（供离线翻译成对照表）
+        run: |
+          # 这一步只为拿到"CI 实际会抽到的那批日语文本"，翻译成人力可控的对照表后
+          # 就能用 --translator table 做**真实**微调实验，全程不需要任何 API key。
+          # FLEURS 流式读取顺序是确定的，所以 --limit 相同则抽到的样本相同。
+          python finetune/prepare_data.py \
+            --source fleurs --limit 300 --eval-limit 0 --max-audio-secs 15 \
+            --translator none --asr-ratio 1.0 \
+            --audio-dir data/audio --out data/dump_only.jsonl \
+            --dump-transcripts data/transcripts.txt
+          wc -l data/transcripts.txt
+          head -5 data/transcripts.txt
+
       - name: LoRA 微调 2 步（CPU）
         run: |
           python finetune/sft_lora.py \
@@ -150,8 +163,109 @@ jobs:
             out/smoke/eval_report.json
             data/train.jsonl
             data/eval.jsonl
+            data/transcripts.txt
           if-no-files-found: warn
           retention-days: 30
+
+  real-mini:
+    name: CPU 真实微调（固定对照表，无需 API key）
+    if: ${{ inputs.mode == 'real-mini' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace 模型
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-0.6B-v1
+
+      - name: 安装依赖
+        run: |
+          set -e
+          pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet qwen-asr peft datasets soundfile librosa
+
+      - name: 检查对照表
+        run: |
+          if [ ! -f finetune/parallel_ja_zh.tsv ]; then
+            echo "::error::缺少 finetune/parallel_ja_zh.tsv。"
+            echo "先跑一次 cpu-smoke，从 artifact 里取 data/transcripts.txt，"
+            echo "翻译成 日文<TAB>中文 的两列 TSV 提交进仓库，再触发本模式。"
+            exit 1
+          fi
+          echo "对照表行数: $(grep -cv '^#' finetune/parallel_ja_zh.tsv)"
+          head -3 finetune/parallel_ja_zh.tsv
+
+      - name: 构造数据（table 翻译，未命中即跳过）
+        run: |
+          python finetune/prepare_data.py \
+            --source fleurs --limit ${{ inputs.samples }} --eval-limit 20 --max-audio-secs 15 \
+            --translator table --table finetune/parallel_ja_zh.tsv --skip-untranslated \
+            --asr-ratio 0.35 --audio-dir data/audio \
+            --out data/train.jsonl --eval-out data/eval.jsonl \
+            --dump-transcripts data/transcripts.txt
+          wc -l data/train.jsonl data/eval.jsonl
+
+      - name: LoRA 微调（CPU）
+        run: |
+          python finetune/sft_lora.py \
+            --model "${{ inputs.model }}" --train data/train.jsonl --eval data/eval.jsonl \
+            --out out/real --device cpu --lora --lora-r 16 --lora-alpha 32 \
+            --epochs 2 --max-steps ${{ inputs.steps }} --batch-size 1 --grad-acc 2 \
+            --lr 2e-4 --log-steps 10 --grad-ckpt
+
+      - name: 评测（真实数据：翻译是否生效 / 是否遗忘 / 静音行为）
+        run: |
+          python finetune/eval_s2tt.py \
+            --model "${{ inputs.model }}" --adapter out/real/lora \
+            --eval data/eval.jsonl --limit 20 --device cpu --silence-secs 2 \
+            --out out/real/eval_report.json
+
+      - name: 判定
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          ev = json.loads(pathlib.Path('out/real/eval_report.json').read_text(encoding='utf-8'))
+          tr = json.loads(pathlib.Path('out/real/train_report.json').read_text(encoding='utf-8'))
+          m, c = ev['metrics'], ev['checks']
+          print('=== 真实微调结论 ===')
+          print(f"  训练样本 {tr['train_samples']} 条 / loss {tr['final_loss']:.4f} / {tr['train_seconds']:.0f}s")
+          print(f"  带 prompt（翻译模式）输出假名占比 = {m['translated_avg_kana']}")
+          print(f"  不带 prompt（转写模式）输出假名占比 = {m['transcribed_avg_kana']}")
+          print(f"  静音输出 = {ev.get('silence')}")
+          for s in ev['translated_samples'][:5]:
+              print(f"    [翻译] {s['out'][:60]}")
+          for s in ev['transcribed_samples'][:3]:
+              print(f"    [转写] {s['out'][:60]}")
+          for k, v in c.items():
+              print(f"  {'✔' if v else '✘'} {k}")
+          # 真实数据下，翻译生效是硬性要求（stub 冒烟时才放宽）
+          if not c.get('translation_takes_effect'):
+              raise SystemExit('翻译未生效：带 prompt 时输出仍以日语为主。'
+                               '需要更多样本/更多步数/更大 LoRA 秩，或改用 GPU 全参微调。')
+          print('✔ 结论：context 作为任务开关可行，微调后 ASR 能直接输出中文')
+          PY
+
+      - name: 上传适配器与报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-real-mini
+          path: |
+            out/real/lora
+            out/real/train_report.json
+            out/real/eval_report.json
+            data/train.jsonl
+            data/eval.jsonl
+          if-no-files-found: warn
+          retention-days: 60
 
   gpu-train:
     name: GPU 真实训练（需 self-hosted + gpu runner）
