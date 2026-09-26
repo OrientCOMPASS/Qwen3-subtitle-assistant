@@ -156,8 +156,29 @@ CI 里对应 `gpu-train` job，需要一个带 `self-hosted` + `gpu` 标签的 r
 
 | workflow | 触发 | 干什么 | 耗时 |
 |---|---|---|---|
-| `probe.yml` | 仅手动 | **T4**：不做微调，只把指令塞进 ASR 的 system 段（`--asr-hotwords`），看能否直出中文；可选用官方 bf16 实现交叉验证，把"量化丢能力"和"context 通道本就不能翻译"区分开 | ~12 min（可选交叉验证 +5 min） |
+| `probe.yml` | 仅手动 | **T4**：不做微调，只把指令塞进 ASR 的 system 段（`--asr-hotwords`），看能否直出中文；可选用官方未量化实现交叉验证，把"量化丢能力"和"context 通道本就不能翻译"区分开 | ~5 min（可选交叉验证 +6 min） |
 | `finetune.yml` | 仅手动 | 微调实验：`cpu-smoke`（stub 冒烟）/ `real-mini`（CPU 真实微调）/ `gpu-train`（GPU 训练） | 8–70 min |
 
 产品回归（构建 / 单测 / 迁移目录 / 摘要分块 / 真实视频全流程）在 master 的 `ci.yml`。
 本分支合并回 master 时会带上那套 CI。
+
+### T4 结论（已实测，2026-09-26）
+
+**context 通道不能用来做 S2TT。** 同一条真实日语音频、同一句翻译指令，两条独立路径：
+
+| 路径 | 不注入 context | 注入 context |
+|---|---|---|
+| 量化 GGUF（sherpa-onnx + Q4_K_M，经 `--asr-hotwords`） | 假名 53.7% / 汉字 29.3% | 假名 42.9% / 汉字 37.1% |
+| 未量化原始权重（`qwen-asr` + transformers，float32/CPU） | 假名 85.6% / 汉字 14.4% | 假名 83.7% / 汉字 16.3% |
+
+未量化那次的两段输出几乎逐字相同，只有零星识别差异（`外が黒く` → `お外が黒く`）。
+说明 context 进 system 段后只当**识别先验/热词偏置**，不被当指令执行——与 Qwen3-ASR
+技术报告 §2.2「模型被刻意训练成不遵循 prompt 里的自然语言指令」一致，只是这里是自己测的。
+
+由此：① "省掉 1.7B 翻译段"这条路关闭；② 要直出目标语言只能微调（见本目录 §10 的实验，
+120 对样本 + LoRA r=32 + 4 epoch + 纯 CPU = 19.3 分钟，带 prompt 时假名占比 0.0%）；
+③ `--asr-hotwords` 的正确用途是专有名词/人名，不是任务指令。
+
+> 交叉验证脚本踩过的坑记在 `probe_context_pytorch.py` 文件头：m4a 要用 ffmpeg 解码、
+> `transcribe` 只吃 `str` 或 `(ndarray, sr)`、返回值是 `@dataclass` 取 `.text`、
+> CPU 用 float32、**不要传 `language`**（会强制"只输出转写文本"，正好压掉要观察的行为）。
