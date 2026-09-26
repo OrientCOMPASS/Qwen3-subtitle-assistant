@@ -462,7 +462,6 @@ jobs:
             --model-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
             --hf-model Qwen/Qwen3-ASR-0.6B `
             --adapter art/out/real/lora `
-            --sample-layers 6 `
             --out out/inspect/onnx_patch_report.json
           if ($LASTEXITCODE -ne 0) { throw "探针运行失败" }
 
