@@ -90,8 +90,24 @@ tied lm_head/embed_tokens 等值所致，不在 LoRA 范围内，无害。
 | 闸 | 内容 | 工具 | 状态 |
 |---|---|---|---|---|
 | Gate 1 | 上述前置事实核查，输出 go/no-go | `finetune.yml` mode=onnx-inspect（windows，复用产品模型缓存+HF 缓存+适配器 artifact，~10 分钟） | ✅ **三项全 GO**（run 36252216017，见 §3） |
-| Gate 2 | 补丁器写出 s2tt 模型目录 → **sherpa-onnx 运行时**（pip）推理：FLEURS eval 带 hotwords 直出中文（假名≤5%）/ 不带仍日语 / 静音→空；与 PyTorch sidecar 输出交叉一致 | 新增 `finetune/patch_onnx_lora.py` + verify job | 待做 |
-| Gate 3 | **产品级**：Rust exe + `--asr-model-dir …s2tt…` + `--asr-hotwords "translate to Chinese"` 跑与 `s2tt-e2e` 同一视频，字幕一致率达标。T4 的教训：int8 量化会改变模型行为，**必须**在最终运行时上复测，不能只信 PyTorch 侧 | master `ci.yml` 增加 T5 用例（或 s2tt-e2e 加 sherpa 模式） | 待做 |
+| Gate 2 | 补丁器写出 s2tt 模型目录 → **sherpa-onnx 运行时**（pip，与产品 Cargo 依赖同版本 1.13.8）推理：直出中文 / 不带仍日语 / 静音→空；与原始包对照 | `finetune/patch_onnx_lora.py` + `verify_s2tt_onnx.py`（mode=onnx-patch） | ✅ **全过**（run 36253697406，见下） |
+| Gate 3 | **产品级**：Rust exe + `--asr-model-dir …s2tt…` + `--asr-hotwords "translate to Chinese"` 跑与 `s2tt-e2e` 同一视频，字幕一致率达标。T4 的教训：int8 量化会改变模型行为，**必须**在最终运行时上复测，不能只信 PyTorch 侧 | master `ci.yml` 增加 T5 用例（或 s2tt-e2e 加 sherpa 模式） | 待做（对象为 1.7B，见 §7） |
+
+### Gate 2 结果（0.6B，run 36253697406，windows 4 vCPU）
+
+补丁器：**250/250 张量补丁成功**（decoder 196 uint8 + encoder 54 int8；未映射 0、
+匹配误差最大 1.22e-2、最坏削顶 0.109%、数值自检坏元素 0、耗时 6.3 分钟）。
+sherpa-onnx **1.13.8（与产品 Cargo 依赖同版本）** 三项行为验证（ja1.wav，12.5s）：
+
+| | 补丁包 | 原始包（对照） |
+|---|---|---|
+| 带 hotwords "translate to Chinese" | **假名 0.0% / 汉字 87.5%**（直出中文） | 假名 51.8%（仍日语——T4 结论在产品运行时复现） |
+| 不带 hotwords | 假名 56.0%（仍日语，任务开关成立） | 假名 ~56%（无差异） |
+| 2s 纯静音 | **双模式全空** | — |
+
+推理 6.7s / 12.5s 音频（含识别器构建，int8 4 线程）——比 PyTorch sidecar（RTF 0.91）
+更快，路线 A 彻底出局。**B2 路线在 0.6B 上全链路打通**：LoRA → int8 ONNX 补丁 →
+产品运行时直出中文，Rust 侧零改动（现有 `--asr-hotwords` 即任务开关）。
 
 ## 5. Rust 侧最小改动清单（Gate 2 过后动工）
 
@@ -112,3 +128,40 @@ tied lm_head/embed_tokens 等值所致，不在 LoRA 范围内，无害。
 `prepare_data.py --translator api`（需密钥）或扩充 `parallel_ja_zh.tsv`（免密钥）→
 `gpu-train`/CPU 分批多轮 → 同一套 Gate 1–3 验证 → 补丁发布。补丁工具只吃
 adapter artifact，与训练解耦，适配器可独立迭代。
+
+## 7. 基座选型：快速直出版改用 1.7B（2026-09-26 决策）
+
+**动机**：0.6B 直出的语言定向/排版/静音全达标（§11），但没有 LLM 闸兜底时，
+翻译精度短板直接暴露给用户——名词级漂移（特撮→特约/特杀、馬→乌鸦/乌龟）与
+1/20 严重误译（§10 质量评估）。快速版要靠更强的基座补偿：1.7B 是论文所称的
+开源 ASR SOTA，且产品侧已有完整支持（`ci.yml` 的 `ASR_VARIANT=1.7B`、
+`download_models.ps1 -AsrVariant 1.7B`、社区 int8 ONNX 包）。
+
+**旧 0.6B LoRA 不可复用（形状硬不兼容）**：
+
+| 模块 | 0.6B 适配器 (A/B 形状) | 1.7B 所需 |
+|---|---|---|
+| LM q_proj | (32,1024) / (2048,32) | (32,**2048**) / (2048,32) |
+| LM k/v_proj | (32,1024) / (1024,32) | (32,**2048**) / (1024,32) |
+| LM o_proj | (32,2048) / (1024,32) | (32,2048) / (**2048**,32) |
+| LM gate/up_proj | (32,1024) / (3072,32) | (32,**2048**) / (**6144**,32) |
+| LM down_proj | (32,3072) / (1024,32) | (32,**6144**) / (**2048**,32) |
+| 音频塔 q/k/v | **18 层** × 896 维 | **24 层** × **1024** 维（连 key 都对不上） |
+
+且 LoRA ΔW 绑定基座权重空间，形状巧合相同也无意义。**重新训练**（run 36254711659，
+real-mini 同款配方：120 对对照表 + 20 静音样本 + LoRA r=32 α=64 + 4 epoch + lr 3e-4，
+纯 CPU；数据零新增）。预计训练 ~1.5-2h（240 步 × ~20-26s/步，fp32 16GB runner）。
+
+**对 ONNX 路线的影响**：1.7B int8 包是**社区导出**（`thieunv-asilla/sherpa-onnx-
+qwen3-asr-1.7B-int8`），导出器与 k2-fsa 官方包不同——命名可能保留、量化摆位可能
+是「MatMul/Gemm per-channel QUInt8 + Q/K/V/O 保 FP32」（README 已知坑）。探针与
+补丁器按设计对两种世界都兼容（值匹配不依赖名字；fp32/uint8 非对称/int8 对称三种
+张量形态都能处理），但**动补丁前必须先对 1.7B 包跑一遍 Gate 1**，账目对不上就停。
+
+**版本矩阵（发布形态）**：
+
+| 版本 | ASR | LLM | 适用 |
+|---|---|---|---|
+| 精翻版（现状） | 0.6B / 1.7B int8 | Qwen3-1.7B GGUF 四段 | 发布级字幕 |
+| 快速直出版 | **1.7B s2tt 补丁包** + hotwords 开关 | 无 | 生肉速览/批量粗翻/低配机 |
+| （轻量选项） | 0.6B s2tt 补丁包（Gate 2 已全链路验证） | 无 | 极致速度，质量降档 |

@@ -58,7 +58,9 @@ system role；sherpa-onnx 侧对应 `hotwords` 字段，其源码注释写明
 | `sft_lora.py` | 训练：官方数据管线 + peft LoRA + CPU 兜底 + `--max-steps/--max-samples` |
 | `eval_s2tt.py` | 评测三项：翻译是否生效（带 prompt 输出假名占比要低）、是否遗忘（不带 prompt 仍出日语）、静音行为（**翻译/转写两种模式都要空**；`--silence-only` 单测静音，供基座模型归因诊断；另报 `transcribed_leak_count`——转写模式整条泄漏成译文的样本数） |
 | `s2tt_pipeline.py` | **无 LLM 端到端管线**（§11）：ffmpeg → silero-vad → 微调 ASR（context 任务开关）→ 空输出段丢弃 → 产品同款排版 → SRT；兼作 PyTorch sidecar 路线的评测工具 |
-| `inspect_onnx_lora.py` | ONNX 权重补丁可行性探针（INTEGRATION.md §3 / Gate 1）：张量地图、HF↔ONNX 同源抽样、ΔW 幅度、重量化削顶率 |
+| `inspect_onnx_lora.py` | ONNX 权重补丁可行性探针（INTEGRATION.md §3 / Gate 1）：权重名被导出器匿名化时**按值匹配** HF 基座，报张量地图/同源误差/ΔW 幅度/重量化削顶率 |
+| `patch_onnx_lora.py` | Gate 2 补丁器：LoRA ΔW 写回官方 int8 ONNX（沿用原 scale/zp，数值自检），产出 sherpa-onnx 直接可用的 s2tt 模型目录 |
+| `verify_s2tt_onnx.py` | Gate 2 验证：产品同款 sherpa-onnx 1.13.8 上三项行为断言（hotwords 直出中文/不带仍日语/静音空），原始包对照 |
 | `probe_context_pytorch.py` | T4 交叉验证：官方未量化实现的 context 通道行为 |
 | `.github/workflows/finetune.yml` | CI：`cpu-smoke` / `real-mini`（CPU 真实微调）/ `gpu-train` / `onnx-inspect` |
 
@@ -165,7 +167,7 @@ CI 里对应 `gpu-train` job，需要一个带 `self-hosted` + `gpu` 标签的 r
 | workflow | 触发 | 干什么 | 耗时 |
 |---|---|---|---|
 | `probe.yml` | 仅手动 | **T4**：不做微调，只把指令塞进 ASR 的 system 段（`--asr-hotwords`），看能否直出中文；可选用官方未量化实现交叉验证，把"量化丢能力"和"context 通道本就不能翻译"区分开 | ~5 min（可选交叉验证 +6 min） |
-| `finetune.yml` | 仅手动 | `cpu-smoke`（stub 冒烟）/ `real-mini`（CPU 真实微调，见 §10）/ `gpu-train`（GPU 训练）/ `onnx-inspect`（LoRA→官方 decoder.int8 权重补丁的前置事实探针，见 INTEGRATION.md §3） | 5–70 min |
+| `finetune.yml` | 仅手动 | `cpu-smoke`（stub 冒烟）/ `real-mini`（CPU 真实微调，见 §10；支持 0.6B/1.7B）/ `gpu-train`（GPU 训练）/ `onnx-inspect`（Gate 1 探针）/ `onnx-patch`（Gate 2 补丁+sherpa-onnx 验证），见 INTEGRATION.md | 5–150 min |
 | `s2tt-e2e.yml` | 仅手动 | **无 LLM 后处理端到端**（见 §11）：微调 ASR 直出中文字幕 vs master 两段式基线三方对照，windows runner，复用适配器 artifact 与媒体缓存 | 8–15 min |
 
 实测记录：§10（微调本身：静音回归与修复、三项判定）；§11（端到端：两个真实视频、
