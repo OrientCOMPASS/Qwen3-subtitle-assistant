@@ -96,9 +96,17 @@ def main() -> int:
     if args.adapter:
         from peft import PeftModel
 
-        wrapper.model = PeftModel.from_pretrained(wrapper.model, args.adapter)
-        wrapper.model.eval()
-        log(f"已挂载 LoRA 适配器: {args.adapter}")
+        # 适配器要挂在 .thinker 上（顶层没有 forward/generate 的实际实现，
+        # 它的 generate 会转发给 self.thinker.generate）
+        top = wrapper.model
+        target = getattr(top, "thinker", top)
+        adapted = PeftModel.from_pretrained(target, args.adapter)
+        adapted.eval()
+        if hasattr(top, "thinker"):
+            top.thinker = adapted
+        else:
+            wrapper.model = adapted
+        log(f"已挂载 LoRA 适配器到 {type(target).__name__}: {args.adapter}")
 
     rows = []
     for line in Path(args.eval).read_text(encoding="utf-8").splitlines():

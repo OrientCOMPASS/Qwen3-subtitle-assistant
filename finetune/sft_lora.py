@@ -196,10 +196,18 @@ def main() -> int:
         dtype=dtype,
         **({"device_map": "cuda:0"} if use_cuda else {}),
     )
-    model = wrapper.model
     processor = wrapper.processor
+    top = wrapper.model
+    # 关键：顶层 Qwen3ASRForConditionalGeneration **只有 generate()、没有 forward()**
+    # （它把一切转发给 .thinker）。直接把它交给 Trainer 会得到
+    #   TypeError: _forward_unimplemented() got an unexpected keyword argument 'input_ids'
+    # 所以训练/挂 LoRA 的对象必须是 .thinker（Qwen3ASRThinkerForConditionalGeneration，
+    # 其 forward 接受 input_ids/input_features/attention_mask/feature_attention_mask/labels，
+    # 与我们的 collator 输出一致）。
+    model = getattr(top, "thinker", top)
     log(f"模型加载完成，用时 {time.time() - t0:.1f}s；"
         f"参数量 {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    log(f"顶层模块 {type(top).__name__}（无 forward）-> 训练目标 {type(model).__name__}")
 
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if args.lora:
@@ -217,6 +225,9 @@ def main() -> int:
         )
         model = get_peft_model(model, cfg)
         model.print_trainable_parameters()
+    # 无论是否 LoRA，都把（可能被包装过的）thinker 挂回顶层，保证 wrapper 的推理路径一致
+    if hasattr(top, "thinker"):
+        top.thinker = model
     log(f"可训练参数：{trainable_before / 1e6:.1f}M -> "
         f"{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
 
@@ -275,8 +286,12 @@ def main() -> int:
     log(f"训练结束，用时 {train_secs:.1f}s；loss={result.training_loss:.4f}")
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(Path(args.out) / ("lora" if args.lora else "full")))
-    processor.save_pretrained(str(Path(args.out) / ("lora" if args.lora else "full")))
+    save_dir = Path(args.out) / ("lora" if args.lora else "full")
+    if args.lora:
+        trainer.save_model(str(save_dir))          # 只存适配器
+    else:
+        top.save_pretrained(str(save_dir))         # 全参微调要存顶层，否则无法直接加载
+    processor.save_pretrained(str(save_dir))
 
     report = {
         "model": args.model,
