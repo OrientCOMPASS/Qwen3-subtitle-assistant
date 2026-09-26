@@ -29,7 +29,7 @@ on:
         options: ["yes", "no"]
         default: "yes"
       pytorch_context:
-        description: "是否用官方 bf16 实现交叉验证（区分「量化丢能力」与「context 本就不能翻译」，需下载 ~1.2GB 模型）"
+        description: "是否用官方未量化实现交叉验证（区分「量化丢能力」与「context 本就不能翻译」，需下载 ~1.2GB 模型）"
         type: choice
         options: ["no", "yes"]
         default: "no"
@@ -171,7 +171,7 @@ jobs:
           python scripts/probe_asr_context.py --control $ctl.FullName --probe $probe.FullName |
             Tee-Object -FilePath probe-report.txt
 
-      - name: 交叉验证（可选）：官方 bf16 实现的 context 通道
+      - name: 交叉验证（可选）：官方未量化实现的 context 通道
         if: env.PT == 'yes'
         shell: pwsh
         run: |
