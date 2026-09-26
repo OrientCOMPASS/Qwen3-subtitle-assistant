@@ -19,8 +19,6 @@ impl SubtitleSegment {
         (self.end_ms.saturating_sub(self.start_ms)) as f64 / 1000.0
     }
 
-    /// 紧凑序列化（喂给 LLM 用）：只带序号与文本。
-    ///
 }
 
 /// LLM 翻译批次的输出单元（`[{"i":1,"t":"译文"}, ...]`）。
