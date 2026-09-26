@@ -51,10 +51,10 @@ system role；sherpa-onnx 侧对应 `hotwords` 字段，其源码注释写明
 
 | 文件 | 作用 |
 |---|---|
-| `prepare_data.py` | 造数据：FLEURS ja_jp（CC-BY-4.0，流式读取）或自备 wav 目录 → JSONL；翻译后端 `none`/`stub`/`api` |
+| `prepare_data.py` | 造数据：FLEURS ja_jp（CC-BY-4.0，流式读取）或自备 wav 目录 → JSONL；翻译后端 `none`/`stub`/`api`/`table`；`--silence-samples N` 混入合成静音/低噪样本（目标 `language None<asr_text>`），保住基座的「静音→空输出」行为 |
 | `sft_lora.py` | 训练：官方数据管线 + peft LoRA + CPU 兜底 + `--max-steps/--max-samples` |
-| `eval_s2tt.py` | 评测三项：翻译是否生效（带 prompt 输出假名占比要低）、是否遗忘（不带 prompt 仍出日语）、静音行为（`language None` + 空文本，逐句质检依赖它） |
-| `.github/workflows/finetune.yml` | CI：`cpu-smoke`（托管 runner，只验证管线）与 `gpu-train`（self-hosted + gpu，真实训练） |
+| `eval_s2tt.py` | 评测三项：翻译是否生效（带 prompt 输出假名占比要低）、是否遗忘（不带 prompt 仍出日语）、静音行为（**翻译/转写两种模式都要空**；`--silence-only` 单测静音，供基座模型归因诊断；另报 `transcribed_leak_count`——转写模式整条泄漏成译文的样本数） |
+| `.github/workflows/finetune.yml` | CI：`cpu-smoke`（托管 runner，只验证管线）、`real-mini`（托管 runner CPU **真实**微调，用提交的对照表）与 `gpu-train`（self-hosted + gpu，放量训练） |
 
 ---
 
@@ -67,7 +67,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install qwen-asr peft datasets soundfile librosa
 
 python finetune/prepare_data.py --source fleurs --limit 4 --eval-limit 2 \
-    --max-audio-secs 12 --translator stub --audio-dir data/audio --out data/train.jsonl
+    --max-audio-secs 12 --translator stub --audio-dir data/audio --out data/train.jsonl \
+    --silence-samples 2
 
 python finetune/sft_lora.py --model Qwen/Qwen3-ASR-0.6B --train data/train.jsonl \
     --out out/smoke --device cpu --lora --lora-r 8 --max-samples 4 --max-steps 2 --batch-size 1
@@ -104,7 +105,8 @@ export S2TT_API_KEY=sk-...
 python finetune/prepare_data.py --source fleurs --limit 2000 --eval-limit 40 \
     --max-audio-secs 20 --translator api \
     --api-base https://dashscope.aliyuncs.com/compatible-mode/v1 \
-    --api-model qwen-plus --api-key-env S2TT_API_KEY --asr-ratio 0.5
+    --api-model qwen-plus --api-key-env S2TT_API_KEY --asr-ratio 0.5 \
+    --silence-samples 200   # 约为训练集的 10%：静音样本太少保不住「静音→空输出」（实测 0 条即被训坏）
 
 # 2) 训练
 python finetune/sft_lora.py --model Qwen/Qwen3-ASR-0.6B \
@@ -126,11 +128,13 @@ CI 里对应 `gpu-train` job，需要一个带 `self-hosted` + `gpu` 标签的 r
 
 1. **翻译生效**：带 `context="translate to Chinese"` 时输出假名占比 ≤ 10%、汉字占比高；
 2. **没有遗忘**：不带 context 时仍输出日语转写（假名占比 ≥ 15%）；
-3. **静音行为不变**：喂静音仍返回 `language None` + 空文本
-   （主程序的逐句质检依赖这个行为剔除噪音段）。
+3. **静音行为不变**：喂静音仍返回 `language None` + 空文本——**翻译/转写两种模式都要过**
+   （主程序的逐句质检依赖这个行为剔除噪音段）。CI 会先对**基座模型**跑同样的
+   `--silence-only` 测试做归因：实测基座在「带 context + 纯数字静音」下自己就会把指令
+   回声成转写（输出 `翻译成中文。`），若基座也非空，静音异常不归因于微调，只警示不判红。
 
 三项都过，才值得继续投入部署路线（transformers sidecar / vLLM / sherpa-onnx ONNX 导出）。
-任何一项不过，先调数据配比（`--asr-ratio`）、LoRA 秩、学习率或训练步数。
+任何一项不过，先调数据配比（`--asr-ratio`、`--silence-samples`）、LoRA 秩、学习率或训练步数。
 
 ---
 
@@ -182,3 +186,69 @@ CI 里对应 `gpu-train` job，需要一个带 `self-hosted` + `gpu` 标签的 r
 > 交叉验证脚本踩过的坑记在 `probe_context_pytorch.py` 文件头：m4a 要用 ffmpeg 解码、
 > `transcribe` 只吃 `str` 或 `(ndarray, sr)`、返回值是 `@dataclass` 取 `.text`、
 > CPU 用 float32、**不要传 `language`**（会强制"只输出转写文本"，正好压掉要观察的行为）。
+
+---
+
+## 10. real-mini 实测记录（纯 CPU 真实微调，GitHub 托管 runner 4 vCPU）
+
+数据：FLEURS ja_jp 前 120 条（音频 ≤15s）+ 仓库内提交的 120 对人工日中对照表
+（`parallel_ja_zh.tsv`，**无任何 API key / 外部翻译服务**）；训练 100 条、留出评测 20 条
+（音频不进训练集）。模型 Qwen3-ASR-0.6B + LoRA r=32 α=64，4 epoch，batch 1×grad-acc 2，
+lr 3e-4，float32，全程 CPU。
+
+### 第一轮（run 36221464174）：翻译成功，但静音行为被训坏
+
+| 判定项 | 结果 | 数值 |
+|---|---|---|
+| 翻译生效（带 prompt 假名占比 ≤ 10%） | ✔ | **0.0%**，汉字占比 85%，20/20 条全中文 |
+| 没有遗忘（不带 prompt 假名占比 ≥ 15%） | ✔ | 57.9%（但 20 条里 1 条整条泄漏成中文） |
+| 静音行为（language None + 空文本） | ✘ | 2s 纯静音输出中文幻觉 `“我”是“我”的意思。` |
+
+训练 200 步 / 19.3 分钟 / final loss 0.99。静音回归的根因：训练集 100% 样本都带非空
+target，LoRA 把基座「静音 → 空输出」这条路压没了；而主程序逐句质检依赖该行为剔除噪音段，
+属部署阻断项。旧判定只强制「翻译生效」，静音 ✘ 仍判绿——一并收敛。
+
+### 修复（commit d74cd8c）
+
+1. `prepare_data.py --silence-samples N`：合成静音/低噪 wav（一半纯零、一半 std≈0.001
+   白噪声），target 与基座静音输出逐 token 一致（`language None<asr_text>`）；前 4 条固定
+   2.0s、覆盖「零/噪 × 带/不带 prompt」四种组合，与评测精确对齐；
+2. `eval_s2tt.py`：静音检查改为**双模式**都要空；新增 `--silence-only`（基座归因诊断）
+   与 `transcribed_leak_count`（均值会掩盖个别样本整条泄漏）；
+3. `finetune.yml`：real-mini 混入 20 条静音样本（训练集 120 = 翻译 67 + 转写 33 + 静音 20），
+   评测后加基座静音诊断，判定三项全强制。
+
+### 第二轮（run 36238661344）：三项判定全过
+
+| 判定项 | 结果 | 数值（第一轮 → 第二轮） |
+|---|---|---|
+| 翻译生效 | ✔ | 假名 0.0% → **0.0%**（汉字占比 85.1%） |
+| 没有遗忘 | ✔ | 假名 57.9% → **63.2%**，整条泄漏 1/20 → **0/20** |
+| 静音行为（双模式） | ✔ | 幻觉 → **两种模式均 `language None` + 空文本** |
+
+训练 240 步 / 37.8 分钟 / final loss 0.86（整轮 job 约 45 分钟，含评测与诊断）。
+
+**意外收获**：基座模型自己在「带 context + 纯数字静音」下就会把指令回声成转写
+（输出 `翻译成中文。`，lang=Chinese），转写模式才输出空。混入静音样本的微调模型
+两种模式都输出空——**静音行为比基座更稳**，这对逐句质检是净改善。
+
+译文样例（模型直出，未经任何 LLM 翻译段；括号内为对照表人工参考译文）：
+
+> 涉嫌引爆炸弹的男子在爆炸中受伤后被拘留。（涉嫌引爆炸弹的男子在爆炸中受伤后被拘留。——逐字全对）
+> 科学家们也一样，致力于开发能产生能量的原子能。（科学家们正在研发能够同样产生能量的核反应堆。）
+> 有时，海风还会带来海豹和频繁的海鸟。（有些降雨还伴有雷雨和频繁的闪电。——**严重误译**，20 条中 1 条）
+
+**质量评估（诚实版）**：句子流畅、语义主体保留，数字类信息（价格区间、倍数）能带过去，
+20 条评测里有逐字全对的样本；但 120 对样本下存在**名词级漂移**（集団墓地→修道院、
+米ドル→贝特、原子炉→原子能），并有 1/20 的严重误译（听感相近时整句跑偏）。
+这足以证明「CPU + 小对照表就能把输出定向到目标语言」的可行性结论；要达到产品可用质量，
+需按 B 节放量（≥2000 对，GPU 或 CPU 分批多轮），术语一致性可再靠 context 塞术语表缓解，
+误译兜底仍有现有管线的 LLM 译文自检一道闸。
+
+### 复现方式
+
+```
+workflow_dispatch → finetune-experiment → mode: real-mini
+```
+
+约 45 分钟跑完，产物在 artifact `s2tt-real-mini`（LoRA 适配器 + 训练/评测/基座诊断报告 + 数据集）。
