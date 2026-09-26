@@ -165,6 +165,11 @@ pub struct Args {
     #[arg(long, default_value = "自动检测（视频原语言）")]
     pub source_lang: String,
 
+    /// 残留检测的源文字系统：kana=日语假名（默认，日翻中场景）、hangul=谚文、none=不检测。
+    /// 命中残留的条目会触发一轮定向二审（只审这些条目，比整批重审便宜）。
+    #[arg(long, default_value = "kana")]
+    pub residual_script: String,
+
     /// 单行字幕最大显示宽度（CJK 计 2、ASCII 计 1；40 ≈ 20 个汉字）。0=不折行
     #[arg(long, default_value_t = 40)]
     pub max_line_width: usize,

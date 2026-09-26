@@ -531,7 +531,7 @@ jobs:
             python scripts/check_e2e.py --name "T1-$(Split-Path $f -Leaf)" --srt $srt `
               --target-lang zh --min-cues 3 --min-cues-per-min 2.0 `
               --max-cue-secs 15 --max-line-width 44 `
-              --max-kana-ratio 0.02 --max-foreign-cues 1
+              --max-kana-ratio 0.02 --max-foreign-cues 1 --max-kana-cues 2
             if ($LASTEXITCODE -ne 0) { $bad++ }
           }
           # 整份日志聚合判定：质检统计每个文件各一条、丢弃率、回退条数、审校修正数

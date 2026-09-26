@@ -15,6 +15,7 @@ pub struct Config {
     // ---- 翻译 ----
     pub target_lang: String,
     pub source_lang: String,
+    pub residual_script: String,
     pub batch_size: usize,
     pub batch_chars: usize,
     pub context_size: usize,
@@ -115,6 +116,14 @@ impl Config {
             prompts_dir,
             target_lang: args.target_lang.clone(),
             source_lang: args.source_lang.clone(),
+            residual_script: match args.residual_script.trim().to_ascii_lowercase().as_str() {
+                "kana" | "hangul" => args.residual_script.trim().to_ascii_lowercase(),
+                "none" | "" => "none".to_string(),
+                other => {
+                    warn!("--residual-script {:?} 不支持（可选 kana/hangul/none），按 none 处理", other);
+                    "none".to_string()
+                }
+            },
             batch_size,
             batch_chars,
             context_size: args.context_size,
@@ -381,6 +390,7 @@ mod tests {
             context_size: 2,
             target_lang: "简体中文".into(),
             source_lang: "日语".into(),
+            residual_script: "kana".into(),
             max_line_width: 40,
             max_cue_secs: 7.0,
             no_layout: false,
