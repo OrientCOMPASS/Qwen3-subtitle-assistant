@@ -23,6 +23,42 @@ import sys
 import unicodedata
 
 
+def load_audio(path: str, sr: int = 16000, max_seconds: float | None = None):
+    """用 ffmpeg 解码成 16k 单声道 float32。
+
+    为什么不直接 soundfile/librosa.read：CI 实测两者都打不开 .m4a（AAC），
+    soundfile 报 "Error opening ... File contains data in an unknown format"，
+    librosa 会退回到 soundfile 于是同样失败。ffmpeg 在 probe job 里已经装好，
+    而且顺带能用 -t 只截前 N 秒，省掉整条视频的解码时间。
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    import soundfile as sf
+
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+           "-ac", "1", "-ar", str(sr)]
+    if max_seconds:
+        cmd += ["-t", str(max_seconds)]
+    cmd += [wav_path]
+    try:
+        subprocess.run(cmd, check=True)
+        wav, got_sr = sf.read(wav_path, dtype="float32")
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+    if got_sr != sr:
+        raise RuntimeError(f"ffmpeg 输出的采样率是 {got_sr}，期望 {sr}")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    return wav
+
+
 def script_of(ch: str) -> str:
     if "\u3040" <= ch <= "\u30ff":
         return "ja"
@@ -54,8 +90,7 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        import librosa
-        import numpy as np
+        import soundfile as sf
         import torch
         from qwen_asr import Qwen3ASRModel
     except ImportError as e:
@@ -68,12 +103,19 @@ def main() -> int:
     print(f"模型：{args.model}   dtype=bfloat16   device=cpu")
     print(f"context：{args.context or '(无)'}")
 
-    wav, _ = librosa.load(args.media, sr=16000, mono=True)
-    if args.max_seconds and len(wav) > int(16000 * args.max_seconds):
-        wav = wav[: int(16000 * args.max_seconds)]
+    wav = load_audio(args.media, sr=16000, max_seconds=args.max_seconds)
     print(f"音频：{len(wav) / 16000:.1f}s（截取前 {args.max_seconds:.0f}s）")
 
-    model = Qwen3ASRModel.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cpu")
+    # 不同版本的 qwen-asr 关键字名不一样（dtype / torch_dtype），两种都试
+    model = None
+    for kw in ({"dtype": torch.bfloat16}, {"torch_dtype": torch.bfloat16}):
+        try:
+            model = Qwen3ASRModel.from_pretrained(args.model, device_map="cpu", **kw)
+            break
+        except TypeError:
+            continue
+    if model is None:
+        model = Qwen3ASRModel.from_pretrained(args.model)
 
     def run(context: str) -> str:
         try:

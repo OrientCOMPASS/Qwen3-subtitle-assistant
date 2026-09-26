@@ -177,7 +177,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           python -m pip install --quiet --upgrade pip
-          pip install --quiet torch numpy soundfile librosa qwen-asr
+          pip install --quiet torch numpy soundfile qwen-asr
           python finetune/probe_context_pytorch.py --media "$env:PROBE_MEDIA" --context "$env:HW" |
             Tee-Object -FilePath probe-report-pytorch.txt
 
