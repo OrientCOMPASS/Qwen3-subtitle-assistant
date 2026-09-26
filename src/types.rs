@@ -201,6 +201,10 @@ pub struct TranslateStats {
     pub copied: usize,
     /// 最终使用原文（未翻译）的条数
     pub untranslated: usize,
+    /// 经过译文自检的条数
+    pub reviewed: usize,
+    /// 自检后实际修正的条数
+    pub review_fixed: usize,
     /// 全局摘要被切成的块数（1 = 未触发分块）
     pub summary_chunks: usize,
     /// 因 prompt 超预算而被对半拆分的次数
@@ -210,7 +214,7 @@ pub struct TranslateStats {
 impl TranslateStats {
     pub fn summary(&self) -> String {
         format!(
-            "翻译 {} 条 / {} 批：重试 {}，拆分 {}，整批失败 {}，位置兜底 {}，照抄 {}，未翻译 {}，摘要分块 {}",
+            "翻译 {} 条 / {} 批：重试 {}，拆分 {}，整批失败 {}，位置兜底 {}，照抄 {}，未翻译 {}，自检 {}/修正 {}，摘要分块 {}",
             self.segments,
             self.batches,
             self.retries,
@@ -219,6 +223,8 @@ impl TranslateStats {
             self.positional,
             self.copied,
             self.untranslated,
+            self.reviewed,
+            self.review_fixed,
             self.summary_chunks
         )
     }

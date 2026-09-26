@@ -26,6 +26,9 @@ use std::collections::HashMap;
 const SYSTEM_PROMPT: &str =
     "你是一个专业的字幕翻译与内容分析助手。请严格按照用户要求的 JSON 格式输出，不要输出任何多余的解释、思考过程、前缀或代码块标记。";
 
+const REVIEW_SYSTEM: &str =
+    "你是一个严格的字幕翻译质检员。请只输出需要修改的条目组成的 JSON 数组，全部达标时输出 []，不要输出任何解释、思考过程或代码块标记。";
+
 /// 生成侧至少预留的 token 数。
 const OUTPUT_RESERVE: usize = 1536;
 /// prompt 模板与聊天包裹的固定开销余量。
@@ -126,7 +129,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                 batch.iter().map(|s| s.text.chars().count()).sum::<usize>()
             );
             match self.translate_batch_adaptive(&gctx, context, batch, 0) {
-                Ok(items) => self.merge_batch(batch, &items, &mut translated),
+                Ok(items) => {
+                    let from = translated.len();
+                    self.merge_batch(batch, &items, &mut translated);
+                    if self.cfg.review_enabled {
+                        self.review_batch(&gctx, batch, &mut translated[from..]);
+                    }
+                }
                 Err(e) => {
                     self.stats.failed_batches += 1;
                     self.stats.untranslated += batch.len();
@@ -449,6 +458,109 @@ impl<'a, 'b> Translator<'a, 'b> {
         let mut out = self.translate_batch_adaptive(gctx, context, &batch[..mid], depth + 1)?;
         out.extend(self.translate_batch_adaptive(gctx, context, &batch[mid..], depth + 1)?);
         Ok(out)
+    }
+
+    /// 译文自检：把「原文 + 当前译文」交回 LLM，让它以质检员身份挑出不达标的条目。
+    ///
+    /// 动机（实测）：日翻中时模型会残留假名、或直接把日文词抄下来（例如 おせんべい
+    /// 没译成"仙贝"）。这类问题在批内翻译时很难自查，但换一个"质检员"身份再审一遍
+    /// 就能挑出来。自检失败不影响主流程：任何异常都只 warn 并保留原译文。
+    fn review_batch(
+        &mut self,
+        gctx: &GlobalContext,
+        sources: &[SubtitleSegment],
+        out: &mut [SubtitleSegment],
+    ) {
+        if out.is_empty() {
+            return;
+        }
+        let pairs: Vec<String> = sources
+            .iter()
+            .zip(out.iter())
+            .map(|(s, t)| {
+                format!(
+                    "{{\"i\":{},\"s\":{},\"t\":{}}}",
+                    s.index,
+                    serde_json::to_string(&s.text).unwrap_or_else(|_| "\"\"".into()),
+                    serde_json::to_string(&t.text).unwrap_or_else(|_| "\"\"".into())
+                )
+            })
+            .collect();
+
+        let mut vars = HashMap::new();
+        vars.insert("target_lang".to_string(), self.cfg.target_lang.clone());
+        vars.insert("glossary".to_string(), gctx.glossary_as_text());
+        vars.insert("pairs".to_string(), format!("[{}]", pairs.join(",")));
+        let prompt = match self.prompts.render("review_batch.txt", &vars) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("[审校] 提示词渲染失败，跳过自检: {:#}", e);
+                return;
+            }
+        };
+
+        let max_new =
+            (self.cfg.translate_tokens_per_item * out.len() + 256).clamp(512, 6144) as u32;
+        let attempts = 2usize;
+        for attempt in 1..=attempts {
+            // 种子偏移 100：让审校与翻译走不同的采样轨迹
+            let raw = match self.session.chat(
+                REVIEW_SYSTEM,
+                &prompt,
+                self.sampling.resample(attempt + 100),
+                max_new,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[审校] 第 {} 次请求失败: {:#}", attempt, e);
+                    continue;
+                }
+            };
+            let fixes = match parse_json::<Vec<TranslateItem>>(&raw, true) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("[审校] 第 {} 次输出不可解析: {}", attempt, e);
+                    continue;
+                }
+            };
+            self.stats.reviewed += out.len();
+            if fixes.is_empty() {
+                info!("[审校] {} 条全部达标，无需修改", out.len());
+                return;
+            }
+            let mut applied = 0usize;
+            for f in &fixes {
+                let new_text = f.t.trim();
+                if new_text.is_empty() {
+                    continue;
+                }
+                let Some(pos) = out.iter().position(|s| s.index as i64 == f.i) else {
+                    warn!("[审校] 返回了未知 index {}，忽略", f.i);
+                    continue;
+                };
+                if out[pos].text.trim() == new_text {
+                    continue;
+                }
+                // 审校结果本身也可能照抄原文，那就没有意义
+                if let Some(src) = sources.get(pos) {
+                    if looks_copied(&src.text, new_text) {
+                        warn!("[审校] 第 {} 条修正后仍与原文雷同，忽略", f.i);
+                        continue;
+                    }
+                }
+                info!(
+                    "[审校✎] {} => {}",
+                    out[pos].text.replace('\n', " "),
+                    new_text.replace('\n', " ")
+                );
+                out[pos].text = new_text.to_string();
+                applied += 1;
+            }
+            self.stats.review_fixed += applied;
+            info!("[审校] 检查 {} 条，修正 {} 条", out.len(), applied);
+            return;
+        }
+        warn!("[审校] {} 次尝试均失败，保留原译文", attempts);
     }
 
     fn build_translate_prompt(

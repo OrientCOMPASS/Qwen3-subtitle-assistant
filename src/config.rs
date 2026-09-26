@@ -52,6 +52,7 @@ pub struct Config {
     pub max_line_width: usize,
     pub max_cue_secs: f64,
     pub layout_enabled: bool,
+    pub review_enabled: bool,
 
     // ---- 运行方式 ----
     pub from_srt: bool,
@@ -152,6 +153,7 @@ impl Config {
             max_line_width: args.max_line_width,
             max_cue_secs,
             layout_enabled: !args.no_layout,
+            review_enabled: !args.no_review,
             from_srt: args.from_srt,
             output_dir: args.output_dir.clone(),
         };
@@ -382,6 +384,7 @@ mod tests {
             max_line_width: 40,
             max_cue_secs: 7.0,
             no_layout: false,
+            no_review: true,
             from_srt: false,
             output_dir: None,
             log_file: None,

@@ -122,6 +122,9 @@ def main() -> int:
     ap.add_argument("--srt", required=True)
     ap.add_argument("--log", default="")
     ap.add_argument("--min-cues", type=int, default=1)
+    ap.add_argument("--min-cues-per-min", type=float, default=0.0,
+                    help="按字幕自身时间跨度折算的最低密度（条/分钟）；0=不检查。"
+                         "固定 --min-cues 对 84 秒的短视频过于苛刻，用密度更合理")
     ap.add_argument("--max-cue-secs", type=float, default=0.0, help="0=不检查")
     ap.add_argument("--max-line-width", type=int, default=0, help="0=不检查")
     ap.add_argument("--target-lang", default="zh", choices=["zh", "any"])
@@ -162,6 +165,12 @@ def main() -> int:
           f"汉字 {ratios['cjk']:.0%} 假名 {ratios['kana']:.0%} 拉丁 {ratios['latin']:.0%}")
 
     check(len(cues) >= args.min_cues, f"字幕条数 {len(cues)} >= {args.min_cues}")
+    if args.min_cues_per_min > 0 and cues:
+        span_min = max(c["end"] for c in cues) / 60000.0
+        need = span_min * args.min_cues_per_min
+        check(len(cues) >= need,
+              f"字幕密度 {len(cues) / max(span_min, 1e-9):.1f} 条/分 >= {args.min_cues_per_min}"
+              f"（时间跨度 {span_min:.1f} 分钟，需 >= {need:.0f} 条）")
     check(all(c["text"].strip() for c in cues), "所有字幕文本非空")
 
     if args.max_cue_secs > 0:

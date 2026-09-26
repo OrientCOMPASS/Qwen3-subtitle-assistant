@@ -48,6 +48,11 @@ on:
         description: "真实视频用例最多测几个（留空 = 3；调成 1 可加快迭代）"
         type: string
         default: ""
+      asr_model:
+        description: "ASR 模型规格（1.7B 约 2.3GB，论文称开源 SOTA，CPU 上慢约 3 倍）"
+        type: choice
+        default: "0.6B"
+        options: [0.6B, 1.7B]
 
 permissions:
   contents: write # release job 创建 Release 需要
@@ -69,6 +74,8 @@ env:
   # 换视频只需改这里；下载结果进 actions/cache，后续运行不再访问 bilibili。
   E2E_BVIDS: "BV16r421g797 BV1ccdQY8Ee8 BV1jT42167f3 BV1No4y117UC"
   E2E_MAX_FILES: "3"
+  # push 事件下 inputs 为空，回落到 0.6B
+  ASR_VARIANT: ${{ inputs.asr_model || '0.6B' }}
 
 jobs:
   # ------------------------------------------------------------------ 构建
@@ -319,7 +326,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: models
-          key: qwen3-models-v3
+          key: qwen3-models-v4-${{ inputs.asr_model || '0.6B' }}
 
       - name: Download models (cache miss)
         id: download-models
@@ -327,7 +334,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/download_models.ps1
+          Write-Host "ASR 规格: $env:ASR_VARIANT"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/download_models.ps1 -AsrVariant $env:ASR_VARIANT
           Get-ChildItem -Recurse models | Select-Object FullName, Length | Format-Table -AutoSize
 
       - name: Save models
@@ -337,7 +345,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: models
-          key: qwen3-models-v3
+          key: qwen3-models-v4-${{ inputs.asr_model || '0.6B' }}
 
       # ---------------- 测试媒体（bilibili 日语视频，缓存） ----------------
       - name: Restore e2e media
@@ -497,7 +505,10 @@ jobs:
           Write-Host "=== 待处理 $($files.Count) 个视频 ==="
           $files | ForEach-Object { Write-Host "  $_" }
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          & ./target/release/subtitle-assistant.exe --no-pause --log-file media/t1.log @files
+          $asrDir = "models/sherpa-onnx-qwen3-asr-$($env:ASR_VARIANT)-int8"
+          Write-Host "ASR 模型目录: $asrDir"
+          & ./target/release/subtitle-assistant.exe --no-pause --asr-model-dir $asrDir `
+              --log-file media/t1.log @files
           $code = $LASTEXITCODE
           $sw.Stop()
           Write-Host "T1 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
@@ -510,19 +521,23 @@ jobs:
           if ($env:T1_SKIPPED) { Write-Warning "T1 已跳过"; exit 0 }
           $files = $env:MEDIA_LIST -split ';'
           $bad = 0
+          # 逐文件：只看字幕本身（条数密度/时长/行宽/是否真翻成中文）
+          # 阈值说明：日翻中的对话字幕里**基本不该出现假名**（おせんべい=仙贝、ほうとう=宝刀面
+          # 都有通用译法），所以假名占比压到 2%、整条未翻译最多容忍 1 条。
           foreach ($f in $files) {
             $srt = ($f -replace '\.[^.]+$','') + ".srt"
             Write-Host "`n=== $srt（前 30 行）==="
             Get-Content $srt -Encoding UTF8 | Select-Object -First 30
-            python scripts/check_e2e.py --name "T1-$(Split-Path $f -Leaf)" --srt $srt --log media/t1.log `
-              --min-cues 8 --target-lang zh --max-cue-secs 15 --max-line-width 44 `
-              --max-untranslated 8 --max-kana-ratio 0.10 --max-foreign-cues 3
+            python scripts/check_e2e.py --name "T1-$(Split-Path $f -Leaf)" --srt $srt `
+              --target-lang zh --min-cues 3 --min-cues-per-min 2.0 `
+              --max-cue-secs 15 --max-line-width 44 `
+              --max-kana-ratio 0.02 --max-foreign-cues 1
             if ($LASTEXITCODE -ne 0) { $bad++ }
           }
-          # 质检统计是整份日志聚合判定：每个输入文件应各有一条
-          python scripts/check_e2e.py --name "T1-质检汇总" --srt (($files[0] -replace '\.[^.]+$','') + ".srt") `
+          # 整份日志聚合判定：质检统计每个文件各一条、丢弃率、回退条数、审校修正数
+          python scripts/check_e2e.py --name "T1-日志汇总" --srt (($files[0] -replace '\.[^.]+$','') + ".srt") `
             --log media/t1.log --target-lang any --expect-qc --expect-qc-files $files.Count `
-            --max-qc-drop-ratio 0.35
+            --max-qc-drop-ratio 0.35 --max-untranslated 8 --expect-log-contains "审校"
           if ($LASTEXITCODE -ne 0) { $bad++ }
           if ($bad -gt 0) { throw "T1 断言失败（$bad 项）" }
 

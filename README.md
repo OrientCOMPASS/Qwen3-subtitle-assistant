@@ -44,6 +44,9 @@
 - **📚 智能上下文翻译**：翻译前先提取剧情摘要与术语表；转录超过 `--summary-chunk-tokens`
   时自动分块提取再合并（map-reduce），长视频也能拿到全局上下文。翻译时注入
   全局摘要 + 滑动窗口上文，抑制术语漂移与上下文割裂。
+- **🔎 译文自检**：每批译完再把「原文 + 译文」交回 LLM 当质检员，挑出残留原文
+  （日翻中常见的假名未译，如 おせんべい 应译"仙贝"）、误译与术语不一致并就地修正
+  （`--no-review` 关闭）。
 - **🎞 流式音频管线**：FFmpeg 管道直出 16kHz `f32le` PCM + Silero VAD 切片，零中间文件。
 - **🧾 字幕排版**：行宽折行 + 超长 cue 拆分（`--max-line-width` / `--max-cue-secs`）。
 - **🔁 会话复用**：LLM 上下文只创建一次，每轮清 KV cache 复用，逐句质检的高频调用
@@ -137,6 +140,31 @@ powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1 -HfMirror h
 也可手动下载任意 Qwen3 GGUF 量化版放入 `models/` 任意子目录（程序会递归搜索第一个 `.gguf`；
 有多个时会 warn 并提示用 `--llm-model` 指定）。
 
+**想用更大的 ASR（Qwen3-ASR-1.7B）**：论文称其为开源 ASR 的 SOTA、可对标最强商业 API。
+社区已有 sherpa-onnx 导出，且**文件布局与 0.6B 完全一致**，因此无需改代码：
+
+```powershell
+# 下载（约 2.3GB：decoder.int8 1.9GB + encoder.int8 299MB + conv_frontend 45MB）
+powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1 -AsrVariant 1.7B
+# 使用
+.\subtitle-assistant.exe --asr-model-dir models\sherpa-onnx-qwen3-asr-1.7B-int8 video.mp4
+```
+
+CPU 上 1.7B 约比 0.6B 慢 3 倍，建议配 CUDA 包使用。CI 里也可以在 dispatch 时选
+`asr_model: 1.7B` 跑一次对比（模型分开缓存）。
+
+> 关于"能不能让 ASR 直接吐中文字幕、省掉翻译"：**不能靠提示词做到**。
+> Qwen3-ASR 技术报告（arXiv:2601.21337）§2.2 明确写了 SFT 阶段
+> "we train the model to be an **ASR-only model that does not follow natural-language
+> instructions in the prompt**"，输出格式被固定为 `language X<|asr_text|>...`，
+> system prompt 里的 context 只用于**背景知识偏置**（对应本项目的 `--asr-hotwords`），
+> 不能切换任务。要做语音翻译只能微调（官方给了 fine-tuning recipe，基座 Qwen3-Omni
+> 本身具备音频翻译能力）。
+>
+> 同系列还有 **Qwen3-ForcedAligner-0.6B**（LLM-based 非自回归时间戳预测，支持含日语在内
+> 的 11 种语言，词/句/段任意粒度）。本项目目前的长字幕拆分是"按字符占比估算时间"，
+> 接入它就能换成真实时间戳对齐——这是字幕时轴质量最值得做的下一步。
+
 ### 3. 运行
 
 ```powershell
@@ -211,6 +239,7 @@ powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1 -HfMirror h
 | `--max-line-width N` | 40 | 单行最大显示宽度（CJK 计 2；40≈20 汉字），0=不折行 |
 | `--max-cue-secs F` | 7.0 | 单条字幕最长秒数，超出按句读拆分，0=不拆 |
 | `--no-layout` | 关 | 关闭折行与拆分 |
+| `--no-review` | 关 | 关闭译文自检（开启时每批多一次 LLM 调用） |
 | **ASR / VAD** | | |
 | `--asr-threads N` | 4 | ASR CPU 线程数（仅 CPU provider 生效） |
 | `--asr-hotwords LIST` | 空 | Qwen3-ASR 偏置词（英文逗号分隔） |
@@ -318,7 +347,7 @@ python scripts/check_dll_deps.py --dir <发行包目录> --fail-on-missing --str
 |---|---|---|
 | T2 摘要分块回归 | `long_ja.srt` 前 40 条配 `--summary-chunk-tokens 400`，强制全局摘要走 map-reduce | 退出码 0、≥40 条、日志「摘要分块 N」且 N ≥ 2、未翻译 cue ≤2 |
 | T3 迁移目录回归 | exe+DLL+prompts 拷到 `%TEMP%`，`models` 用 junction，从**非仓库 CWD** 启动 | 退出码 0，且日志出现「改用 exe 目录」（证明资源路径回退生效） |
-| T1 真实视频（×3） | 3 个 bilibili 日语视频（学术演讲 198s / 比赛演讲 282s / 家庭口语 84s，`scripts/fetch_media.py` 下载 + actions/cache 缓存），**一次调用喂多个文件**（顺带验证模型跨文件复用），跑完整流程：ASR → 逐句质检 → 摘要 → 翻译 → 排版 | 每个视频各自断言：条数 ≥8、最长 cue ≤15s、最宽行 ≤44、未翻译 cue ≤3、假名占比 ≤10%；再对整份日志聚合断言：每个文件各有一条质检统计、计数自洽、**QC 丢弃率 ≤35%**、无 `GGML_ASSERT`/panic |
+| T1 真实视频（×3） | 3 个 bilibili 日语视频（学术演讲 198s / 比赛演讲 282s / 家庭口语 84s，`scripts/fetch_media.py` 下载 + actions/cache 缓存），**一次调用喂多个文件**（顺带验证模型跨文件复用），跑完整流程：ASR → 逐句质检 → 摘要 → 翻译 → 排版 | 每个视频各自断言：条数密度 ≥2 条/分钟（按字幕时间跨度折算，避免对短视频用固定条数误判）、最长 cue ≤15s、最宽行 ≤44、**假名占比 ≤2%、整条未翻译 ≤1 条**（日翻中的对话字幕基本不该残留假名：おせんべい=仙贝、ほうとう=宝刀面都有通用译法）；再对整份日志聚合断言：每文件各一条质检统计且计数自洽、**QC 丢弃率 ≤35%**、回退原文 ≤8 条、日志含"审校"（证明自检真的跑了）、无 `GGML_ASSERT`/panic |
 
 回归用例不依赖网络，排在真实视频用例之前跑，最快拿到关键反馈。
 模型缓存用 `actions/cache/restore` + `save(if: always())` 而非 `actions/cache`——后者的 post 步骤在 job 失败时会被跳过，2.7GB 模型会每轮重下。

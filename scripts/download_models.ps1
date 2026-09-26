@@ -1,5 +1,9 @@
 ﻿# 一键下载运行所需的全部模型到程序目录的 models\ 下：
-#   1. Qwen3-ASR 0.6B int8（sherpa-onnx 格式，GitHub Release）
+#   1. Qwen3-ASR int8（sherpa-onnx 格式）：
+#        -AsrVariant 0.6B（默认）-> k2-fsa GitHub Release 的 tar.bz2
+#        -AsrVariant 1.7B         -> HuggingFace 社区导出（约 2.3GB，论文称开源 ASR SOTA）
+#      两者文件布局一致（conv_frontend/encoder.int8/decoder.int8/tokenizer），
+#      切换只需给程序传 --asr-model-dir models\sherpa-onnx-qwen3-asr-1.7B-int8
 #   2. Silero VAD（GitHub Release）
 #   3. Qwen3-1.7B-Q8_0.gguf（HuggingFace，可用 -HfMirror 切换镜像）
 #
@@ -12,6 +16,7 @@
 
 param(
     [string]$HfMirror = "https://huggingface.co",
+    [ValidateSet("0.6B","1.7B")][string]$AsrVariant = "0.6B",
     [switch]$SkipLlm
 )
 
@@ -39,10 +44,20 @@ function Get-File {
     }
 }
 
-# ---------- 1. Qwen3-ASR 0.6B int8 ----------
-$asrDir = Join-Path $models "sherpa-onnx-qwen3-asr-0.6B-int8"
+# ---------- 1. Qwen3-ASR int8（0.6B 走 GitHub Release tar；1.7B 走 HuggingFace 逐文件） ----------
+$asrDir = Join-Path $models "sherpa-onnx-qwen3-asr-$AsrVariant-int8"
 if (Test-Path (Join-Path $asrDir "encoder.int8.onnx")) {
-    Write-Host "ASR 模型已存在，跳过" -ForegroundColor DarkGray
+    Write-Host "ASR 模型已存在，跳过: $asrDir" -ForegroundColor DarkGray
+} elseif ($AsrVariant -eq "1.7B") {
+    $base = "$HfMirror/thieunv-asilla/sherpa-onnx-qwen3-asr-1.7B-int8/resolve/main"
+    New-Item -ItemType Directory -Force -Path (Join-Path $asrDir "tokenizer") | Out-Null
+    $files = @("conv_frontend.onnx", "encoder.int8.onnx", "decoder.int8.onnx",
+               "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json")
+    foreach ($f in $files) {
+        $dest = Join-Path $asrDir ($f -replace '/', '\\')
+        Get-File "$base/$f" $dest
+    }
+    Write-Host "✔ ASR 1.7B 就绪: $asrDir" -ForegroundColor Green
 } else {
     $asrTar = Join-Path $tmp "sherpa-onnx-qwen3-asr-0.6B-int8.tar.bz2"
     Get-File "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2" $asrTar
@@ -52,7 +67,7 @@ if (Test-Path (Join-Path $asrDir "encoder.int8.onnx")) {
     if (-not (Test-Path $extracted)) { throw "解压后未找到预期目录: $extracted" }
     if (Test-Path $asrDir) { Remove-Item -Recurse -Force $asrDir }
     Move-Item $extracted $asrDir
-    Write-Host "✔ ASR 模型就绪: $asrDir" -ForegroundColor Green
+    Write-Host "✔ ASR 0.6B 就绪: $asrDir" -ForegroundColor Green
 }
 
 # ---------- 2. Silero VAD ----------
