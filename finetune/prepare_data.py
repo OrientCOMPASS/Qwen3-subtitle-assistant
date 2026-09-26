@@ -40,6 +40,10 @@ from pathlib import Path
 
 ASR_TEXT_TAG = "<asr_text>"
 LANG_TAG = "language Japanese" + ASR_TEXT_TAG
+# 基座模型对静音/无语音音频的原始输出就是这一串（qwen_asr.inference.utils.parse_asr_output
+# 把 "language None<asr_text>" 解析成 language=""、text=""）。静音样本的训练目标必须
+# 与之逐 token 一致，才能把该行为原样保住。
+SILENCE_TAG = "language None" + ASR_TEXT_TAG
 DEFAULT_PROMPT = "translate to Chinese"
 
 
@@ -273,6 +277,55 @@ class ApiTranslator:
         raise RuntimeError(f"翻译失败（{text[:30]}…）: {last}")
 
 
+# --------------------------------------------------------------------------- 静音样本
+
+def make_silence_samples(audio_dir: Path, n: int, prompt: str,
+                         min_secs: float, max_secs: float, seed: int) -> list[str]:
+    """合成静音/低噪 wav，训练目标固定为 `language None<asr_text>`（空文本）。
+
+    为什么需要：实测（run 36221464174）120 对样本 LoRA 4 epoch 后，翻译与抗遗忘都达标，
+    但**静音行为被训坏**——喂 2s 纯静音输出了中文幻觉（`“我”是“我”的意思。`），
+    而主程序的逐句质检依赖「静音 -> language None + 空文本」剔除噪音段。
+    根因是训练集里 100% 的样本都有非空 target，LoRA 把「空输出」这条路压没了。
+    修复：把静音样本显式混回训练集，且带 prompt（翻译模式）与不带 prompt（转写模式）
+    各占一半——eval 的静音测试两种模式都要过。
+
+    样本内容一半纯零、一半低幅白噪声（std≈0.001，更接近真实过了 VAD 的噪音段）；
+    前 4 条固定 2.0s 并遍历「零/噪 × 带/不带 prompt」四种组合，
+    与 eval_s2tt.py 的默认静音测试（2s 纯零，双模式）精确对齐。
+    """
+    import numpy as np
+    import soundfile as sf
+
+    rng = np.random.default_rng(seed)
+    lines: list[str] = []
+    for j in range(n):
+        # j<4：2.0s，四种组合全覆盖（0=零+prompt 1=噪+prompt 2=零+无prompt 3=噪+无prompt）
+        # j>=4：零/噪交替，时长在 [min_secs, max_secs] 内随机
+        if j < 4:
+            secs = 2.0
+            zeros = j in (0, 2)          # 0=零+prompt 1=噪+prompt 2=零+无prompt 3=噪+无prompt
+            with_prompt = j in (0, 1)
+        else:
+            secs = round(float(rng.uniform(min_secs, max_secs)), 2)
+            zeros = (j % 2 == 0)
+            with_prompt = ((j // 2) % 2 == 0)
+        n_samples = int(16000 * secs)
+        if zeros:
+            arr = np.zeros(n_samples, dtype=np.float32)
+        else:
+            arr = rng.normal(0.0, 0.001, n_samples).astype(np.float32)
+        wav = audio_dir / f"silence_{j:03d}.wav"
+        sf.write(str(wav), arr, 16000, subtype="PCM_16")
+        rec = {
+            "audio": str(wav.resolve()),
+            "text": SILENCE_TAG,
+            "prompt": prompt if with_prompt else "",
+        }
+        lines.append(json.dumps(rec, ensure_ascii=False))
+    return lines
+
+
 # --------------------------------------------------------------------------- 主流程
 
 def main() -> int:
@@ -292,6 +345,11 @@ def main() -> int:
                     help="把抽到的日语转写逐行写到该文件（供离线翻译成对照表）")
     ap.add_argument("--skip-untranslated", action="store_true",
                     help="table 模式下对照表未命中的样本直接跳过（而不是报错）")
+    ap.add_argument("--silence-samples", type=int, default=0,
+                    help="混入 N 条合成静音/低噪样本（目标 language None+空文本），"
+                         "保住基座的「静音->空输出」行为（主程序逐句质检依赖它）")
+    ap.add_argument("--silence-min-secs", type=float, default=1.0)
+    ap.add_argument("--silence-max-secs", type=float, default=3.0)
     ap.add_argument("--api-base", default="")
     ap.add_argument("--api-model", default="")
     ap.add_argument("--api-key-env", default="", help="存放 API key 的环境变量名")
@@ -397,11 +455,22 @@ def main() -> int:
             "（离线翻译成对照表后可用 --translator table 训练）")
     if n_skipped:
         log(f"对照表未命中而跳过 {n_skipped} 条")
+
+    n_silence = 0
+    if args.silence_samples > 0:
+        sil = make_silence_samples(audio_dir, args.silence_samples, args.prompt,
+                                   args.silence_min_secs, args.silence_max_secs, args.seed)
+        train_lines.extend(sil)
+        n_silence = len(sil)
+        log(f"已混入静音/低噪样本 {n_silence} 条（目标 {SILENCE_TAG!r}，"
+            f"带 prompt 与不带 prompt 各约一半）")
+
     Path(args.out).write_text("\n".join(train_lines) + "\n", encoding="utf-8")
     Path(args.eval_out).write_text("\n".join(eval_lines) + "\n", encoding="utf-8")
     log(f"训练集 {len(train_lines)} 条 -> {args.out}")
     log(f"评测集 {len(eval_lines)} 条 -> {args.eval_out}")
-    log(f"任务构成：翻译 {n_mt} 条（prompt={args.prompt!r}），转写 {n_asr} 条（prompt 为空）")
+    log(f"任务构成：翻译 {n_mt} 条（prompt={args.prompt!r}），转写 {n_asr} 条（prompt 为空），"
+        f"静音 {n_silence} 条")
     if not train_lines:
         log("!! 训练集为空，请检查数据源与 --limit")
         return 1

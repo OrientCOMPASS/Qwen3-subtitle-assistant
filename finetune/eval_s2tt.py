@@ -64,17 +64,24 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-ASR-0.6B")
     ap.add_argument("--adapter", default="", help="LoRA 适配器目录（留空则评测基座模型）")
-    ap.add_argument("--eval", required=True, help="prepare_data.py 产出的评测 JSONL")
+    ap.add_argument("--eval", default="", help="prepare_data.py 产出的评测 JSONL（--silence-only 时可省略）")
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--prompt", default="translate to Chinese", help="翻译任务的 context")
     ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     ap.add_argument("--silence-secs", type=float, default=2.0, help="静音测试时长；0=跳过")
+    ap.add_argument("--silence-only", action="store_true",
+                    help="只跑静音测试（用于基座模型归因诊断：区分「微调训坏」与「transformers 路径本来就幻觉」）")
     ap.add_argument("--max-kana-translated", type=float, default=0.10,
                     help="翻译模式下输出假名占比上限（超过即判未生效）")
     ap.add_argument("--min-kana-transcribed", type=float, default=0.15,
                     help="转写模式下输出假名占比下限（低于即判可能遗忘）")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
+
+    if not args.silence_only and not args.eval:
+        ap.error("需要 --eval（或改用 --silence-only）")
+    if args.silence_only and args.silence_secs <= 0:
+        ap.error("--silence-only 需要 --silence-secs > 0")
 
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -109,12 +116,13 @@ def main() -> int:
         log(f"已挂载 LoRA 适配器到 {type(target).__name__}: {args.adapter}")
 
     rows = []
-    for line in Path(args.eval).read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            rows.append(json.loads(line))
-    if not rows:
-        log("评测集为空")
-        return 1
+    if not args.silence_only:
+        for line in Path(args.eval).read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+        if not rows:
+            log("评测集为空")
+            return 1
 
     # 按 prompt 是否为空分成两组：翻译组 / 转写组
     translated = [r for r in rows if r.get("prompt")][: args.limit]
@@ -158,24 +166,36 @@ def main() -> int:
             "translated_avg_kana": avg(tr_out, "kana"),
             "translated_avg_cjk": avg(tr_out, "cjk"),
             "transcribed_avg_kana": avg(asr_out, "kana"),
+            # 转写模式里「整条泄漏成译文（假名<5%）」的样本数——均值达标也可能掩盖
+            # 个别样本被翻译任务吸走（实测 20 条里出现过 1 条），单列出来供观察。
+            "transcribed_leak_count": sum(1 for i in asr_out if i["kana"] < 0.05),
         },
         "checks": {},
     }
 
-    # ---- 静音行为 ----
+    # ---- 静音行为（两种模式都要测：带 prompt 的翻译模式 + 不带的转写模式） ----
+    # 主程序的逐句质检依赖「静音 -> language None + 空文本」；上一轮 real-mini 实测
+    # 微调后静音输出中文幻觉，所以这里双模式检查，且 finetune.yml 会先跑一次
+    # --silence-only 的基座诊断做归因（区分「训坏」与「transformers 路径本来就如此」）。
     if args.silence_secs > 0:
         silence = np.zeros(int(16000 * args.silence_secs), dtype=np.float32)
-        try:
-            res = wrapper.transcribe(audio=(silence, 16000), context=args.prompt)
-            text = (res[0].text if res else "") or ""
-            lang = (res[0].language if res else "") or ""
-            report["silence"] = {"text": text, "lang_tag": lang}
-            report["checks"]["silence_is_empty"] = len(text.strip()) <= 2
-            log(f"静音输出: lang={lang!r} text={text!r} -> "
-                f"{'OK' if report['checks']['silence_is_empty'] else '非空（需注意）'}")
-        except Exception as e:  # noqa: BLE001
-            report["silence"] = {"error": f"{type(e).__name__}: {e}"}
-            log(f"静音测试失败: {e}")
+        sil_report: dict = {}
+        for mode, ctx in (("translate_mode", args.prompt), ("transcribe_mode", "")):
+            try:
+                res = wrapper.transcribe(audio=(silence, 16000), context=ctx)
+                text = (res[0].text if res else "") or ""
+                lang = (res[0].language if res else "") or ""
+                sil_report[mode] = {"text": text, "lang_tag": lang, "context": ctx}
+                log(f"静音[{mode}] context={ctx!r} -> lang={lang!r} text={text!r}")
+            except Exception as e:  # noqa: BLE001
+                sil_report[mode] = {"error": f"{type(e).__name__}: {e}", "context": ctx}
+                log(f"静音[{mode}] 测试失败: {e}")
+        report["silence"] = sil_report
+        report["checks"]["silence_is_empty"] = all(
+            "error" not in v and len((v.get("text") or "").strip()) <= 2
+            for v in sil_report.values()
+        )
+        log(f"静音检查: {'OK（双模式均空）' if report['checks']['silence_is_empty'] else '非空/出错（需注意）'}")
 
     m = report["metrics"]
     if m["translated_avg_kana"] is not None:

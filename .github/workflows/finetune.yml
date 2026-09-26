@@ -82,11 +82,12 @@ jobs:
                   '| peft', peft.__version__, '| qwen-asr', md.version('qwen-asr')); \
             print('Qwen3ASRModel:', qwen_asr.Qwen3ASRModel)"
 
-      - name: 构造数据（FLEURS ja_jp + stub 伪翻译）
+      - name: 构造数据（FLEURS ja_jp + stub 伪翻译 + 静音样本）
         run: |
           python finetune/prepare_data.py \
             --source fleurs --limit 4 --eval-limit 2 \
             --max-audio-secs 12 --translator stub --asr-ratio 0.5 \
+            --silence-samples 2 \
             --audio-dir data/audio --out data/train.jsonl --eval-out data/eval.jsonl
           echo "--- train.jsonl（首行，audio 路径已截断）---"
           python -c "import json;l=open('data/train.jsonl',encoding='utf-8').readline();d=json.loads(l);d['audio']='...'+d['audio'][-24:];print(json.dumps(d,ensure_ascii=False,indent=2))"
@@ -136,15 +137,18 @@ jobs:
               fails.append('LoRA 可训练参数为 0（适配器没挂上）')
           if not ev.get('translated_samples') and not ev.get('transcribed_samples'):
               fails.append('评测没有任何输出样本')
-          if 'silence' in ev and ev['silence'].get('error'):
-              fails.append(f"静音推理报错: {ev['silence']['error']}")
+          sil = ev.get('silence') or {}
+          sil_errs = [f"{k}: {v['error']}" for k, v in sil.items()
+                      if isinstance(v, dict) and v.get('error')]
+          if sil_errs:
+              fails.append(f"静音推理报错: {sil_errs}")
           print('=== 管线冒烟结论 ===')
           print(f"  final_loss        = {loss}")
           print(f"  可训练参数(M)     = {rep.get('trainable_params_m')}")
           print(f"  训练耗时(s)       = {rep.get('train_seconds')}")
           print(f"  翻译组输出假名占比 = {ev['metrics']['translated_avg_kana']}")
           print(f"  转写组输出假名占比 = {ev['metrics']['transcribed_avg_kana']}")
-          print(f"  静音输出          = {ev.get('silence')}")
+          print(f"  静音输出          = {json.dumps(ev.get('silence'), ensure_ascii=False)}")
           print('注意：本轮用 stub 伪翻译 + CPU + 2 步，翻译质量指标不达标是预期行为，')
           print('      本判定只检查"管线是否跑通"。质量验证请用 gpu-train 模式。')
           if fails:
@@ -203,27 +207,37 @@ jobs:
           echo "对照表行数: $(grep -cv '^#' finetune/parallel_ja_zh.tsv)"
           head -3 finetune/parallel_ja_zh.tsv
 
-      - name: 构造数据（table 翻译，未命中即跳过）
+      - name: 构造数据（table 翻译，未命中即跳过；混入静音样本）
         run: |
           # --limit/--eval-limit 必须落在对照表覆盖范围内（表覆盖 FLEURS 流式顺序的前 120 条），
           # 否则评测集会因未命中而被全部跳过。100 训练 + 20 评测：
           #   asr-ratio 0.3 => 约 70 条"带 prompt 的翻译样本" + 30 条"无 prompt 的转写样本"（抗遗忘锚点）
+          # --silence-samples 20 => 合成静音/低噪样本（目标 language None+空文本，双模式各半），
+          #   保住「静音->空输出」行为——上一轮 real-mini（run 36221464174）翻译/抗遗忘都达标，
+          #   唯独静音被训坏（输出中文幻觉），而逐句质检依赖它剔除噪音段。
           python finetune/prepare_data.py \
             --source fleurs --limit 100 --eval-limit 20 --max-audio-secs 15 \
             --translator table --table finetune/parallel_ja_zh.tsv --skip-untranslated \
-            --asr-ratio 0.3 --audio-dir data/audio \
+            --asr-ratio 0.3 --silence-samples 20 \
+            --audio-dir data/audio \
             --out data/train.jsonl --eval-out data/eval.jsonl \
             --dump-transcripts data/transcripts.txt
           echo "训练集 $(wc -l < data/train.jsonl) 条 / 评测集 $(wc -l < data/eval.jsonl) 条"
           python - <<'PY'
           import json, pathlib
           rows = [json.loads(l) for l in pathlib.Path('data/train.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()]
-          mt = [r for r in rows if r['prompt']]
-          print(f'  其中带 prompt（翻译任务）{len(mt)} 条，无 prompt（转写任务）{len(rows)-len(mt)} 条')
+          sil  = [r for r in rows if r['text'].startswith('language None')]
+          real = [r for r in rows if not r['text'].startswith('language None')]
+          mt   = [r for r in real if r['prompt']]
+          asr  = [r for r in real if not r['prompt']]
+          print(f'  翻译 {len(mt)} 条 / 转写 {len(asr)} 条 / 静音 {len(sil)} 条'
+                f'（静音中带 prompt {len([r for r in sil if r["prompt"]])} 条）')
           for r in mt[:3]:
               print('   例:', r['text'][:80])
           if not mt:
               raise SystemExit('没有翻译样本，无法验证 S2TT')
+          if not sil:
+              raise SystemExit('没有静音样本（--silence-samples 未生效？）')
           PY
           wc -l data/train.jsonl data/eval.jsonl
 
@@ -234,7 +248,8 @@ jobs:
             --out out/real --device cpu --lora --lora-r 32 --lora-alpha 64 \
             --epochs 4 --max-steps -1 --batch-size 1 --grad-acc 2 \
             --lr 3e-4 --log-steps 10
-          # 100 样本 / (1×2) × 4 epoch ≈ 200 个优化步；CPU 实测约 5 秒/步 => 约 20 分钟
+          # 120 样本（100 真实 + 20 静音）/ (1×2) × 4 epoch = 240 个优化步；
+          # CPU 实测约 5.8 秒/步 => 约 23 分钟（上一轮 200 步实测 19.3 分钟）
 
       - name: 评测（真实数据：翻译是否生效 / 是否遗忘 / 静音行为）
         run: |
@@ -243,29 +258,64 @@ jobs:
             --eval data/eval.jsonl --limit 20 --device cpu --silence-secs 2 \
             --out out/real/eval_report.json
 
+      - name: 基座模型静音诊断（归因用，不挂适配器）
+        run: |
+          # 判定静音检查前先归因：基座模型在 transformers+float32 路径下对 2s 纯数字静音
+          # 是否本来就输出空。若基座也非空，静音问题就不是微调造成的（判定里只警示不判红）。
+          python finetune/eval_s2tt.py \
+            --model "${{ inputs.model }}" --silence-only \
+            --device cpu --silence-secs 2 \
+            --out out/real/base_silence.json
+
       - name: 判定
         run: |
           python - <<'PY'
           import json, pathlib
           ev = json.loads(pathlib.Path('out/real/eval_report.json').read_text(encoding='utf-8'))
           tr = json.loads(pathlib.Path('out/real/train_report.json').read_text(encoding='utf-8'))
+          bp = pathlib.Path('out/real/base_silence.json')
+          base = json.loads(bp.read_text(encoding='utf-8')) if bp.is_file() else None
           m, c = ev['metrics'], ev['checks']
           print('=== 真实微调结论 ===')
           print(f"  训练样本 {tr['train_samples']} 条 / loss {tr['final_loss']:.4f} / {tr['train_seconds']:.0f}s")
           print(f"  带 prompt（翻译模式）输出假名占比 = {m['translated_avg_kana']}")
-          print(f"  不带 prompt（转写模式）输出假名占比 = {m['transcribed_avg_kana']}")
-          print(f"  静音输出 = {ev.get('silence')}")
+          print(f"  不带 prompt（转写模式）输出假名占比 = {m['transcribed_avg_kana']}"
+                f"（整条泄漏 {m.get('transcribed_leak_count')} / 20）")
+          print(f"  静音输出（适配器） = {json.dumps(ev.get('silence'), ensure_ascii=False)}")
+          if base is not None:
+              print(f"  静音输出（基座）   = {json.dumps(base.get('silence'), ensure_ascii=False)}")
           for s in ev['translated_samples'][:5]:
               print(f"    [翻译] {s['out'][:60]}")
           for s in ev['transcribed_samples'][:3]:
               print(f"    [转写] {s['out'][:60]}")
           for k, v in c.items():
               print(f"  {'✔' if v else '✘'} {k}")
-          # 真实数据下，翻译生效是硬性要求（stub 冒烟时才放宽）
+          # README 判定标准：三项必须同时成立（上一轮只强制了翻译生效，静音 ✘ 仍判绿，收敛掉）
+          fails = []
           if not c.get('translation_takes_effect'):
-              raise SystemExit('翻译未生效：带 prompt 时输出仍以日语为主。'
-                               '需要更多样本/更多步数/更大 LoRA 秩，或改用 GPU 全参微调。')
-          print('✔ 结论：context 作为任务开关可行，微调后 ASR 能直接输出中文')
+              fails.append('翻译未生效：带 prompt 时输出仍以日语为主。'
+                           '需要更多样本/更多步数/更大 LoRA 秩，或改用 GPU 全参微调。')
+          if not c.get('no_catastrophic_forgetting'):
+              fails.append('灾难性遗忘：不带 prompt 时输出不再以日语为主。'
+                           '提高 --asr-ratio 或减少训练步数。')
+          base_ok = bool(base and base.get('checks', {}).get('silence_is_empty'))
+          if c.get('silence_is_empty') is False:
+              if base_ok:
+                  fails.append('静音行为被训坏（基座静音输出为空、挂适配器后幻觉）：'
+                               '增大 --silence-samples、降低学习率或减少 epoch。')
+              else:
+                  print('⚠ 基座模型在 transformers 路径下对纯数字静音也非空——'
+                        '静音异常不归因于本次微调，仅作参考（产品路径 sherpa-onnx 的行为需另行验证）。')
+          if fails:
+              for f in fails:
+                  print('✘', f)
+              raise SystemExit(1)
+          if c.get('silence_is_empty') is False:
+              print('✔ 结论：翻译生效 / 未遗忘 两项通过；静音行为与基座一致（不归因于本次微调），'
+                    'context 可作为任务开关')
+          else:
+              print('✔ 结论：三项判定全部通过——翻译生效 / 未遗忘 / 静音行为保留，'
+                    'context 可作为任务开关，微调后 ASR 能直接输出中文')
           PY
 
       - name: 上传适配器与报告
@@ -277,6 +327,7 @@ jobs:
             out/real/lora
             out/real/train_report.json
             out/real/eval_report.json
+            out/real/base_silence.json
             data/train.jsonl
             data/eval.jsonl
           if-no-files-found: warn
