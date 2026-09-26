@@ -197,12 +197,25 @@ qwen3-asr-1.7B-int8`），导出器与 k2-fsa 官方包不同——命名可能�
   微调权重兑现，E2 验证）；CPU Q8 推理 RTF ≈0.36、模型加载 ~1.2s，快于
   sherpa int8（RTF <0.6）。注意：llama-server 返回**原始格式**
   `language X<asr_text>正文`，Rust 集成时自行解析（`language None`→空，同产品语义）；
-* ⏳ **E2**（`mode=gguf-e2`）：1.7B 适配器合并回 HF（`merge_lora_hf.py`，peft
-  merge_and_unload，音频塔 LoRA 天然随 mmproj 带出）→ 官方转换器
-  （`conversion/qwen3vl.py` 注册了 Qwen3ASR 的 TEXT+MMPROJ 双类）→ LM f16→Q4_K_M、
-  mmproj 直出 q8_0 → llama-server 断言**直出中文**（--expect cjk）+ 静音空输出 +
-  转写对照仍日语；同时给出单文件体积账；
-* 待做 **E3**：Rust FFI 集成（llama-cpp-2 无 mtmd 绑定，手写薄 FFI ~12 个函数或
-  vendor libmtmd）+ **移除双模型工作流**（LLM 四段下线）+ 单 exe 打包（模型嵌入
-  或同包，体积断言 ≤2GiB）+ VAD 归属（silero 现依赖 sherpa-onnx：候选为保留极小
-  ORT 仅跑 VAD，或 Rust 侧 silero 实现）。
+* ✅ **E2**（run 36266741946，全链路 4.9 分钟）：1.7B 适配器 `merge_lora_hf.py`
+  合并回 HF（peft merge_and_unload，音频塔 LoRA 天然随 mmproj 带出，**无任何张量
+  映射问题**）→ 官方转换器（`conversion/qwen3vl.py` 的 TEXT+MMPROJ 双类）→
+  LM f16→**Q4_K_M 1.03GiB** + mmproj q8_0 0.33GiB → llama-server b11201 实测：
+  带 context 直出中文（7.2s 音频 4.1s，**RTF 0.57**，假名 0%/汉字 84%，译文
+  「我家的中学是便当制，如果没带的话，就买50日元的学校售卖面包。」）；
+  不带 context 仍日语转写（任务开关保住）；**静音双模式 `language None`+空**
+  （该行为穿越了 合并→转换→Q4_K_M 量化 全链路）。
+  **单文件体积账：1.36 GiB 模型 + exe/DLL ≈ 1.5 GiB ≤ 2 GiB ✔**；
+* 待做 **E3**（产品手术，用户已拍板「移除双模型工作流」）：
+  1. Rust 集成：llama-cpp-2 无 mtmd 绑定 → 对 libmtmd 手写薄 FFI（mtmd_init_from_file /
+     mtmd_bitmap / mtmd_input_chunks / mtmd_helper_eval_chunks 等 ~12 个函数），
+     新 asr 后端实现与现有 sherpa 后端同款接口；解析原始输出 `language X<asr_text>正文`
+     （`language None`→空，语义与产品 QC 一致）；
+  2. 移除双模型工作流：LLM 四段（qc/summary/translate/review）与 GGUF-LLM 下载下线，
+     产品收敛为「媒体 → VAD → S2TT 直出 → 排版 → SRT」；
+  3. VAD 归属：silero 现经 sherpa-onnx——候选保留极小 ORT 仅跑 VAD（~35MB DLL），
+     或换 Rust 侧 silero 实现；
+  4. 硬件加速与内存：`-ngl 99` 全量上卡（CUDA/Vulkan 动态后端，产品已有同款 DLL
+     发现机制），ggml 权重迁移显存后释放主机副本；CPU 兜底；
+  5. 单文件打包：v1 = 单 zip（exe+DLL+GGUF ≈1.5GiB，体积断言 ≤2GiB）；
+     v2 可选 = GGUF include_bytes! 嵌入 exe + 首启解压缓存（真·单执行文件）。
