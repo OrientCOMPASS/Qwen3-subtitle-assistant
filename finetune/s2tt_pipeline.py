@@ -274,6 +274,9 @@ def main() -> int:
     ap.add_argument("--max-line-width", type=int, default=44)
     ap.add_argument("--max-cue-secs", type=float, default=15.0)
     ap.add_argument("--limit-segments", type=int, default=0, help=">0 时只处理前 N 段（调试）")
+    ap.add_argument("--min-keep-secs", type=float, default=2.0,
+                    help="lang=None 但带文本的段：时长 >= 此值且字数达标才保留（见下）")
+    ap.add_argument("--min-keep-chars", type=int, default=4)
     args = ap.parse_args()
 
     for stream in (sys.stdout, sys.stderr):
@@ -295,6 +298,7 @@ def main() -> int:
 
     cues: List[Tuple[float, float, str]] = []
     dropped: List[dict] = []
+    kept_lang_none = 0
     t_inf = 0.0
     for i, (st, en) in enumerate(segs):
         seg = audio[int(st * 16000): int(en * 16000)]
@@ -303,15 +307,25 @@ def main() -> int:
         t_inf += time.time() - t0
         text = ((res[0].text if res else "") or "").strip()
         lang = ((res[0].language if res else "") or "").strip()
-        # 「language None + 空文本」= 无语音/噪音段 -> 丢弃（微调时专门保住的行为，
-        # 替代产品管线的 LLM 逐句质检）
-        if not text or not lang:
+        # 丢弃策略（替代产品管线的 LLM 逐句质检）：
+        #   * 空文本 -> 丢弃（微调时专门保住的「静音 -> language None + 空」行为）；
+        #   * lang=None 但带文本 -> 按时长/字数分流：实测（run 36244259286/36245047648）
+        #     这类输出在 <1.2s 碎片段上是半幻觉垃圾（"今天"、"请 everyone"、""人间""），
+        #     在长段上却是真实语音（4.6s 的结尾致辞"很开心，谢谢你的成长。"被整句丢掉）。
+        #     故 >= min-keep-secs 且 >= min-keep-chars 保留，否则丢弃；
+        #   * 正常 lang + 文本 -> 保留。
+        if not text or (not lang and ((en - st) < args.min_keep_secs
+                                      or len(text) < args.min_keep_chars)):
             dropped.append({"start": round(st, 2), "end": round(en, 2),
                             "lang": lang, "text": text[:30]})
             log(f"  [{i+1:3d}/{len(segs)}] {st:7.2f}-{en:7.2f}s  丢弃（lang={lang!r} text={text[:20]!r}）")
             continue
+        if not lang:
+            kept_lang_none += 1
+            log(f"  [{i+1:3d}/{len(segs)}] {st:7.2f}-{en:7.2f}s  lang=None 但长段保留  {text[:40]}")
+        else:
+            log(f"  [{i+1:3d}/{len(segs)}] {st:7.2f}-{en:7.2f}s  lang={lang}  {text[:46]}")
         cues.append((st, en, text))
-        log(f"  [{i+1:3d}/{len(segs)}] {st:7.2f}-{en:7.2f}s  lang={lang}  {text[:46]}")
 
     n_final = write_srt(cues, Path(args.out), args.max_line_width, args.max_cue_secs)
     all_text = " ".join(t for _, _, t in cues)
@@ -324,6 +338,7 @@ def main() -> int:
         "audio_seconds": round(audio_secs, 1),
         "segments_total": len(segs),
         "segments_kept": len(cues),
+        "kept_lang_none": kept_lang_none,
         "segments_dropped": len(dropped),
         "drop_ratio": round(len(dropped) / max(1, len(segs)), 3),
         "cues_final": n_final,
