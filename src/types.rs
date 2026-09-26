@@ -21,22 +21,6 @@ impl SubtitleSegment {
 
     /// 紧凑序列化（喂给 LLM 用）：只带序号与文本。
     ///
-    /// 旧版把 `start_ms`/`end_ms` 也塞进 prompt 并要求模型原样回显，
-    /// 既浪费 token 又让解析对小模型的输出格式极其敏感；时间轴始终由
-    /// Rust 侧保留，模型只需要"第 i 条 -> 译文"。
-    pub fn compact_json_list(segments: &[SubtitleSegment]) -> String {
-        let items: Vec<String> = segments
-            .iter()
-            .map(|s| {
-                format!(
-                    "{{\"i\":{},\"t\":{}}}",
-                    s.index,
-                    serde_json::to_string(&s.text).unwrap_or_else(|_| "\"\"".into())
-                )
-            })
-            .collect();
-        format!("[{}]", items.join(","))
-    }
 }
 
 /// LLM 翻译批次的输出单元（`[{"i":1,"t":"译文"}, ...]`）。
@@ -246,13 +230,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn compact_json_escapes_and_keeps_only_i_t() {
-        let v = vec![seg(1, 0, 1000, "他说\"好\""), seg(2, 1000, 2000, "第二句")];
-        let j = SubtitleSegment::compact_json_list(&v);
-        assert_eq!(j, r#"[{"i":1,"t":"他说\"好\""},{"i":2,"t":"第二句"}]"#);
-        assert!(!j.contains("start_ms"));
-    }
 
     #[test]
     fn translate_item_accepts_aliases() {
