@@ -1,0 +1,207 @@
+# ============================================================================
+# S2TT 端到端实验：微调后的 Qwen3-ASR 直出中文字幕，全程无 LLM 后处理。
+#
+# 回答的问题：把 real-mini 微调出的 LoRA 适配器「融合」进主程序形态
+# （ffmpeg → VAD → ASR → 排版 → SRT），省掉 1.7B LLM 的质检/摘要/翻译/审校
+# 四段之后，真实日语视频的字幕质量还剩多少？
+#
+# 设计：
+#   * 不重新编译 Rust——用 finetune/s2tt_pipeline.py 在 PyTorch 运行时上复刻
+#     产品管线（同款 VAD 语义、同款折行/长 cue 拆分规则、language None 段丢弃
+#     替代 LLM 质检），CPU float32；
+#   * 实验组 = 适配器 + context="translate to Chinese"（直出中文）；
+#     对照组 = 同一适配器不带 context（应仍出日语）——在真实视频上验证任务开关；
+#   * 基线 = master 产品 CI（两段式：ASR→LLM）对同一视频的最终字幕，
+#     从 master 最新 e2e-results artifact 取，三方对照打印；
+#   * 媒体复用 master 建好的 bilibili 缓存（e2e-media-bilibili-v3），不重新下载；
+#   * 适配器复用 real-mini run 的 s2tt-real-mini artifact（默认 36238661344），
+#     不重新训练。
+#
+# 注：与 probe.yml 同理，GitHub 只索引「默认分支上存在」或「曾经运行过」的
+# workflow。首次落地借一次 push 触发完成注册，注册后撤掉 push 触发。
+# ============================================================================
+name: s2tt-e2e
+
+on:
+  push:
+    branches: [exp/asr-s2tt]   # 临时：仅为注册本 workflow（首次 push 触发一轮真实测试）
+  workflow_dispatch:
+    inputs:
+      bvid:
+        description: "测试视频 BV 号（须在媒体缓存里）"
+        type: string
+        default: "BV16r421g797"
+      adapter_run:
+        description: "s2tt-real-mini 适配器所在 run id"
+        type: string
+        default: "36238661344"
+      modes:
+        description: "translate=只跑直出中文；both=加跑不带 context 的日语对照"
+        type: choice
+        default: "both"
+        options: [both, translate, transcribe]
+      max_seconds:
+        description: "只处理视频前 N 秒（0 = 全部；CPU 上 3 分钟视频双模式约 20~30 分钟）"
+        type: string
+        default: "0"
+
+permissions:
+  contents: read
+  actions: read   # 跨 run 下载适配器与 master e2e 产物需要
+
+concurrency:
+  group: s2tt-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  # push 事件下 inputs 为空，用 || 兜住默认值
+  BVID: ${{ inputs.bvid || 'BV16r421g797' }}
+  ADAPTER_RUN: ${{ inputs.adapter_run || '36238661344' }}
+  MODES: ${{ inputs.modes || 'both' }}
+  MAX_SECS: ${{ inputs.max_seconds || '0' }}
+
+jobs:
+  e2e:
+    name: S2TT 直出字幕（无 LLM 后处理）
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace 模型（与 finetune.yml 同 key，命中免下载）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-0.6B-v1
+
+      - name: 安装依赖（CPU torch + qwen-asr + peft + silero-vad）
+        run: |
+          set -e
+          pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet qwen-asr peft soundfile librosa "silero-vad>=5.1,<7"
+          python -c "import torch, silero_vad, importlib.metadata as md; \
+            print('torch', torch.__version__, '| silero-vad', md.version('silero-vad'), \
+                  '| qwen-asr', md.version('qwen-asr'))"
+          ffmpeg -version | head -1
+
+      - name: 下载 LoRA 适配器（来自 real-mini run）
+        uses: actions/download-artifact@v4
+        with:
+          name: s2tt-real-mini
+          run-id: ${{ env.ADAPTER_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: art
+
+      - name: 校验适配器
+        run: |
+          ls -la art/out/real/lora/
+          test -f art/out/real/lora/adapter_model.safetensors || \
+            test -f art/out/real/lora/adapter_model.bin || \
+            { echo "::error::适配器权重缺失"; exit 1; }
+
+      - name: 取 master 最新带 e2e-results 的 run（两段式管线基线）
+        id: find-master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GITHUB_TOKEN"]; repo = os.environ["GITHUB_REPOSITORY"]
+          def api(u):
+              r = urllib.request.Request(u)
+              r.add_header("Authorization", f"Bearer {tok}")
+              r.add_header("Accept", "application/vnd.github+json")
+              return json.loads(urllib.request.urlopen(r, timeout=60).read())
+          runs = api(f"https://api.github.com/repos/{repo}/actions/runs?branch=master&per_page=30")["workflow_runs"]
+          pick = None
+          for run in runs:
+              arts = api(run["artifacts_url"] + "?per_page=30")["artifacts"]
+              if any(a["name"] == "e2e-results" for a in arts):
+                  pick = run; break
+          if pick:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"run-id={pick['id']}\n")
+              print("master e2e 基线 run:", pick["id"], pick["head_sha"][:8])
+          else:
+              print("::warning::找不到带 e2e-results 的 master run，跳过三方对照")
+          PY
+
+      - name: 下载 master 基线字幕
+        if: steps.find-master.outputs.run-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-results
+          run-id: ${{ steps.find-master.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: master_e2e
+
+      - name: 还原测试媒体缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: media-cache
+          key: e2e-media-bilibili-v3
+          fail-on-cache-miss: true
+
+      - name: 选定测试视频
+        run: |
+          set -e
+          mkdir -p media/out
+          echo "缓存内容:"; ls -la media-cache/
+          f=$(ls media-cache/ | grep "$BVID" | head -1 || true)
+          if [ -z "$f" ]; then echo "::error::缓存里没有 $BVID"; exit 1; fi
+          ext="${f##*.}"
+          cp "media-cache/$f" "media/test.$ext"
+          echo "MEDIA=media/test.$ext" >> "$GITHUB_ENV"
+          dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "media/test.$ext")
+          echo "视频: $f 时长 ${dur}s"
+
+      - name: 实验组：适配器 + context 直出中文（无 LLM）
+        if: env.MODES == 'both' || env.MODES == 'translate'
+        run: |
+          set -o pipefail
+          python finetune/s2tt_pipeline.py --media "$MEDIA" \
+            --adapter art/out/real/lora --context "translate to Chinese" \
+            --max-seconds "$MAX_SECS" \
+            --out media/out/translate.srt --stats media/out/translate.stats.json \
+            2>&1 | tee media/out/translate.log
+
+      - name: 对照组：同一适配器不带 context（应仍出日语）
+        if: env.MODES == 'both' || env.MODES == 'transcribe'
+        run: |
+          set -o pipefail
+          python finetune/s2tt_pipeline.py --media "$MEDIA" \
+            --adapter art/out/real/lora --context "" \
+            --max-seconds "$MAX_SECS" \
+            --out media/out/transcribe.srt --stats media/out/transcribe.stats.json \
+            2>&1 | tee media/out/transcribe.log
+
+      - name: 判定 + 三方对照报告
+        run: |
+          set -o pipefail
+          python scripts/s2tt_e2e_report.py \
+            --bvid "$BVID" --modes "$MODES" \
+            --out-dir media/out --master-dir master_e2e \
+            2>&1 | tee verdict-report.txt
+
+      - name: 上传实验产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-e2e-results
+          path: |
+            media/out/*.srt
+            media/out/*.json
+            media/out/*.log
+            verdict-report.txt
+          if-no-files-found: warn
+          retention-days: 30
