@@ -242,7 +242,12 @@ def main() -> int:
     log(f"训练样本 {len(ds)} 条")
 
     eval_ds = None
-    if args.eval and Path(args.eval).is_file():
+    eval_path = Path(args.eval) if args.eval else None
+    # 空文件会让 datasets 抛 ValueError: Instruction "train" corresponds to no data!
+    has_eval = bool(eval_path and eval_path.is_file() and eval_path.read_text(encoding="utf-8").strip())
+    if eval_path and not has_eval:
+        log(f"评测集为空或不存在（{eval_path}），跳过评估")
+    if has_eval:
         eval_ds = load_dataset("json", data_files=args.eval, split="train")
         if args.max_samples and len(eval_ds) > args.max_samples:
             eval_ds = eval_ds.select(range(args.max_samples))

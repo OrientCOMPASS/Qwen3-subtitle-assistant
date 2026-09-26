@@ -101,7 +101,8 @@ jobs:
           python finetune/prepare_data.py \
             --source fleurs --limit 300 --eval-limit 0 --max-audio-secs 15 \
             --translator none --asr-ratio 1.0 \
-            --audio-dir data/audio --out data/dump_only.jsonl \
+            --audio-dir data/audio_dump --out data/dump_only.jsonl \
+            --eval-out data/dump_eval.jsonl \
             --dump-transcripts data/transcripts.txt
           wc -l data/transcripts.txt
           head -5 data/transcripts.txt
@@ -205,21 +206,36 @@ jobs:
 
       - name: 构造数据（table 翻译，未命中即跳过）
         run: |
+          # --limit/--eval-limit 必须落在对照表覆盖范围内（表覆盖 FLEURS 流式顺序的前 120 条），
+          # 否则评测集会因未命中而被全部跳过。100 训练 + 20 评测：
+          #   asr-ratio 0.3 => 约 70 条"带 prompt 的翻译样本" + 30 条"无 prompt 的转写样本"（抗遗忘锚点）
           python finetune/prepare_data.py \
-            --source fleurs --limit ${{ inputs.samples }} --eval-limit 20 --max-audio-secs 15 \
+            --source fleurs --limit 100 --eval-limit 20 --max-audio-secs 15 \
             --translator table --table finetune/parallel_ja_zh.tsv --skip-untranslated \
-            --asr-ratio 0.35 --audio-dir data/audio \
+            --asr-ratio 0.3 --audio-dir data/audio \
             --out data/train.jsonl --eval-out data/eval.jsonl \
             --dump-transcripts data/transcripts.txt
+          echo "训练集 $(wc -l < data/train.jsonl) 条 / 评测集 $(wc -l < data/eval.jsonl) 条"
+          python - <<'PY'
+          import json, pathlib
+          rows = [json.loads(l) for l in pathlib.Path('data/train.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()]
+          mt = [r for r in rows if r['prompt']]
+          print(f'  其中带 prompt（翻译任务）{len(mt)} 条，无 prompt（转写任务）{len(rows)-len(mt)} 条')
+          for r in mt[:3]:
+              print('   例:', r['text'][:80])
+          if not mt:
+              raise SystemExit('没有翻译样本，无法验证 S2TT')
+          PY
           wc -l data/train.jsonl data/eval.jsonl
 
       - name: LoRA 微调（CPU）
         run: |
           python finetune/sft_lora.py \
             --model "${{ inputs.model }}" --train data/train.jsonl --eval data/eval.jsonl \
-            --out out/real --device cpu --lora --lora-r 16 --lora-alpha 32 \
-            --epochs 2 --max-steps ${{ inputs.steps }} --batch-size 1 --grad-acc 2 \
-            --lr 2e-4 --log-steps 10 --grad-ckpt
+            --out out/real --device cpu --lora --lora-r 32 --lora-alpha 64 \
+            --epochs 4 --max-steps -1 --batch-size 1 --grad-acc 2 \
+            --lr 3e-4 --log-steps 10
+          # 100 样本 / (1×2) × 4 epoch ≈ 200 个优化步；CPU 实测约 5 秒/步 => 约 20 分钟
 
       - name: 评测（真实数据：翻译是否生效 / 是否遗忘 / 静音行为）
         run: |
