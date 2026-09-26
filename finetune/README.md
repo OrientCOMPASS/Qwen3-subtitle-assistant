@@ -149,3 +149,15 @@ CI 里对应 `gpu-train` job，需要一个带 `self-hosted` + `gpu` 标签的 r
   不确定性最高的部分——所以先用 transformers 路线验证效果，别一上来就啃导出。
 * `qwen-asr` 锁 `transformers==4.57.6`、`accelerate==1.12.0`；装 vLLM 后端要额外
   `pip install "qwen-asr[vllm]"`（会拉 vllm==0.14.0）。
+
+## 5. 本分支的 CI（已精简）
+
+实验分支不承载产品回归，push 到本分支**不触发任何 workflow**：
+
+| workflow | 触发 | 干什么 | 耗时 |
+|---|---|---|---|
+| `probe.yml` | 仅手动 | **T4**：不做微调，只把指令塞进 ASR 的 system 段（`--asr-hotwords`），看能否直出中文；可选用官方 bf16 实现交叉验证，把"量化丢能力"和"context 通道本就不能翻译"区分开 | ~12 min（可选交叉验证 +5 min） |
+| `finetune.yml` | 仅手动 | 微调实验：`cpu-smoke`（stub 冒烟）/ `real-mini`（CPU 真实微调）/ `gpu-train`（GPU 训练） | 8–70 min |
+
+产品回归（构建 / 单测 / 迁移目录 / 摘要分块 / 真实视频全流程）在 master 的 `ci.yml`。
+本分支合并回 master 时会带上那套 CI。
