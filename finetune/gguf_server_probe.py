@@ -177,8 +177,8 @@ def main() -> int:
             lang = res.get("lang_tag", "")
             ok = (not res["ok"]) or (len(body) <= 2 or lang.lower() == "none")
             report["runs"][tag] = {**res, "parsed_body": body, "parsed_lang": lang, "empty_ok": bool(ok)}
-            log(f"[{tag}] ok={res['ok']} raw={text[:60]!r} -> body={body[:30]!r} lang={lang!r} "
-                f"{'✔ 空/None' if ok else '✘ 非空'}")
+            log(f"[{tag}] ok={res['ok']} raw={res.get('text', '')[:60]!r} "
+                f"-> body={body[:30]!r} lang={lang!r} {'✔ 空/None' if ok else '✘ 非空'}")
             if not ok:
                 fails.append(f"{tag}: 静音输出非空（{body[:30]!r}）")
         sil_path.unlink(missing_ok=True)
