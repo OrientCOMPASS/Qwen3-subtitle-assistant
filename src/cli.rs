@@ -92,15 +92,21 @@ pub struct Args {
     #[arg(long, default_value = "")]
     pub asr_hotwords: String,
 
-    /// Qwen3-ASR 单段最多生成的 token 数（默认 128 偏小，长语音段会被截断）
-    #[arg(long, default_value_t = 256)]
+    /// Qwen3-ASR 单段最多生成的 token 数。
+    /// 注意它与 --asr-max-total-len、--vad-buffer-secs 是**联动的**：
+    /// 音频 token 率 12.5Hz，512 的总预算要分给 prompt + 音频 + 生成，
+    /// 每加大 128 个生成 token，可处理的语音段就缩短约 10 秒。
+    #[arg(long, default_value_t = 128)]
     pub asr_max_new_tokens: i32,
 
-    /// Qwen3-ASR 的最大总序列长度（音频 token + 文本 token）
-    #[arg(long, default_value_t = 1024)]
+    /// Qwen3-ASR 的最大总序列长度（prompt + 音频 token + 生成 token）。
+    /// **传大于导出模型 KV 容量的值没有意义**：sherpa-onnx 会静默 clamp 到模型上限
+    /// （现有 ONNX 导出均为 512），需要更长音频得重新导出 decoder。
+    #[arg(long, default_value_t = 512)]
     pub asr_max_total_len: i32,
 
-    /// Silero VAD 缓冲区秒数（也是单条语音段的长度上限）
+    /// Silero VAD 缓冲区秒数（单条语音段长度上限）。
+    /// 超过模型单段音频上限时会自动收敛并 warn（上限由上面两个参数反推）。
     #[arg(long, default_value_t = 60.0)]
     pub vad_buffer_secs: f32,
 

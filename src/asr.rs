@@ -49,6 +49,28 @@ pub struct AsrEngine {
 /// Silero VAD 每帧采样点数（16kHz 下 32ms）
 const VAD_WINDOW: usize = 512;
 
+/// AuT 编码器的音频 token 率：论文 §2.1 说明它对 128 维 Fbank 做 8 倍下采样，
+/// 得到 **12.5 Hz** 的音频 token（即 1 秒语音 = 12.5 个 token）。
+const AUDIO_TOKEN_RATE: f32 = 12.5;
+
+/// system 段（chat 模板 + hotwords/context）大致占用的 token 数。
+const PROMPT_TOKEN_RESERVE: i32 = 48;
+
+/// 导出模型的 KV cache 容量（token）。
+///
+/// 这是**导出时固定死的**：社区/官方 sherpa-onnx 导出的 Qwen3-ASR decoder
+/// KV cache 容量均为 512（见可行性报告第 6 节）。sherpa-onnx 运行时会把用户传入的
+/// max_total_len 静默 clamp 到模型上限（offline-recognizer-qwen3-asr-impl.cc:843-846），
+/// 所以传 1024 只是自欺欺人；真正决定"单段音频能有多长"的是下面这个预算分配：
+///
+///     max_total_len >= prompt(system 段) + 音频 token + 生成 token
+///
+/// 音频 token = 秒数 × 12.5，因此 max_new_tokens 每加大 128，可处理的语音就少约 10 秒。
+pub fn audio_budget_secs(max_total_len: i32, max_new_tokens: i32) -> f32 {
+    let budget = (max_total_len - PROMPT_TOKEN_RESERVE - max_new_tokens).max(32);
+    budget as f32 / AUDIO_TOKEN_RATE
+}
+
 impl AsrEngine {
     pub fn new(asr_model_dir: &Path, vad_model: &Path, opts: &AsrOptions) -> Result<Self> {
         anyhow::ensure!(
@@ -75,11 +97,31 @@ impl AsrEngine {
         vad_config.sample_rate = SAMPLE_RATE;
         vad_config.num_threads = 1;
 
-        let vad = VoiceActivityDetector::create(&vad_config, opts.vad_buffer_secs)
+        // VAD 段长上限不能超过模型能处理的音频长度，否则 sherpa-onnx 会直接报
+        // "The max_total_len (N) caps prompt + audio KV (model limit M)" 并中断该段。
+        let max_audio_secs = audio_budget_secs(opts.max_total_len, opts.max_new_tokens);
+        let vad_buffer = opts.vad_buffer_secs.min(max_audio_secs);
+        if vad_buffer < opts.vad_buffer_secs {
+            warn!(
+                "--vad-buffer-secs {}s 超过模型单段音频上限 {:.1}s（max_total_len={} - prompt预留{} - max_new_tokens={} = {} 个音频 token ÷ 12.5Hz），已收敛到 {:.1}s。\n\
+                 想放宽就调小 --asr-max-new-tokens；注意 max_total_len 传再大也会被 sherpa-onnx \
+                 clamp 到导出模型的 KV 容量（现有导出均为 512）。",
+                opts.vad_buffer_secs,
+                max_audio_secs,
+                opts.max_total_len,
+                PROMPT_TOKEN_RESERVE,
+                opts.max_new_tokens,
+                (opts.max_total_len - PROMPT_TOKEN_RESERVE - opts.max_new_tokens).max(32),
+                vad_buffer
+            );
+        }
+
+        let vad = VoiceActivityDetector::create(&vad_config, vad_buffer)
             .context("初始化 VAD 失败，请检查 silero_vad.onnx 路径")?;
         info!(
-            "VAD 就绪（buffer={}s, min_silence={}s）",
-            opts.vad_buffer_secs, opts.vad_min_silence
+            "VAD 就绪（buffer={:.1}s, min_silence={}s）；ASR 生成上限 max_new_tokens={}，\
+             max_total_len={} -> 单段音频最长约 {:.1}s",
+            vad_buffer, opts.vad_min_silence, opts.max_new_tokens, opts.max_total_len, max_audio_secs
         );
 
         // ---- 2. Qwen3-ASR 识别器 ----
@@ -309,6 +351,37 @@ impl AsrEngine {
             .get_result()
             .map(|r| r.text.trim().to_string())
             .filter(|t| !t.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_matches_the_512_token_export() {
+        // sherpa 默认：max_total_len=512, max_new_tokens=128
+        //   512 - 48(prompt) - 128 = 336 个音频 token ÷ 12.5Hz ≈ 26.9s
+        let s = audio_budget_secs(512, 128);
+        assert!((s - 26.88).abs() < 0.1, "{s}");
+        // 把生成上限翻倍，可用音频时长就少约 10 秒——这正是"提高 max_new_tokens 反而更糟"的原因
+        let s2 = audio_budget_secs(512, 256);
+        assert!((s2 - 16.64).abs() < 0.1, "{s2}");
+        assert!(s2 < s);
+    }
+
+    #[test]
+    fn budget_has_a_floor() {
+        // 参数配得再离谱也不能算出负数/0
+        assert!(audio_budget_secs(512, 100_000) > 0.0);
+        assert!(audio_budget_secs(0, 0) > 0.0);
+    }
+
+    #[test]
+    fn long_audio_needs_a_bigger_export() {
+        // 想处理 60 秒的连续语音段，512 的导出不可能做到：需要 (60*12.5+48+128)=926 token 的导出
+        assert!(audio_budget_secs(512, 128) < 60.0);
+        assert!(audio_budget_secs(1024, 128) > 60.0);
     }
 }
 

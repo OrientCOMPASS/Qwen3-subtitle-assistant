@@ -244,9 +244,9 @@ CPU 上 1.7B 约比 0.6B 慢 3 倍，建议配 CUDA 包使用。CI 里也可以�
 | **ASR / VAD** | | |
 | `--asr-threads N` | 4 | ASR CPU 线程数（仅 CPU provider 生效） |
 | `--asr-hotwords LIST` | 空 | Qwen3-ASR 偏置词（英文逗号分隔） |
-| `--asr-max-new-tokens N` | 256 | 单段最多生成 token（sherpa 默认 128 偏小） |
-| `--asr-max-total-len N` | 1024 | 最大总序列长度（sherpa 默认 512） |
-| `--vad-buffer-secs F` | 60 | VAD 缓冲区秒数（= 单段长度上限） |
+| `--asr-max-new-tokens N` | 128 | 单段最多生成 token |
+| `--asr-max-total-len N` | 512 | 最大总序列长度（prompt + 音频 + 生成）。**传大于导出模型 KV 容量的值无效**：sherpa-onnx 会静默 clamp 到模型上限（现有 ONNX 导出均为 512） |
+| `--vad-buffer-secs F` | 60 | VAD 缓冲区秒数（单段长度上限）；超过模型单段音频上限时自动收敛并 warn |
 | `--vad-min-silence F` | 0.5 | 判定语音结束所需的最短静音 |
 | **运行方式** | | |
 | `--from-srt` | 关 | 跳过 ASR，把输入当 SRT 直接翻译 |
@@ -254,6 +254,24 @@ CPU 上 1.7B 约比 0.6B 慢 3 倍，建议配 CUDA 包使用。CI 里也可以�
 | `--no-pause` | 关 | 失败退出时不等待回车 |
 
 依赖：系统 `PATH` 中需有 **FFmpeg / ffprobe**（音频解码用）。
+
+### ASR 单段音频有多长？（三个参数的联动关系）
+
+AuT 编码器对 Fbank 做 8 倍下采样，音频 token 率是 **12.5 Hz**（1 秒语音 = 12.5 token），
+而 sherpa-onnx 用的 ONNX 导出把 decoder 的 **KV cache 容量固定在 512 token**。这 512 要分给三方：
+
+```
+max_total_len(512)  >=  prompt(system 段 + chat 模板，约 48)  +  音频秒数 × 12.5  +  max_new_tokens
+```
+
+所以默认参数下单段音频最长约 `(512-48-128)/12.5 ≈ 26.9 秒`；把 `--asr-max-new-tokens`
+提到 256 反而会缩到约 16.6 秒。程序启动时会按这个公式算出上限，
+若 `--vad-buffer-secs` 超过它就自动收敛并打 warn（否则 sherpa-onnx 会直接报
+`The max_total_len (N) caps prompt + audio KV (model limit M)` 并中断该段）。
+需要处理更长的连续语音，得换一个 KV 容量更大的 decoder 导出。
+
+> 论文里说的"单次推理支持 20 分钟音频（Seq. Len. 1200s）"指的是 **PyTorch / vLLM 运行时**，
+> 不是这些 int8 ONNX 导出，别被这个数字误导。
 
 ---
 
