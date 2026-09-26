@@ -50,25 +50,56 @@ def log(msg: str) -> None:
 # --------------------------------------------------------------------------- 音频源
 
 def iter_fleurs(limit: int, max_secs: float):
-    """流式读取 FLEURS ja_jp，产出 (16k float32 数组, 转写文本)。"""
-    from datasets import load_dataset
+    """流式读取 FLEURS ja_jp，产出 (16k float32 数组, 转写文本)。
+
+    注意：**不要让 datasets 自己解码音频**——新版 datasets 的 Audio 特征解码依赖
+    torchcodec（缺了会抛 ImportError，且解释器退出时还会 segfault）。
+    这里用 cast_column(Audio(decode=False)) 拿原始字节，再用 soundfile 解码。
+    """
+    import io
+
+    import numpy as np
+    import soundfile as sf
+    from datasets import Audio, load_dataset
 
     ds = load_dataset("google/fleurs", "ja_jp", split="train", streaming=True)
+    try:
+        ds = ds.cast_column("audio", Audio(decode=False))
+        log("已切换为不解码音频（拿原始 bytes，自行用 soundfile 解码）")
+    except Exception as e:  # noqa: BLE001
+        log(f"cast_column(decode=False) 失败（{e}），按已解码数组处理")
+
     n = 0
     for row in ds:
         audio = row.get("audio") or {}
-        arr = audio.get("array")
-        sr = audio.get("sampling_rate") or 16000
         text = (row.get("transcription") or row.get("raw_transcription") or "").strip()
-        if arr is None or not text:
+        if not text:
             continue
+
+        arr = None
+        sr = 16000
+        raw = audio.get("bytes")
+        if raw:
+            try:
+                arr, sr = sf.read(io.BytesIO(raw), dtype="float32")
+            except Exception as e:  # noqa: BLE001
+                log(f"soundfile 解码失败，跳过该条: {e}")
+                continue
+        elif audio.get("array") is not None:
+            arr = np.asarray(audio["array"], dtype="float32")
+            sr = int(audio.get("sampling_rate") or 16000)
+        if arr is None or len(arr) == 0:
+            continue
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+
         secs = len(arr) / float(sr)
         if secs > max_secs or secs < 1.0:
             continue
         if sr != 16000:
-            import numpy as np
             import librosa
-            arr = librosa.resample(np.asarray(arr, dtype="float32"), orig_sr=sr, target_sr=16000)
+
+            arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
         yield arr, text
         n += 1
         if n >= limit:
