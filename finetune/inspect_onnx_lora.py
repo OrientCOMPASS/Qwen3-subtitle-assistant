@@ -69,7 +69,10 @@ def scan_quant_entries(model, fname: str) -> list[dict]:
 
     覆盖三种消费形态：
       DequantizeLinear(w, scale[, zp], axis=a) -> MatMul
-      MatMulInteger(A, B[, A_zp, B_zp])（scale 在图外，本探针记 flag）
+      MatMulInteger(A, B[, A_zp, B_zp]) -> int32 -> 图外 Mul 乘 scale
+        （k2-fsa 官方包实测就是这种：scale 不在节点输入里，但与权重按命名约定
+         `onnx::MatMul_N_quantized/_scale/_zero_point` 1:1:1 伴生，按名字关联；
+         B 侧 (K,N) 的 per-channel 语义沿 N，axis 默认 1）
       QLinearMatMul(a, a_s, a_zp, b, b_s, b_zp, ...)
     """
     init_names = {t.name for t in model.graph.initializer}
@@ -89,13 +92,21 @@ def scan_quant_entries(model, fname: str) -> list[dict]:
         elif node.op_type == "MatMulInteger":
             for pos in (0, 1):
                 if len(ins) > pos and ins[pos] in init_names:
-                    e = entries.setdefault(ins[pos], {"w": ins[pos], "file": fname,
-                                                      "node_idx": idx, "op": node.op_type})
+                    w = ins[pos]
+                    e = entries.setdefault(w, {"w": w, "file": fname,
+                                               "node_idx": idx, "op": node.op_type})
                     zpos = pos + 2
                     if len(ins) > zpos and ins[zpos]:
                         e["zp"] = ins[zpos]
                     if "scale" not in e:
-                        flags.append(f"{ins[pos]}: MatMulInteger 无内联 scale（在图外 Mul，需另找）")
+                        # 名字约定关联：*_quantized -> *_scale / *_zero_point
+                        base = w[: -len("_quantized")] if w.endswith("_quantized") else w
+                        for cand in (base + "_scale", w + "_scale", base + ".scale"):
+                            if cand in init_names:
+                                e["scale"] = cand
+                                break
+                        else:
+                            flags.append(f"{w}: MatMulInteger 且无同名约定 scale（需人工看图）")
         elif node.op_type == "QLinearMatMul":
             for tpos, spos, zpos in ((0, 1, 2), (3, 4, 5)):
                 if len(ins) > max(tpos, spos, zpos) and ins[tpos] in init_names:
@@ -104,6 +115,10 @@ def scan_quant_entries(model, fname: str) -> list[dict]:
                     e["scale"] = ins[spos]
                     if ins[zpos]:
                         e["zp"] = ins[zpos]
+    # MatMulInteger 无 axis 属性：B 侧 (K,N) per-channel 沿 N，默认 axis=1
+    for e in entries.values():
+        if e["op"] == "MatMulInteger" and "axis" not in e:
+            e["axis"] = 1
     return list(entries.values()), flags
 
 
