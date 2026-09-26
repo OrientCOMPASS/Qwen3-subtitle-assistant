@@ -262,6 +262,7 @@ fn process_with_qc(
         cfg.qc_retries,
         cfg.qc_min_similarity,
         cfg.qc_keep_min_chars,
+        cfg.sampling(),
     );
     let qc_max_tokens = cfg.qc_max_tokens;
 

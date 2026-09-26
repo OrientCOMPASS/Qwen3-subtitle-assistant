@@ -13,7 +13,7 @@
 //!    每次都 warn 并计数，收尾打印统计（CI 可据此断言）。
 
 use crate::config::Config;
-use crate::llm::{parse_json, LlmSession};
+use crate::llm::{parse_json, LlmSession, Sampling};
 use crate::prompt::PromptStore;
 use crate::qc::char_similarity;
 use crate::srt::format_timestamp;
@@ -34,11 +34,14 @@ const TEMPLATE_MARGIN: usize = 512;
 const SUMMARY_MAX_NEW: u32 = 2048;
 /// 译文与原文相似度高于此值即视为"照抄没翻译"。
 const COPY_THRESHOLD: f32 = 0.90;
+/// 短于此字符数的片段不做照抄判定（汉字词在中日间常常同形）。
+const COPY_MIN_CHARS: usize = 8;
 
 pub struct Translator<'a, 'b> {
     session: &'a mut LlmSession<'b>,
     prompts: &'a PromptStore,
     cfg: &'a Config,
+    sampling: Sampling,
     stats: TranslateStats,
 }
 
@@ -48,6 +51,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             session,
             prompts,
             cfg,
+            sampling: cfg.sampling(),
             stats: TranslateStats::default(),
         }
     }
@@ -198,6 +202,9 @@ impl<'a, 'b> Translator<'a, 'b> {
                     seg.text.clone()
                 });
 
+            if looks_copied(&seg.text, &text) {
+                self.stats.copied += 1;
+            }
             let translated_seg = SubtitleSegment {
                 text,
                 ..seg.clone()
@@ -337,12 +344,12 @@ impl<'a, 'b> Translator<'a, 'b> {
         let mut last_err = anyhow::anyhow!("未执行");
         let mut attempt_prompt = prompt.clone();
         for attempt in 1..=attempts {
-            let temp = if attempt == 1 {
-                self.cfg.temperature.min(0.3)
-            } else {
-                0.0
-            };
-            match self.session.chat(SYSTEM_PROMPT, &attempt_prompt, temp, max_new) {
+            match self.session.chat(
+                SYSTEM_PROMPT,
+                &attempt_prompt,
+                self.sampling.resample(attempt),
+                max_new,
+            ) {
                 Ok(raw) => match parse_json::<GlobalContext>(&raw, false) {
                     // 关键校验：字段全是 serde(default)，一个 {} 也能"解析成功"。
                     // 摘要与术语表都空 == 没拿到东西，必须当失败重试。
@@ -387,9 +394,9 @@ impl<'a, 'b> Translator<'a, 'b> {
     // 分批翻译
     // ========================================================================
 
-    /// 带自适应拆分的批次翻译。触发拆分的两种情况：
-    /// - prompt 超出 token 预算；
-    /// - 模型**照抄原文**的比例过高（小模型在大批次上会退化成复制输入）。
+    /// 批次翻译。只在 **prompt 超出 token 预算** 时对半拆分；
+    /// 译文质量不达标（照抄原文）走"换种子重新抽取"，不再靠拆批解决——
+    /// 实测拆批会级联到单条仍判不合格，最后整批回退原文，比部分翻译更差。
     fn translate_batch_adaptive(
         &mut self,
         gctx: &GlobalContext,
@@ -415,39 +422,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 tokens, budget
             );
         }
-
-        let items = self.translate_once(&prompt, batch.len())?;
-
-        // 照抄检测：译文与原文几乎一样 == 没翻译
-        let copied: Vec<usize> = batch
-            .iter()
-            .filter_map(|seg| {
-                items
-                    .iter()
-                    .find(|it| it.i == seg.index as i64)
-                    .filter(|it| looks_copied(&seg.text, &it.t))
-                    .map(|_| seg.index)
-            })
-            .collect();
-        if !copied.is_empty() {
-            self.stats.copied += copied.len();
-            warn!(
-                "检测到 {} 条译文与原文几乎相同（照抄未翻译），index: {:?}",
-                copied.len(),
-                &copied[..copied.len().min(8)]
-            );
-            let ratio = copied.len() as f32 / batch.len().max(1) as f32;
-            if ratio >= 0.2 && batch.len() > 1 {
-                return self.split_and_retry(
-                    gctx,
-                    context,
-                    batch,
-                    depth,
-                    format!("照抄比例 {:.0}%", ratio * 100.0),
-                );
-            }
-        }
-        Ok(items)
+        self.translate_once(&prompt, batch)
     }
 
     /// 拆半重试；深度受限时不再拆，直接返回当前结果或错误。
@@ -522,58 +497,112 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.prompts.render("translate_batch.txt", &vars)
     }
 
-    fn translate_once(&mut self, prompt: &str, batch_len: usize) -> Result<Vec<TranslateItem>> {
+    /// 一次批次翻译：失败或质量不达标就**换种子重新抽取**（模型卡明确不建议贪心）。
+    ///
+    /// 与旧策略的关键差别：重抽用尽后**接受其中最好的一次结果**，而不是整批回退原文。
+    /// 回退原文意味着这一段字幕完全没翻译，一定比"部分照抄"更差。
+    fn translate_once(&mut self, prompt: &str, batch: &[SubtitleSegment]) -> Result<Vec<TranslateItem>> {
         let attempts = self.cfg.max_retries.max(1);
+        let batch_len = batch.len();
         // 生成上限随条数伸缩：宁可给足，也不要因为截断而整批重来
-        let max_new = (self.cfg.translate_tokens_per_item * batch_len + 256).clamp(512, 6144) as u32;
+        let max_new =
+            (self.cfg.translate_tokens_per_item * batch_len + 256).clamp(512, 6144) as u32;
+        let hint_copy = format!(
+            "\n\n【重要】你上一次把原文照抄回来了，没有翻译。请重新输出 JSON 数组，\
+             形如 [{{\"i\":1,\"t\":\"译文\"}}]，每条 t 都必须是{}，条数与输入一致，\
+             不要输出思考过程、解释或代码块标记。\n/no_think",
+            self.cfg.target_lang
+        );
 
         let mut last_err = anyhow::anyhow!("未执行");
         let mut attempt_prompt = prompt.to_string();
+        let mut best: Option<(Vec<TranslateItem>, usize)> = None;
+
         for attempt in 1..=attempts {
-            let temp = if attempt == 1 {
-                self.cfg.temperature
-            } else {
-                0.0 // 重试转贪心，排除采样抖动
-            };
-            match self
-                .session
-                .chat(SYSTEM_PROMPT, &attempt_prompt, temp, max_new)
-            {
-                Ok(raw) => match parse_json::<Vec<TranslateItem>>(&raw, true) {
-                    Ok(items) => {
-                        if items.is_empty() {
-                            self.stats.retries += 1;
-                            last_err = anyhow::anyhow!("第 {} 次返回空数组", attempt);
-                            warn!("[翻译] {}", last_err);
-                            attempt_prompt = format!("{}{}", prompt, HINT_ARRAY);
-                            continue;
-                        }
-                        if items.len() != batch_len {
-                            warn!(
-                                "[翻译] 返回 {} 条，期望 {} 条（按索引匹配，缺失条目回退原文）",
-                                items.len(),
-                                batch_len
-                            );
-                        }
-                        return Ok(items);
-                    }
-                    Err(e) => {
-                        self.stats.retries += 1;
-                        last_err = anyhow::anyhow!("第 {} 次解析失败: {}", attempt, e);
-                        warn!("[翻译] {}", last_err);
-                        attempt_prompt = format!("{}{}", prompt, HINT_ARRAY);
-                    }
-                },
+            let raw = match self.session.chat(
+                SYSTEM_PROMPT,
+                &attempt_prompt,
+                self.sampling.resample(attempt),
+                max_new,
+            ) {
+                Ok(r) => r,
                 Err(e) => {
                     self.stats.retries += 1;
                     last_err = e.context(format!("第 {} 次请求失败", attempt));
                     warn!("[翻译] {:#}", last_err);
+                    continue;
                 }
+            };
+
+            let items = match parse_json::<Vec<TranslateItem>>(&raw, true) {
+                Ok(v) if !v.is_empty() => v,
+                Ok(_) => {
+                    self.stats.retries += 1;
+                    last_err = anyhow::anyhow!("第 {} 次返回空数组", attempt);
+                    warn!("[翻译] {}", last_err);
+                    attempt_prompt = format!("{}{}", prompt, HINT_ARRAY);
+                    continue;
+                }
+                Err(e) => {
+                    self.stats.retries += 1;
+                    last_err = anyhow::anyhow!("第 {} 次解析失败: {}", attempt, e);
+                    warn!("[翻译] {}", last_err);
+                    attempt_prompt = format!("{}{}", prompt, HINT_ARRAY);
+                    continue;
+                }
+            };
+
+            if items.len() != batch_len {
+                warn!(
+                    "[翻译] 返回 {} 条，期望 {} 条（按索引匹配，缺失条目回退原文）",
+                    items.len(),
+                    batch_len
+                );
             }
+
+            let copies = count_copies(batch, &items);
+            if copies == 0 {
+                return Ok(items);
+            }
+            warn!(
+                "[翻译] 第 {}/{} 次抽取有 {} / {} 条疑似照抄原文，换种子重新抽取…",
+                attempt,
+                attempts,
+                copies,
+                batch_len
+            );
+            self.stats.retries += 1;
+            attempt_prompt = format!("{}{}", prompt, hint_copy);
+            if best.as_ref().map(|(_, c)| copies < *c).unwrap_or(true) {
+                best = Some((items, copies));
+            }
+        }
+
+        if let Some((items, copies)) = best {
+            warn!(
+                "[翻译] {} 次抽取后仍有 {} 条疑似照抄，采用其中最好的一次（不回退整批原文）",
+                attempts, copies
+            );
+            return Ok(items);
         }
         Err(last_err)
     }
 }
+
+/// 统计一批里"疑似照抄原文"的条数。
+fn count_copies(batch: &[SubtitleSegment], items: &[TranslateItem]) -> usize {
+    batch
+        .iter()
+        .filter(|seg| {
+            items
+                .iter()
+                .find(|it| it.i == seg.index as i64)
+                .map(|it| looks_copied(&seg.text, &it.t))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
 
 /// 按「条数上限 + 字符预算」双约束切批。
 ///
@@ -608,6 +637,11 @@ fn looks_copied(source: &str, translated: &str) -> bool {
     let s = source.trim();
     let t = translated.trim();
     if t.is_empty() || s.is_empty() {
+        return false;
+    }
+    // 短片段不做判定：日语里的汉字词（今日/戦争/村人/卒業生）本身往往就是合法中文，
+    // 逐字相同并不代表模型没翻译。实测正是这类短片段造成了 100% 误判。
+    if s.chars().count() < COPY_MIN_CHARS {
         return false;
     }
     if s == t {
@@ -647,6 +681,11 @@ mod tests {
         assert!(!looks_copied("今日は良い天気です", ""));
         // 长度差很大时不判为照抄（交给别的校验）
         assert!(!looks_copied("あいうえおかきくけこさしすせそ", "あい"));
+        // 短片段豁免：汉字词在中日间常常同形，逐字相同不代表没翻译
+        // （实测正是这类短片段造成了整批 100% 误判 -> 级联拆批 -> 整批回退原文）
+        assert!(!looks_copied("今日。", "今日。"));
+        assert!(!looks_copied("戦争", "戦争"));
+        assert!(!looks_copied("皆さんに。", "各位。"));
     }
 
     #[test]

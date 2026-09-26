@@ -26,6 +26,59 @@ use log::{debug, info, warn};
 use std::num::NonZeroU32;
 use std::path::Path;
 
+/// 采样参数。默认值取自 Qwen3 模型卡（huggingface.co/Qwen/Qwen3-1.7B）
+/// 对**非思考模式**的建议：`Temperature=0.7, TopP=0.8, TopK=20, MinP=0`。
+///
+/// 模型卡同时明确写着 **"DO NOT use greedy decoding"**（贪心会导致质量退化与
+/// 无限重复），所以本项目不再用"重试转贪心"的策略，而是**换种子重新抽取**。
+#[derive(Debug, Clone, Copy)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+impl Sampling {
+    pub fn new(temperature: f32, top_p: f32, top_k: i32, seed: u32) -> Self {
+        Self {
+            temperature,
+            top_p: top_p.clamp(0.0, 1.0),
+            top_k,
+            seed,
+        }
+    }
+
+    /// Qwen3 模型卡推荐的非思考模式参数
+    pub fn qwen3(seed: u32) -> Self {
+        Self::new(0.7, 0.8, 20, seed)
+    }
+
+    /// 派生第 n 次抽取的种子（重抽时换一个采样轨迹，而不是退回贪心）
+    pub fn resample(&self, attempt: usize) -> Self {
+        Self {
+            seed: self.seed.wrapping_add((attempt as u32).wrapping_mul(0x9E37_79B9)),
+            ..*self
+        }
+    }
+
+    fn build(&self) -> LlamaSampler {
+        if self.temperature <= 0.0 {
+            // 仅在用户显式要求时走贪心（模型卡不推荐）
+            return LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        }
+        let mut chain: Vec<LlamaSampler> = vec![LlamaSampler::temp(self.temperature)];
+        if self.top_k > 0 {
+            chain.push(LlamaSampler::top_k(self.top_k));
+        }
+        if self.top_p > 0.0 && self.top_p < 1.0 {
+            chain.push(LlamaSampler::top_p(self.top_p, 1));
+        }
+        chain.push(LlamaSampler::dist(self.seed));
+        LlamaSampler::chain_simple(chain)
+    }
+}
+
 pub struct LlmClient {
     backend: LlamaBackend,
     model: LlamaModel,
@@ -92,13 +145,13 @@ impl LlmSession<'_> {
         }
     }
 
-    /// 一轮 ChatML 对话。`temperature <= 0` 时使用贪心采样（JSON 任务应始终用贪心）。
+    /// 一轮 ChatML 对话。采样策略由 `Sampling` 决定（默认按 Qwen3 模型卡的非思考模式参数）。
     /// `max_new_tokens` 为生成上限（防止小模型跑飞吃满上下文）。
     pub fn chat(
         &mut self,
         system: &str,
         user: &str,
-        temperature: f32,
+        sampling: Sampling,
         max_new_tokens: u32,
     ) -> Result<String> {
         // 复用上下文：清空上一轮 KV cache
@@ -154,14 +207,7 @@ impl LlmSession<'_> {
             );
         }
 
-        let mut sampler = if temperature > 0.0 {
-            LlamaSampler::chain_simple([
-                LlamaSampler::temp(temperature),
-                LlamaSampler::dist(self.client.seed),
-            ])
-        } else {
-            LlamaSampler::chain_simple([LlamaSampler::greedy()])
-        };
+        let mut sampler = sampling.build();
 
         // 位置计数器从 prompt 末尾继续（不是最后一个 chunk 的长度）
         let mut n_cur = prompt_len;

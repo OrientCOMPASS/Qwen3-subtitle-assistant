@@ -11,7 +11,7 @@
 //! - **纠正必须可信**：模型给的 `fix` 文本要与原文足够相似、长度比合理，
 //!   否则视为幻觉、保留原文并计数（旧版会无条件接受改写，甚至因缺字段直接丢句）。
 
-use crate::llm::{parse_json, LlmSession};
+use crate::llm::{parse_json, LlmSession, Sampling};
 use crate::prompt::PromptStore;
 use crate::types::{QcStats, QcVerdict, SubtitleSegment};
 use log::{info, warn};
@@ -34,6 +34,8 @@ pub struct QualityChecker {
     len_ratio: (f32, f32),
     /// 超过这个字符数的句子不允许被 drop（除非高度重复），0 = 关闭该保护
     keep_min_chars: usize,
+    /// 采样参数（Qwen3 模型卡明确禁止贪心；解析失败时换种子重抽）
+    sampling: Sampling,
 }
 
 impl QualityChecker {
@@ -42,6 +44,7 @@ impl QualityChecker {
         max_attempts: usize,
         min_similarity: f32,
         keep_min_chars: usize,
+        sampling: Sampling,
     ) -> Self {
         Self {
             context_size: context_size.max(1),
@@ -51,6 +54,7 @@ impl QualityChecker {
             min_similarity: min_similarity.clamp(0.0, 1.0),
             len_ratio: (0.3, 3.0),
             keep_min_chars,
+            sampling,
         }
     }
 
@@ -84,8 +88,13 @@ impl QualityChecker {
 
         let mut prompt = base_prompt.clone();
         for attempt in 1..=self.max_attempts {
-            // 贪心解码：判定任务要可复现
-            let raw = match session.chat(QC_SYSTEM, &prompt, 0.0, qc_max_tokens) {
+            // 每次尝试换一个种子重新抽取（模型卡明确不建议贪心解码）
+            let raw = match session.chat(
+                QC_SYSTEM,
+                &prompt,
+                self.sampling.resample(attempt),
+                qc_max_tokens,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     self.stats.retries += 1;
@@ -102,7 +111,7 @@ impl QualityChecker {
                         "[QC] 第 {}/{} 次输出不可解析（{}）",
                         attempt, self.max_attempts, e
                     );
-                    // 贪心解码下原样重试没有意义：追加格式提醒后再试
+                    // 追加格式提醒 + 换种子重抽（原样原种子重试没有意义）
                     prompt = format!("{}{}", base_prompt, FORMAT_HINT);
                 }
             }
@@ -341,7 +350,7 @@ mod tests {
     }
 
     fn checker(sim: f32) -> QualityChecker {
-        QualityChecker::new(3, 2, sim, 30)
+        QualityChecker::new(3, 2, sim, 30, Sampling::qwen3(42))
     }
 
     #[test]
@@ -418,13 +427,13 @@ mod tests {
             .validate_drop("ありがとうありがとうありがとうありがとうありがとう")
             .is_ok());
         // 关闭保护后一律允许
-        let off = QualityChecker::new(3, 2, 0.35, 0);
+        let off = QualityChecker::new(3, 2, 0.35, 0, Sampling::qwen3(42));
         assert!(off.validate_drop(real).is_ok());
     }
 
     #[test]
     fn history_window_is_bounded() {
-        let mut c = QualityChecker::new(2, 2, 0.35, 30);
+        let mut c = QualityChecker::new(2, 2, 0.35, 30, Sampling::qwen3(42));
         c.push_history("a");
         c.push_history("b");
         c.push_history("c");

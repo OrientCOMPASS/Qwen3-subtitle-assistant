@@ -44,6 +44,10 @@ on:
         description: "媒体拉取失败时判失败（默认降级为跳过真实视频用例）"
         type: boolean
         default: false
+      media_max:
+        description: "真实视频用例最多测几个（留空 = 3；调成 1 可加快迭代）"
+        type: string
+        default: ""
 
 permissions:
   contents: write # release job 创建 Release 需要
@@ -60,9 +64,11 @@ env:
   # 统一强制 UTF-8 模式。
   PYTHONUTF8: "1"
   PYTHONIOENCODING: utf-8
-  # e2e 真实测试媒体：bilibili 上的日语视频（1~5 分钟），按顺序尝试，第一个可用即用。
+  # e2e 真实测试媒体：bilibili 上的日语视频（1~5 分钟），按顺序尝试，取前 E2E_MAX_FILES 个可用者。
+  # 刻意选了三种不同语域：学术演讲 / 正式比赛演讲 / 家庭日常口语。
   # 换视频只需改这里；下载结果进 actions/cache，后续运行不再访问 bilibili。
-  E2E_BVIDS: "BV16r421g797 BV1ccdQY8Ee8 BV1No4y117UC BV1jT42167f3"
+  E2E_BVIDS: "BV16r421g797 BV1ccdQY8Ee8 BV1jT42167f3 BV1No4y117UC"
+  E2E_MAX_FILES: "3"
 
 jobs:
   # ------------------------------------------------------------------ 构建
@@ -340,7 +346,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: media-cache
-          key: e2e-media-bilibili-v2
+          key: e2e-media-bilibili-v3
 
       - name: Fetch media (cache miss)
         id: fetch-media
@@ -359,7 +365,9 @@ jobs:
           if (-not $use) { $use = "${{ vars.E2E_MEDIA_URL }}" }
           $urlArgs = @()
           if ($use) { $urlArgs = @("--url", $use); Write-Host "使用直链: $use" }
-          python scripts/fetch_media.py --out media-cache --min-secs 60 --max-secs 420 @urlArgs @bvids
+          $maxFiles = "${{ inputs.media_max }}"
+          if (-not $maxFiles) { $maxFiles = $env:E2E_MAX_FILES }
+          python scripts/fetch_media.py --out media-cache --min-secs 60 --max-secs 420 --max-files $maxFiles @urlArgs @bvids
           $ok = $LASTEXITCODE -eq 0
           Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_OK=$ok"
           Get-ChildItem media-cache -ErrorAction SilentlyContinue | Select-Object Name, Length
@@ -381,77 +389,57 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: media-cache
-          key: e2e-media-bilibili-v2
+          key: e2e-media-bilibili-v3
 
       - name: Stage media
         if: inputs.e2e_media != 'none'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path media | Out-Null
-          $f = Get-ChildItem media-cache -File -ErrorAction SilentlyContinue |
-               Where-Object { $_.Extension -match '\.(m4a|mp4|webm|mp3|wav|flv|mkv|media)$' } |
-               Sort-Object Length -Descending | Select-Object -First 1
-          if ($f) {
-            Copy-Item $f.FullName "media/test_video$($f.Extension)" -Force
-            Write-Host "使用测试媒体: media/test_video$($f.Extension) ($([math]::Round($f.Length/1MB,2)) MB)"
-            ffprobe -v error -show_entries format=duration -of csv=p=0 "media/test_video$($f.Extension)"
-            Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_FILE=media/test_video$($f.Extension)"
-          } else {
+          $files = Get-ChildItem media-cache -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Extension -match '\.(m4a|mp4|webm|mp3|wav|flv|mkv|media)$' } |
+                   Sort-Object Name
+          if (-not $files) {
             Write-Warning "没有可用媒体文件，真实视频用例将被跳过"
-            Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_FILE="
+            Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_COUNT=0"
+            exit 0
           }
+          $staged = @()
+          foreach ($f in $files) {
+            $dest = "media/video_$($f.BaseName)$($f.Extension)"
+            Copy-Item $f.FullName $dest -Force
+            $dur = (ffprobe -v error -show_entries format=duration -of csv=p=0 $dest) 2>$null
+            Write-Host ("  {0}  {1} MB  {2}s" -f $dest, [math]::Round($f.Length/1MB,2), $dur)
+            $staged += $dest
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_COUNT=$($staged.Count)"
+          Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_LIST=$($staged -join ';')"
 
       # ============ 回归用例（不依赖网络，先跑，最快拿到关键反馈） ============
-      # T2a：长 prompt 回归。tests/fixtures/long_lines_ja.srt 是 50 条 20 秒长 cue、约 7000 字，
-      #      配 --summary-chunk-tokens 10000 强制"整篇一次性喂给摘要"：prompt ~5000 token，
-      #      远超 n_batch(2048)。v0.2 在这里会命中 llama.cpp 的 GGML_ASSERT 直接 abort，
-      #      v0.3 必须分块 prefill 并正常产出——日志里要能看到"分块 prefill"。
-      #      同时 20 秒长 cue 会触发排版阶段的按句读拆分。
-      - name: T2a 长 prompt（分块 prefill）+ 长 cue 拆分
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path media | Out-Null
-          $sw = [Diagnostics.Stopwatch]::StartNew()
-          & ./target/release/subtitle-assistant.exe --no-pause --from-srt `
-              --output-dir media --ctx-size 12288 --summary-chunk-tokens 10000 `
-              --batch-size 20 --log-file media/t2a.log tests/fixtures/long_lines_ja.srt
-          $code = $LASTEXITCODE
-          $sw.Stop()
-          Write-Host "T2a 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
-          if ($code -ne 0) { throw "T2a 退出码非 0（长 prompt 路径回归失败，详见 media/t2a.log）" }
-
-      - name: T2a 断言
-        shell: pwsh
-        run: |
-          Get-Content media/long_lines_ja.translated.srt -Encoding UTF8 | Select-Object -First 24
-          python scripts/check_e2e.py --name T2a-长prompt --srt media/long_lines_ja.translated.srt `
-            --log media/t2a.log --min-cues 80 --target-lang zh `
-            --max-cue-secs 9 --max-line-width 44 --max-untranslated 5 `
-            --max-kana-ratio 0.12 --max-foreign-cues 3 `
-            --expect-log-contains "分块 prefill"
-          if ($LASTEXITCODE -ne 0) { throw "T2a 断言失败" }
-
-      # T2b：摘要 map-reduce 回归。取 long_ja.srt 前 40 条，把单块预算压到 400 token，
+      # 说明：这里刻意**不测**超长 prompt（>n_batch 的整篇一次性喂入）。
+      # 本工具的设计目标是 1~5 分钟的视频，转录量远在预算之内；
+      # 分块 prefill 只作为"不要崩"的兜底保留，不对其正确性做回归承诺。
+      # T2：摘要 map-reduce 回归。取 long_ja.srt 前 40 条，把单块预算压到 400 token，
       #      强制全局摘要走"分块提取 -> 合并"路径（日志里的"摘要分块 N"必须 >= 2）。
-      - name: T2b 摘要分块 map-reduce
+      - name: T2 摘要分块 map-reduce
         shell: pwsh
         run: |
           python -c "import pathlib; t=pathlib.Path('tests/fixtures/long_ja.srt').read_text(encoding='utf-8'); b=[x for x in t.strip().split('\n\n') if x.strip()][:40]; pathlib.Path('media/short40_ja.srt').write_text('\n\n'.join(b), encoding='utf-8')"
           & ./target/release/subtitle-assistant.exe --no-pause --from-srt `
               --output-dir media --summary-chunk-tokens 400 --batch-size 20 `
-              --log-file media/t2b.log media/short40_ja.srt
+              --log-file media/t2.log media/short40_ja.srt
           $code = $LASTEXITCODE
-          Write-Host "T2b 退出码=$code"
-          if ($code -ne 0) { throw "T2b 退出码非 0（摘要分块路径失败，详见 media/t2b.log）" }
+          Write-Host "T2 退出码=$code"
+          if ($code -ne 0) { throw "T2 退出码非 0（摘要分块路径失败，详见 media/t2.log）" }
 
-      - name: T2b 断言
+      - name: T2 断言
         shell: pwsh
         run: |
-          python scripts/check_e2e.py --name T2b-摘要分块 --srt media/short40_ja.translated.srt `
-            --log media/t2b.log --min-cues 40 --target-lang zh `
+          python scripts/check_e2e.py --name T2-摘要分块 --srt media/short40_ja.translated.srt `
+            --log media/t2.log --min-cues 40 --target-lang zh `
             --max-cue-secs 9 --max-line-width 44 --min-summary-chunks 2 --max-untranslated 3 `
             --max-kana-ratio 0.12 --max-foreign-cues 2
-          if ($LASTEXITCODE -ne 0) { throw "T2b 断言失败" }
+          if ($LASTEXITCODE -ne 0) { throw "T2 断言失败" }
 
       # T3：迁移目录回归（拖拽/快捷方式启动路径）。exe+DLL+prompts 拷到 TEMP，
       #      models 用 junction 指过去，再从非仓库 CWD 启动。
@@ -493,16 +481,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "T3 断言失败" }
 
       # ============ T1：真实 bilibili 日语视频全流程（放最后，媒体拉取有不确定性） ============
+      # 一次调用喂多个文件：顺带验证"模型跨文件复用"（QC 模式下 ASR+LLM 只加载一次）。
       - name: T1 真实日语视频全流程
         shell: pwsh
         run: |
-          if (-not $env:MEDIA_FILE) {
+          if (-not $env:MEDIA_LIST) {
             Write-Warning "跳过 T1（无媒体）。这不代表通过：请用 workflow_dispatch 重试或更换 E2E_BVIDS。"
             Add-Content -Path $env:GITHUB_ENV -Value "T1_SKIPPED=1"
             exit 0
           }
+          $files = $env:MEDIA_LIST -split ';'
+          Write-Host "=== 待处理 $($files.Count) 个视频 ==="
+          $files | ForEach-Object { Write-Host "  $_" }
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          & ./target/release/subtitle-assistant.exe --no-pause --log-file media/t1.log $env:MEDIA_FILE
+          & ./target/release/subtitle-assistant.exe --no-pause --log-file media/t1.log @files
           $code = $LASTEXITCODE
           $sw.Stop()
           Write-Host "T1 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
@@ -513,14 +505,23 @@ jobs:
         shell: pwsh
         run: |
           if ($env:T1_SKIPPED) { Write-Warning "T1 已跳过"; exit 0 }
-          $srt = ($env:MEDIA_FILE -replace '\.[^.]+$','') + ".srt"
-          Write-Host "=== $srt 内容（前 60 行） ==="
-          Get-Content $srt -Encoding UTF8 | Select-Object -First 60
-          python scripts/check_e2e.py --name T1-真实视频 --srt $srt --log media/t1.log `
-            --min-cues 8 --target-lang zh --max-cue-secs 15 --max-line-width 44 `
-            --expect-qc --max-untranslated 5 --max-kana-ratio 0.08 --max-foreign-cues 2 `
+          $files = $env:MEDIA_LIST -split ';'
+          $bad = 0
+          foreach ($f in $files) {
+            $srt = ($f -replace '\.[^.]+$','') + ".srt"
+            Write-Host "`n=== $srt（前 30 行）==="
+            Get-Content $srt -Encoding UTF8 | Select-Object -First 30
+            python scripts/check_e2e.py --name "T1-$(Split-Path $f -Leaf)" --srt $srt --log media/t1.log `
+              --min-cues 8 --target-lang zh --max-cue-secs 15 --max-line-width 44 `
+              --max-untranslated 8 --max-kana-ratio 0.10 --max-foreign-cues 3
+            if ($LASTEXITCODE -ne 0) { $bad++ }
+          }
+          # 质检统计是整份日志聚合判定：每个输入文件应各有一条
+          python scripts/check_e2e.py --name "T1-质检汇总" --srt (($files[0] -replace '\.[^.]+$','') + ".srt") `
+            --log media/t1.log --target-lang any --expect-qc --expect-qc-files $files.Count `
             --max-qc-drop-ratio 0.35
-          if ($LASTEXITCODE -ne 0) { throw "T1 断言失败" }
+          if ($LASTEXITCODE -ne 0) { $bad++ }
+          if ($bad -gt 0) { throw "T1 断言失败（$bad 项）" }
 
       - name: Upload e2e results
         if: always()

@@ -203,7 +203,9 @@ def main() -> int:
     ap.add_argument("--url", default="", help="直链或视频页 URL（优先于 --bvid）")
     ap.add_argument("--min-secs", type=float, default=60.0)
     ap.add_argument("--max-secs", type=float, default=600.0)
-    ap.add_argument("--name", default="", help="输出文件名（不含扩展名）")
+    ap.add_argument("--name", default="", help="输出文件名（不含扩展名，仅在单文件时有意义）")
+    ap.add_argument("--max-files", type=int, default=1,
+                    help="最多下载几个候选（CI 用多语言/多风格样本时会 >1）")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -236,8 +238,11 @@ def main() -> int:
     bili = Bili()
     bili.bootstrap()
 
+    fetched: list[dict] = []
     for bvid in args.bvid:
-        name = args.name or bvid
+        if len(fetched) >= args.max_files:
+            break
+        name = args.name if (args.name and args.max_files == 1) else bvid
         try:
             log(f"=== 尝试 {bvid} ===")
             info = bili.view(bvid)
@@ -260,25 +265,32 @@ def main() -> int:
                 dest.unlink(missing_ok=True)
                 continue
             real = ffprobe_duration(dest) or dur
-            print("MEDIA_OK " + json.dumps({"source": "bilibili", "id": bvid, "file": str(dest),
-                                            "duration": real, "title": title}, ensure_ascii=False))
-            return 0
+            fetched.append({"source": "bilibili", "id": bvid, "file": str(dest),
+                            "duration": real, "title": title})
+            print("MEDIA_OK " + json.dumps(fetched[-1], ensure_ascii=False))
         except Exception as e:  # noqa: BLE001
             log(f"{bvid} 失败: {e}")
             time.sleep(3)
 
-    # ---------- yt-dlp 兜底 ----------
+    # ---------- yt-dlp 兜底（仅在还没凑够文件时使用） ----------
     for bvid in args.bvid:
-        got = try_ytdlp(f"https://www.bilibili.com/video/{bvid}", out_dir / (args.name or bvid))
+        if len(fetched) >= args.max_files:
+            break
+        if any(f["id"] == bvid for f in fetched):
+            continue
+        got = try_ytdlp(f"https://www.bilibili.com/video/{bvid}", out_dir / bvid)
         if got:
             dur = ffprobe_duration(got)
             if dur and not (args.min_secs <= dur <= args.max_secs):
                 log(f"yt-dlp 结果时长 {dur:.0f}s 不在范围内，放弃")
                 continue
-            print("MEDIA_OK " + json.dumps({"source": "yt-dlp", "id": bvid, "file": str(got),
-                                            "duration": dur, "title": bvid}, ensure_ascii=False))
-            return 0
+            fetched.append({"source": "yt-dlp", "id": bvid, "file": str(got),
+                            "duration": dur, "title": bvid})
+            print("MEDIA_OK " + json.dumps(fetched[-1], ensure_ascii=False))
 
+    if fetched:
+        print("MEDIA_ALL " + json.dumps({"count": len(fetched), "files": fetched}, ensure_ascii=False))
+        return 0
     return fail("所有候选均失败（bilibili 风控 / 视频下线？）")
 
 

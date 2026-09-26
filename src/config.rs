@@ -1,4 +1,5 @@
 use crate::cli::Args;
+use crate::llm::Sampling;
 use anyhow::{Context, Result};
 use log::{info, warn};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ pub struct Config {
     pub context_size: usize,
     pub max_retries: usize,
     pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: i32,
     pub summary_chunk_tokens: usize,
     pub translate_tokens_per_item: usize,
 
@@ -116,12 +119,20 @@ impl Config {
             context_size: args.context_size,
             max_retries: args.max_retries.max(1),
             temperature: args.temperature.max(0.0),
+            top_p: args.top_p.clamp(0.0, 1.0),
+            top_k: args.top_k.max(0),
             summary_chunk_tokens: args.summary_chunk_tokens.max(256),
             translate_tokens_per_item: args.translate_tokens_per_item.max(16),
             gpu_layers: args.gpu_layers,
             ctx_size,
             prefill_batch,
-            seed: args.seed,
+            seed: if args.seed == 0 {
+                let s = random_seed();
+                info!("未指定 --seed，本次运行使用随机种子 {}", s);
+                s
+            } else {
+                args.seed
+            },
             asr_threads: args.asr_threads.max(1),
             asr_hotwords: args.asr_hotwords.trim().to_string(),
             asr_max_new_tokens: args.asr_max_new_tokens.max(16),
@@ -146,6 +157,11 @@ impl Config {
         };
         info!("使用 LLM 模型: {:?}", cfg.llm_model);
         Ok(cfg)
+    }
+
+    /// 组装采样参数（默认即 Qwen3 模型卡对非思考模式的建议值）
+    pub fn sampling(&self) -> Sampling {
+        Sampling::new(self.temperature, self.top_p, self.top_k, self.seed)
     }
 
     // ---------------- 输出路径 ----------------
@@ -197,6 +213,14 @@ impl Config {
         self.out_dir_for(input)
             .join(format!("{}.verified.srt", Self::file_stem(input)))
     }
+}
+
+/// 进程级随机种子（--seed 0 时使用）
+fn random_seed() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() ^ (d.as_secs() as u32)).wrapping_mul(2654435761))
+        .unwrap_or(42)
 }
 
 fn clamp_warn<T>(v: T, lo: T, hi: T, name: &str, fallback: T) -> T
@@ -331,8 +355,10 @@ mod tests {
             gpu_layers: 0,
             ctx_size: 4096,
             prefill_batch: 512,
-            seed: 1,
-            temperature: 0.0,
+            seed: 7,
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
             max_retries: 1,
             summary_chunk_tokens: 1000,
             translate_tokens_per_item: 64,

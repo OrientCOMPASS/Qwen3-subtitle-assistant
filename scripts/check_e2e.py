@@ -97,10 +97,11 @@ def log_stats(log_text: str) -> dict:
     }
     m = re.search(r"摘要分块 (\d+)", log_text)
     out["summary_chunks"] = int(m.group(1)) if m else None
-    m = re.search(
+    # 多文件批处理时日志里会有多行质检统计，全部收集后聚合判定
+    out["qc_all"] = [tuple(int(x) for x in g) for g in re.findall(
         r"质检 (\d+) 句：保留 (\d+)，纠正 (\d+)，丢弃 (\d+)，解析失败兜底 (\d+)，"
-        r"纠正被拒 (\d+)，丢弃被拒 (\d+)，重试 (\d+)", log_text)
-    out["qc"] = tuple(int(x) for x in m.groups()) if m else None
+        r"纠正被拒 (\d+)，丢弃被拒 (\d+)，重试 (\d+)", log_text)]
+    out["qc"] = out["qc_all"][0] if out["qc_all"] else None
     m = re.search(r"排版完成：(\d+) 条 -> (\d+) 条", log_text)
     out["layout"] = (int(m.group(1)), int(m.group(2))) if m else None
     m = re.search(r"ASR 流程结束，最终保留 (\d+) 条字幕", log_text)
@@ -125,6 +126,8 @@ def main() -> int:
     ap.add_argument("--max-line-width", type=int, default=0, help="0=不检查")
     ap.add_argument("--target-lang", default="zh", choices=["zh", "any"])
     ap.add_argument("--expect-qc", action="store_true")
+    ap.add_argument("--expect-qc-files", type=int, default=1,
+                    help="期望日志里出现几条质检统计（多文件批处理时等于文件数）")
     ap.add_argument("--min-summary-chunks", type=int, default=0)
     ap.add_argument("--max-untranslated", type=int, default=0)
     ap.add_argument("--max-kana-ratio", type=float, default=0.03)
@@ -203,19 +206,22 @@ def main() -> int:
             check(st["untranslated"] <= args.max_untranslated,
                   f"回退原文 {st['untranslated']} 条 <= {args.max_untranslated}")
             if args.expect_qc:
-                check(st["qc"] is not None, "日志含质检统计行")
-                if st["qc"]:
-                    total, kept, fixed, dropped, failed, rejected, drop_rej, retries = st["qc"]
-                    if args.max_qc_drop_ratio >= 0 and total:
-                        ratio = dropped / total
-                        check(ratio <= args.max_qc_drop_ratio,
-                              f"QC 丢弃率 {ratio:.0%}（{dropped}/{total}）<= {args.max_qc_drop_ratio:.0%}"
-                              f"；另有 {drop_rej} 条因长句保护被拦下")
-                    # 每句必然落入 kept/fixed/dropped 之一（fail-open 与"纠正被拒"都计入 kept）
-                    check(total == kept + fixed + dropped,
-                          f"质检计数自洽: 共 {total} 句 = 保留 {kept} + 纠正 {fixed} + 丢弃 {dropped}"
-                          f"（解析兜底 {failed}，纠正被拒 {rejected}）")
-                    check(total > 0, f"质检覆盖 {total} 句 > 0")
+                qc_all = st["qc_all"]
+                check(len(qc_all) >= args.expect_qc_files,
+                      f"日志含质检统计行 {len(qc_all)} 条 >= {args.expect_qc_files}（每个输入文件一条）")
+                tot = sum(q[0] for q in qc_all)
+                kept = sum(q[1] for q in qc_all)
+                fixed = sum(q[2] for q in qc_all)
+                dropped = sum(q[3] for q in qc_all)
+                drop_rej = sum(q[6] for q in qc_all)
+                check(tot > 0, f"质检覆盖 {tot} 句 > 0")
+                check(tot == kept + fixed + dropped,
+                      f"质检计数自洽: 共 {tot} 句 = 保留 {kept} + 纠正 {fixed} + 丢弃 {dropped}")
+                if args.max_qc_drop_ratio >= 0 and tot:
+                    ratio = dropped / tot
+                    check(ratio <= args.max_qc_drop_ratio,
+                          f"QC 丢弃率 {ratio:.0%}（{dropped}/{tot}）<= {args.max_qc_drop_ratio:.0%}"
+                          f"；另有 {drop_rej} 条因长句保护被拦下")
             if args.min_summary_chunks:
                 check((st["summary_chunks"] or 0) >= args.min_summary_chunks,
                       f"摘要分块 {st['summary_chunks']} >= {args.min_summary_chunks}（证明长文本走了 map-reduce）")

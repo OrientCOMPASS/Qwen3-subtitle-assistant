@@ -54,13 +54,22 @@ pub struct Args {
     #[arg(long, default_value_t = 2048)]
     pub prefill_batch: u32,
 
-    /// 采样种子（0=按时间随机）。固定种子可让同一输入的质检/翻译结果可复现。
-    #[arg(long, default_value_t = 42)]
+    /// 采样种子（0=每次运行随机）。固定种子可让同一输入的结果可复现。
+    #[arg(long, default_value_t = 0)]
     pub seed: u32,
 
-    /// 翻译首轮采样温度（0=贪心）。重试一律转为贪心以保证稳定。
-    #[arg(long, default_value_t = 0.3)]
+    /// 采样温度。默认 0.7 取自 Qwen3 模型卡对非思考模式的建议；
+    /// 模型卡明确写着"DO NOT use greedy decoding"，故 0（贪心）只在你确有需要时才用。
+    #[arg(long, default_value_t = 0.7)]
     pub temperature: f32,
+
+    /// 采样 top-p（模型卡建议 0.8；1.0 = 关闭）
+    #[arg(long, default_value_t = 0.8)]
+    pub top_p: f32,
+
+    /// 采样 top-k（模型卡建议 20；0 = 关闭）
+    #[arg(long, default_value_t = 20)]
+    pub top_k: i32,
 
     /// 翻译/摘要的单批最大重试次数
     #[arg(long, default_value_t = 3)]

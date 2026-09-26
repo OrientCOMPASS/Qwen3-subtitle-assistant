@@ -8,10 +8,15 @@
 > **v0.3 变更要点**（相对 v0.2）
 > 1. **长视频不再崩**：prompt 按 `n_batch` 分块 prefill（旧版超过 2048 token 会命中
 >    llama.cpp 的 `GGML_ASSERT` 直接 abort）；转录过长时全局摘要自动走 **map-reduce 分块**。
+>    （注：设计目标是 1~5 分钟的视频；分块 prefill 只是"不崩"的兜底，
+>    不为超长转录的翻译质量做承诺，CI 也不对其设回归用例。）
 > 2. **翻译不再静默回退原文**：紧凑输出格式（只回传 `i`/`t`，时间轴由 Rust 保留）、
 >    索引对不上时按位置兜底、每条回退都 warn 并计数，收尾打印统计。
-> 3. **提示词全部 `/no_think` + JSON 任务贪心解码**：v0.2 只给质检提示词关了思考模式，
->    摘要/翻译仍在思考，白白吃掉生成预算导致 JSON 截断。
+> 3. **提示词全部 `/no_think`，采样参数按模型卡设置**：v0.2 只给质检提示词关了思考模式，
+>    摘要/翻译仍在思考，白白吃掉生成预算导致 JSON 截断。采样默认 `Temperature=0.7 /
+>    TopP=0.8 / TopK=20`（Qwen3 模型卡对非思考模式的建议），**不使用贪心解码**——
+>    模型卡明确写了 "DO NOT use greedy decoding"（会退化并无限重复）；
+>    结果不达标时**换种子重新抽取**，重抽用尽则接受其中最好的一次，绝不整批回退原文。
 > 4. **字幕排版**：按显示宽度折行（CJK 计 2）、超长 cue 按句读拆分并按字符占比分配时间。
 >    旧版一个 VAD 语音段就是一条字幕，十几秒的连续讲话会变成一整屏文字。
 > 5. **资源路径回退到 exe 目录**：拖拽/快捷方式启动时 CWD 不可控，旧版会直接报
@@ -185,8 +190,10 @@ powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1 -HfMirror h
 | **LLM** | | |
 | `--ctx-size N` | 8192 | LLM 上下文长度（小于 2048 会被抬到 2048 并 warn） |
 | `--prefill-batch N` | 2048 | llama.cpp `n_batch`；长 prompt 会自动按它分块 |
-| `--seed N` | 42 | 采样种子（固定值 → 结果可复现） |
-| `--temperature F` | 0.3 | 翻译首轮采样温度；重试一律转贪心 |
+| `--seed N` | 0(随机) | 采样种子；固定值可让同一输入的结果可复现 |
+| `--temperature F` | 0.7 | 采样温度（Qwen3 模型卡对**非思考模式**的建议值） |
+| `--top-p F` | 0.8 | nucleus 采样（模型卡建议值；1.0=关闭） |
+| `--top-k N` | 20 | top-k 采样（模型卡建议值；0=关闭） |
 | `--max-retries N` | 3 | 摘要/翻译单批最大重试次数 |
 | **质检** | | |
 | `--no-qc` | 关 | 关闭逐句 LLM 质检（回到线性流程） |
@@ -309,12 +316,11 @@ python scripts/check_dll_deps.py --dir <发行包目录> --fail-on-missing --str
 
 | 用例 | 内容 | 断言 |
 |---|---|---|
-| T2a 长 prompt 回归 | `tests/fixtures/long_lines_ja.srt`（50 条 20 秒长 cue、约 7000 字）配 `--ctx-size 12288 --summary-chunk-tokens 10000`，强制整篇一次性喂给摘要 → prompt ~5000 token 远超 `n_batch`(2048) | 退出码 0（**v0.2 在此必然 `GGML_ASSERT` abort**）、日志出现「分块 prefill」、≥80 条、最长 cue ≤9s、最宽行 ≤44、回退原文 ≤5 条 |
-| T2b 摘要分块回归 | `long_ja.srt` 前 40 条配 `--summary-chunk-tokens 400`，强制全局摘要走 map-reduce | 退出码 0、≥40 条、日志「摘要分块 N」且 N ≥ 2 |
+| T2 摘要分块回归 | `long_ja.srt` 前 40 条配 `--summary-chunk-tokens 400`，强制全局摘要走 map-reduce | 退出码 0、≥40 条、日志「摘要分块 N」且 N ≥ 2、未翻译 cue ≤2 |
 | T3 迁移目录回归 | exe+DLL+prompts 拷到 `%TEMP%`，`models` 用 junction，从**非仓库 CWD** 启动 | 退出码 0，且日志出现「改用 exe 目录」（证明资源路径回退生效） |
-| T1 真实视频 | bilibili 日语视频（>1 分钟，`scripts/fetch_media.py` 下载 + actions/cache 缓存）跑完整流程：ASR → 逐句质检 → 摘要 → 翻译 → 排版 | 字幕条数、最长 cue ≤15s、最宽行 ≤44、假名占比 ≤3%（确认真翻成中文）、回退原文 ≤5 条、质检计数自洽、日志无 `GGML_ASSERT`/panic |
+| T1 真实视频（×3） | 3 个 bilibili 日语视频（学术演讲 198s / 比赛演讲 282s / 家庭口语 84s，`scripts/fetch_media.py` 下载 + actions/cache 缓存），**一次调用喂多个文件**（顺带验证模型跨文件复用），跑完整流程：ASR → 逐句质检 → 摘要 → 翻译 → 排版 | 每个视频各自断言：条数 ≥8、最长 cue ≤15s、最宽行 ≤44、未翻译 cue ≤3、假名占比 ≤10%；再对整份日志聚合断言：每个文件各有一条质检统计、计数自洽、**QC 丢弃率 ≤35%**、无 `GGML_ASSERT`/panic |
 
-三个回归用例都不依赖网络，排在真实视频用例之前跑，最快拿到关键反馈。
+回归用例不依赖网络，排在真实视频用例之前跑，最快拿到关键反馈。
 模型缓存用 `actions/cache/restore` + `save(if: always())` 而非 `actions/cache`——后者的 post 步骤在 job 失败时会被跳过，2.7GB 模型会每轮重下。
 
 关于 bilibili 与数据中心 IP（实测结论，2026-09）：GitHub runner 的 IP 会被 bilibili 判 412，
@@ -335,7 +341,7 @@ playurl 取音频流）走 `curl/8.0`，音频下载走浏览器 UA + Referer + 
 2. 在仓库 Settings → Secrets and variables → Variables 里设 `E2E_MEDIA_URL`，之后每次运行自动使用；
 3. 本地跑 `python scripts/fetch_media.py --bvid BV…`（住宅 IP 无风控）拿到文件后自行托管。
 
-全部失败时默认**跳过 T1** 并打 warning（T2a/T2b/T3 照跑），dispatch 勾选 `strict_media`
+全部失败时默认**跳过 T1** 并打 warning（T2/T3 照跑），dispatch 勾选 `strict_media`
 可改为直接判失败。换测试视频只需改 workflow 顶部的 `E2E_BVIDS`。
 
 **release**（`needs: [build, e2e]`，仅手动 dispatch 且勾选 `release`）：
@@ -370,7 +376,7 @@ Qwen3-subtitle-assistant/
 │   ├── download_models.ps1     # 模型一键下载（支持 HF 镜像）
 │   └── download_models.bat
 ├── tests/fixtures/
-│   └── long_ja.srt             # 长文本回归夹具（125 条日语，自撰文本，无版权问题）
+│   └── long_ja.srt             # 回归夹具（125 条日语，自撰文本，无版权问题）
 └── src/
     ├── main.rs                 # 编排：质检模式 / 线性模式(--no-qc) / --from-srt；模型跨文件复用
     ├── runtime.rs              # 外置 DLL 探测与加载、exe 目录、UTF-8 控制台、失败暂停
