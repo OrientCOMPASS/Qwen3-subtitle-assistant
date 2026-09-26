@@ -21,10 +21,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调(用提交的对照表，无需 API key)；gpu-train=GPU 真实训练；onnx-inspect=ONNX 权重补丁可行性探针"
+        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调；gpu-train=GPU 训练；onnx-inspect=Gate1 探针；onnx-patch=Gate2 补丁+sherpa-onnx 验证"
         type: choice
         default: "cpu-smoke"
-        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect]
+        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect, onnx-patch]
       model:
         description: "基座模型"
         type: choice
@@ -471,5 +471,89 @@ jobs:
         with:
           name: s2tt-onnx-inspect
           path: out/inspect/onnx_patch_report.json
+          if-no-files-found: warn
+          retention-days: 60
+
+  # ------------------------------------------------------------------ Gate 2
+  # 补丁器把 LoRA ΔW 写回官方 int8 ONNX（Gate 1 已实证 250/250 可映射、削顶 0.109%），
+  # 然后在**产品同款运行时 sherpa-onnx**（pip 1.13.8，与 Cargo 依赖同版本）上验证
+  # 三项行为：hotwords 直出中文 / 不带仍日语 / 静音空输出，并与原始包对照。
+  # T4 教训：量化运行时会改变行为，PyTorch 侧全绿不代表 sherpa 侧成立，必须实测。
+  onnx-patch:
+    name: Gate 2：ONNX 权重补丁 + sherpa-onnx 验证
+    if: ${{ inputs.mode == 'onnx-patch' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Console UTF-8
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 还原产品模型缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: qwen3-models-v4-0.6B
+          fail-on-cache-miss: true
+
+      - name: Cache HuggingFace 基座（windows key）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-0.6B-win-v1
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet onnx safetensors huggingface_hub numpy soundfile librosa
+          pip install --quiet "sherpa-onnx==1.13.8"
+          python -c "import sherpa_onnx; print('sherpa-onnx', sherpa_onnx.__version__ if hasattr(sherpa_onnx,'__version__') else 'ok')"
+
+      - name: 下载 LoRA 适配器
+        uses: actions/download-artifact@v4
+        with:
+          name: s2tt-real-mini
+          run-id: ${{ env.ADAPTER_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: art
+
+      - name: 运行补丁器（值匹配 -> ΔW 写回 -> 数值自检）
+        shell: pwsh
+        run: |
+          python finetune/patch_onnx_lora.py `
+            --model-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
+            --hf-model Qwen/Qwen3-ASR-0.6B `
+            --adapter art/out/real/lora `
+            --out-dir models/sherpa-onnx-qwen3-asr-0.6B-s2tt-int8 `
+            --report out/patch/patch_report.json
+          if ($LASTEXITCODE -ne 0) { throw "补丁器失败（未映射/削顶超标/自检失败，详见 out/patch/patch_report.json）" }
+
+      - name: sherpa-onnx 运行时三项验证（补丁 vs 原始对照）
+        shell: pwsh
+        run: |
+          python finetune/verify_s2tt_onnx.py `
+            --model-dir models/sherpa-onnx-qwen3-asr-0.6B-s2tt-int8 `
+            --baseline-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
+            --threads 4 --out out/patch/verify_report.json
+          if ($LASTEXITCODE -ne 0) { throw "Gate 2 验证未通过（详见 out/patch/verify_report.json）" }
+
+      - name: 上传 Gate 2 报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-onnx-patch
+          path: |
+            out/patch/patch_report.json
+            out/patch/verify_report.json
           if-no-files-found: warn
           retention-days: 60
