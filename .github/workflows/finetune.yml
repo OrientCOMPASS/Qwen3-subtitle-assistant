@@ -58,6 +58,8 @@ env:
   HF_HUB_DISABLE_PROGRESS_BARS: "1"
   TOKENIZERS_PARALLELISM: "false"
   ADAPTER_RUN: ${{ inputs.adapter_run || '36238661344' }}
+  # HF 缓存 key 按基座模型区分：0.6B/1.7B 权重不通用，混用一个 key 会互相污染
+  MODEL_TAG: ${{ inputs.model == 'Qwen/Qwen3-ASR-1.7B' && '1.7B' || '0.6B' }}
 
 jobs:
   cpu-smoke:
@@ -193,11 +195,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache HuggingFace 模型
+      - name: Cache HuggingFace 模型（key 随基座模型；1.7B 首次 miss 下载 ~3.4GB）
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-qwen3-asr-0.6B-v1
+          key: hf-qwen3-asr-${{ env.MODEL_TAG }}-v1
 
       - name: 安装依赖
         run: |
