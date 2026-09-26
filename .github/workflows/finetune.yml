@@ -21,10 +21,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调；gpu-train=GPU 训练；onnx-inspect=Gate1 探针；onnx-patch=Gate2 补丁+sherpa-onnx 验证；gguf-e1=llama.cpp GGUF 运行时探针"
+        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调；gpu-train=GPU 训练；onnx-inspect=Gate1 探针；onnx-patch=Gate2 补丁+sherpa-onnx 验证；gguf-e1=GGUF 运行时探针；gguf-e2=GGUF 全链路(合并→转换→量化→直出中文)"
         type: choice
         default: "cpu-smoke"
-        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect, onnx-patch, gguf-e1]
+        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect, onnx-patch, gguf-e1, gguf-e2]
       model:
         description: "基座模型"
         type: choice
@@ -703,5 +703,129 @@ jobs:
             out/gguf/e1_report.json
             server.out.log
             server.err.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ------------------------------------------------------------------ GGUF E2
+  # 决定性实验：1.7B LoRA 合并回 HF → llama.cpp 官方转换器出 GGUF（LM+mmproj）→
+  # Q4_K_M 量化 → llama-server 直出中文断言（--expect cjk + 静音检查 + 转写对照）。
+  # E1（run 36264747112）已证明运行时与 context 通道；E2 证明「微调进 GGUF」全链路，
+  # 并给出单文件体积账（LM Q4_K_M + mmproj Q8_0 应 ≈1.5GB < 2GiB）。
+  gguf-e2:
+    name: GGUF E2：LoRA 合并→转换→量化→直出中文
+    if: ${{ inputs.mode == 'gguf-e2' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace 基座（ubuntu key 按模型区分）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-${{ env.MODEL_TAG }}-v1
+
+      - name: 安装依赖（torch CPU + qwen-asr + peft）
+        run: |
+          set -e
+          pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet qwen-asr peft safetensors numpy soundfile librosa
+
+      - name: 下载 LoRA 适配器（1.7B real-mini 产物）
+        uses: actions/download-artifact@v4
+        with:
+          name: s2tt-real-mini
+          run-id: ${{ env.ADAPTER_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: art
+
+      - name: 准备 llama.cpp（源码 pin b11201 + ubuntu 预编译二进制）
+        run: |
+          set -e
+          git clone --depth 1 --branch b11201 https://github.com/ggml-org/llama.cpp llama.cpp
+          pip install --quiet ./llama.cpp/gguf-py
+          if [ -f llama.cpp/requirements/requirements-convert_hf_to_gguf.txt ]; then
+            pip install --quiet -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+          else
+            pip install --quiet transformers sentencepiece protobuf
+          fi
+          for name in llama-b11201-bin-ubuntu-x64.zip llama-b11201-bin-ubuntu-24.04-x64.zip; do
+            if curl -sL --fail --retry 2 -o llama-bin.zip "https://github.com/ggml-org/llama.cpp/releases/download/b11201/$name"; then
+              echo "下载成功: $name"; break
+            fi
+          done
+          test -f llama-bin.zip
+          mkdir -p llama-bin && cd llama-bin && python3 -c "import zipfile; zipfile.ZipFile('../llama-bin.zip').extractall('.')"
+          find . -name "llama-quantize" -o -name "llama-server" | head
+          chmod +x $(find . -type f -name "llama-*" ! -name "*.dll")
+
+      - name: 下载日语测试音频
+        run: |
+          curl -sL --fail --retry 3 -o ja.wav "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/test_wavs/ja.wav"
+          python3 -c "import wave; w=wave.open('ja.wav'); print('ja.wav', w.getnframes()/w.getframerate(), 's')"
+
+      - name: 合并 LoRA 回 HF 基座
+        run: |
+          set -e
+          python finetune/merge_lora_hf.py --base "${{ inputs.model }}" \
+            --adapter art/out/real/lora --out merged/s2tt
+
+      - name: 转换 GGUF（LM f16 + mmproj q8_0）
+        run: |
+          set -e
+          python llama.cpp/convert_hf_to_gguf.py merged/s2tt --outfile s2tt-f16.gguf --outtype f16
+          python llama.cpp/convert_hf_to_gguf.py merged/s2tt --mmproj --outfile proj-q8.gguf --outtype q8_0
+          ls -la *.gguf
+          MMPROJ=$(ls mmproj-*.gguf | head -1)
+          echo "MMPROJ=$MMPROJ" >> "$GITHUB_ENV"
+
+      - name: 量化 LM 到 Q4_K_M + 体积账
+        run: |
+          set -e
+          Q=$(find llama-bin -type f -name llama-quantize | head -1)
+          "$Q" s2tt-f16.gguf s2tt-Q4_K_M.gguf Q4_K_M
+          python3 - <<'PY'
+          import os, pathlib
+          lm = pathlib.Path("s2tt-Q4_K_M.gguf").stat().st_size
+          mm = pathlib.Path(os.environ["MMPROJ"]).stat().st_size
+          tot = lm + mm
+          gib = tot / 2**30
+          print(f"LM Q4_K_M {lm/2**30:.2f} GiB + mmproj {mm/2**30:.2f} GiB = {gib:.2f} GiB")
+          print(f"单文件预算（<=2 GiB，另留 ~0.2 GiB 给 exe/DLL）: {'✔ 可行' if gib <= 1.8 else '✘ 超限，需更低量化'}")
+          pathlib.Path("out_size.txt").write_text(f"{gib:.3f}\n")
+          PY
+
+      - name: 启动 llama-server 并跑 E2 探针（断言直出中文 + 静音 + 转写对照）
+        run: |
+          set -e
+          S=$(find llama-bin -type f -name llama-server | head -1)
+          "$S" -m s2tt-Q4_K_M.gguf --mmproj "$MMPROJ" --port 8080 --jinja -t 4 -c 4096 \
+            > server.out.log 2> server.err.log &
+          SRV_PID=$!
+          code=0
+          python finetune/gguf_server_probe.py --url http://127.0.0.1:8080 \
+            --audio ja.wav --expect cjk --check-silence --audio-secs 7.2 \
+            --out out/gguf/e2_report.json || code=$?
+          kill $SRV_PID 2>/dev/null || true
+          echo "=== server 日志末尾 ==="
+          tail -n 20 server.err.log server.out.log || true
+          exit $code
+
+      - name: 上传 E2 报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-gguf-e2
+          path: |
+            out/gguf/e2_report.json
+            merge_report.json
+            server.out.log
+            server.err.log
+            out_size.txt
           if-no-files-found: warn
           retention-days: 30

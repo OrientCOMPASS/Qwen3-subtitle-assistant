@@ -189,8 +189,20 @@ qwen3-asr-1.7B-int8`），导出器与 k2-fsa 官方包不同——命名可能�
 * Rust 绑定缺口：llama-cpp-2 0.1.157（产品已锁）**没有 mtmd 绑定**——需要手写
   薄 FFI（mtmd.h 用到 ~12 个函数）或推动上游；这是集成阶段的主要工程量。
 
-**验证链**：E1（本轮，`finetune.yml mode=gguf-e1`）官方 0.6B GGUF + llama-server
-证明运行时与 **system 段 context 通道**（任务开关的 GGUF 等价物）→ E2 合并 LoRA
-→ convert → quantize → 同探针断言直出中文（--expect cjk）→ E3 Rust FFI 集成 +
-移除 LLM 四段 + 单 exe 打包（含体积断言）。VAD 归属（silero 现依赖 sherpa-onnx）
-在 E3 一并解决：候选为保留极小 ORT 仅跑 VAD、或换 Rust 侧 silero 实现。
+**验证链与进度**：
+
+* ✅ **E1**（run 36264747112，llama.cpp b11201 + ggml-org 0.6B Q8_0）：
+  `loaded multimodal model`（LM+mmproj）；7.2s 日语 wav 转录全对；**system 段
+  context 通道可用**（基座带不带 context 都出日语，与 T4 一致——通道语义要靠
+  微调权重兑现，E2 验证）；CPU Q8 推理 RTF ≈0.36、模型加载 ~1.2s，快于
+  sherpa int8（RTF <0.6）。注意：llama-server 返回**原始格式**
+  `language X<asr_text>正文`，Rust 集成时自行解析（`language None`→空，同产品语义）；
+* ⏳ **E2**（`mode=gguf-e2`）：1.7B 适配器合并回 HF（`merge_lora_hf.py`，peft
+  merge_and_unload，音频塔 LoRA 天然随 mmproj 带出）→ 官方转换器
+  （`conversion/qwen3vl.py` 注册了 Qwen3ASR 的 TEXT+MMPROJ 双类）→ LM f16→Q4_K_M、
+  mmproj 直出 q8_0 → llama-server 断言**直出中文**（--expect cjk）+ 静音空输出 +
+  转写对照仍日语；同时给出单文件体积账；
+* 待做 **E3**：Rust FFI 集成（llama-cpp-2 无 mtmd 绑定，手写薄 FFI ~12 个函数或
+  vendor libmtmd）+ **移除双模型工作流**（LLM 四段下线）+ 单 exe 打包（模型嵌入
+  或同包，体积断言 ≤2GiB）+ VAD 归属（silero 现依赖 sherpa-onnx：候选为保留极小
+  ORT 仅跑 VAD，或 Rust 侧 silero 实现）。
