@@ -430,18 +430,42 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 还原产品模型缓存（sherpa-onnx int8 包，master CI 建好）
+      - name: 还原产品模型缓存（0.6B，master CI 建好）
+        if: env.MODEL_TAG == '0.6B'
         uses: actions/cache/restore@v4
         with:
           path: models
           key: qwen3-models-v4-0.6B
           fail-on-cache-miss: true
 
-      - name: Cache HuggingFace 基座（windows key，s2tt-e2e 已建）
+      # 1.7B 是社区导出包（thieunv-asilla），不在产品缓存里：HF 逐文件下载 + 独立缓存。
+      # 文件布局与 0.6B 官方包一致（conv_frontend/encoder.int8/decoder.int8/tokenizer）。
+      - name: 缓存 1.7B 社区 ONNX 包
+        if: env.MODEL_TAG == '1.7B'
+        uses: actions/cache@v4
+        with:
+          path: models/sherpa-onnx-qwen3-asr-1.7B-int8
+          key: qwen3-asr-1.7B-onnx-v1
+
+      - name: 下载 1.7B ONNX（缓存 miss 时，~2.3GB）
+        if: env.MODEL_TAG == '1.7B'
+        shell: bash
+        run: |
+          set -e
+          d=models/sherpa-onnx-qwen3-asr-1.7B-int8
+          if [ -f "$d/decoder.int8.onnx" ]; then echo "已缓存，跳过下载"; ls -la "$d"; exit 0; fi
+          mkdir -p "$d/tokenizer"
+          base="https://huggingface.co/thieunv-asilla/sherpa-onnx-qwen3-asr-1.7B-int8/resolve/main"
+          for f in conv_frontend.onnx encoder.int8.onnx decoder.int8.onnx tokenizer/vocab.json tokenizer/merges.txt tokenizer/tokenizer_config.json; do
+            curl -sL --fail --retry 3 -o "$d/$f" "$base/$f"
+            echo "  $f $(du -h "$d/$f" | cut -f1)"
+          done
+
+      - name: Cache HuggingFace 基座（windows key 按模型区分）
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-qwen3-asr-0.6B-win-v1
+          key: hf-qwen3-asr-${{ env.MODEL_TAG }}-win-v1
 
       - name: 安装依赖
         run: |
@@ -461,8 +485,8 @@ jobs:
         shell: pwsh
         run: |
           python finetune/inspect_onnx_lora.py `
-            --model-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
-            --hf-model Qwen/Qwen3-ASR-0.6B `
+            --model-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-int8 `
+            --hf-model ${{ inputs.model }} `
             --adapter art/out/real/lora `
             --out out/inspect/onnx_patch_report.json
           if ($LASTEXITCODE -ne 0) { throw "探针运行失败" }
@@ -500,18 +524,42 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 还原产品模型缓存
+      - name: 还原产品模型缓存（0.6B，master CI 建好）
+        if: env.MODEL_TAG == '0.6B'
         uses: actions/cache/restore@v4
         with:
           path: models
           key: qwen3-models-v4-0.6B
           fail-on-cache-miss: true
 
-      - name: Cache HuggingFace 基座（windows key）
+      # 1.7B 是社区导出包（thieunv-asilla），不在产品缓存里：HF 逐文件下载 + 独立缓存。
+      # 文件布局与 0.6B 官方包一致（conv_frontend/encoder.int8/decoder.int8/tokenizer）。
+      - name: 缓存 1.7B 社区 ONNX 包
+        if: env.MODEL_TAG == '1.7B'
+        uses: actions/cache@v4
+        with:
+          path: models/sherpa-onnx-qwen3-asr-1.7B-int8
+          key: qwen3-asr-1.7B-onnx-v1
+
+      - name: 下载 1.7B ONNX（缓存 miss 时，~2.3GB）
+        if: env.MODEL_TAG == '1.7B'
+        shell: bash
+        run: |
+          set -e
+          d=models/sherpa-onnx-qwen3-asr-1.7B-int8
+          if [ -f "$d/decoder.int8.onnx" ]; then echo "已缓存，跳过下载"; ls -la "$d"; exit 0; fi
+          mkdir -p "$d/tokenizer"
+          base="https://huggingface.co/thieunv-asilla/sherpa-onnx-qwen3-asr-1.7B-int8/resolve/main"
+          for f in conv_frontend.onnx encoder.int8.onnx decoder.int8.onnx tokenizer/vocab.json tokenizer/merges.txt tokenizer/tokenizer_config.json; do
+            curl -sL --fail --retry 3 -o "$d/$f" "$base/$f"
+            echo "  $f $(du -h "$d/$f" | cut -f1)"
+          done
+
+      - name: Cache HuggingFace 基座（windows key 按模型区分）
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-qwen3-asr-0.6B-win-v1
+          key: hf-qwen3-asr-${{ env.MODEL_TAG }}-win-v1
 
       - name: 安装依赖
         run: |
@@ -533,10 +581,10 @@ jobs:
         shell: pwsh
         run: |
           python finetune/patch_onnx_lora.py `
-            --model-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
-            --hf-model Qwen/Qwen3-ASR-0.6B `
+            --model-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-int8 `
+            --hf-model ${{ inputs.model }} `
             --adapter art/out/real/lora `
-            --out-dir models/sherpa-onnx-qwen3-asr-0.6B-s2tt-int8 `
+            --out-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-s2tt-int8 `
             --report out/patch/patch_report.json
           if ($LASTEXITCODE -ne 0) { throw "补丁器失败（未映射/削顶超标/自检失败，详见 out/patch/patch_report.json）" }
 
@@ -544,8 +592,8 @@ jobs:
         shell: pwsh
         run: |
           python finetune/verify_s2tt_onnx.py `
-            --model-dir models/sherpa-onnx-qwen3-asr-0.6B-s2tt-int8 `
-            --baseline-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
+            --model-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-s2tt-int8 `
+            --baseline-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-int8 `
             --threads 4 --out out/patch/verify_report.json
           if ($LASTEXITCODE -ne 0) { throw "Gate 2 验证未通过（详见 out/patch/verify_report.json）" }
 
