@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -38,6 +39,23 @@ ASR_TEXT_TAG = "<asr_text>"
 
 def log(msg: str) -> None:
     print(f"[sft] {msg}", flush=True)
+
+def _hard_exit(code: int) -> "NoReturn":
+    """绕过解释器 finalization 直接退出。
+
+    实测：datasets/pyarrow 的后台线程在 Python finalize 阶段会触发
+    `Fatal Python error: PyGILState_Release: thread state ... must be current`
+    并 SIGABRT（退出码 134），**即使脚本本身已经完全成功**（CI 上就是这样：
+    train.jsonl/eval.jsonl 都写好了、汇总也打印了，进程仍以 134 退出被判红）。
+    所有产物在调用本函数前均已写盘并 flush，因此直接 _exit 是安全的。
+    """
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(code)
+
 
 
 def build_prefix_messages(prompt: str, audio_array: Any) -> List[Dict[str, Any]]:
@@ -287,4 +305,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _hard_exit(main())
