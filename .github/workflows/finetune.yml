@@ -634,12 +634,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 还原产品模型缓存（只取 test_wavs/ja1.wav 作测试音频）
-        uses: actions/cache/restore@v4
-        with:
-          path: models
-          key: qwen3-models-v4-0.6B
-          fail-on-cache-miss: true
+      # 测试音频不依赖产品模型缓存（qwen3-models 缓存已被仓库 10GB 配额 LRU 逐出，
+      # 实测教训）：改用 k2-fsa 维护的 SenseVoice 日语测试 wav（0.23MB，URL 稳定）。
+      - name: 下载日语测试音频（SenseVoice test_wavs/ja.wav）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          curl.exe -sL --fail --retry 3 -o ja.wav "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/test_wavs/ja.wav"
+          Get-Item ja.wav | Select-Object Name, Length
 
       - name: 下载 llama.cpp 预编译（win-cpu-x64，pin b11201）
         shell: pwsh
@@ -666,9 +668,8 @@ jobs:
       - name: 音频时长
         shell: pwsh
         run: |
-          $wav = "models/sherpa-onnx-qwen3-asr-0.6B-int8/test_wavs/ja1.wav"
-          $secs = python -c "import wave; w=wave.open(r'$wav'); print(w.getnframes()/w.getframerate())"
-          Write-Host "ja1.wav = $secs s"
+          $secs = python -c "import wave; w=wave.open('ja.wav'); print(w.getnframes()/w.getframerate())"
+          Write-Host "ja.wav = $secs s"
           "AUDIO_SECS=$secs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: 启动 llama-server 并跑探针
@@ -681,7 +682,7 @@ jobs:
           ) -RedirectStandardOutput server.out.log -RedirectStandardError server.err.log -PassThru -NoNewWindow
           try {
             python finetune/gguf_server_probe.py --url http://127.0.0.1:8080 `
-              --audio models/sherpa-onnx-qwen3-asr-0.6B-int8/test_wavs/ja1.wav `
+              --audio ja.wav `
               --expect kana --audio-secs $env:AUDIO_SECS `
               --out out/gguf/e1_report.json
             $code = $LASTEXITCODE
