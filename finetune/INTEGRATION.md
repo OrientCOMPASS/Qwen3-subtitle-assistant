@@ -165,3 +165,32 @@ qwen3-asr-1.7B-int8`），导出器与 k2-fsa 官方包不同——命名可能�
 | 精翻版（现状） | 0.6B / 1.7B int8 | Qwen3-1.7B GGUF 四段 | 发布级字幕 |
 | 快速直出版 | **1.7B s2tt 补丁包** + hotwords 开关 | 无 | 生肉速览/批量粗翻/低配机 |
 | （轻量选项） | 0.6B s2tt 补丁包（Gate 2 已全链路验证） | 无 | 极致速度，质量降档 |
+
+## 8. 运行时切换决策：llama.cpp/GGUF 取代 ORT 补丁路线（2026-09-26，用户决策）
+
+**决策**：放弃「sherpa-onnx/ONNX 权重补丁」作为最终运行时（B2 仅作已验证的中间成果
+保留在实验线），产品改用 **llama.cpp（GGUF）** 推理 S2TT 模型；同时**移除双模型
+工作流**（ASR→LLM 四段），产品收敛为单模型直出。动机（三条硬需求 ORT 路线都别扭）：
+
+| 需求 | llama.cpp/GGUF | ORT/sherpa-onnx 补丁 |
+|---|---|---|
+| 硬件加速 | CUDA + **Vulkan（任意 Windows GPU，无需 CUDA）** + CPU，动态后端 DLL 产品已有同款机制 | CUDA 需用户自备整套运行库；DirectML 需自编译 sherpa（编译期门 + device_id 硬编码 0） |
+| 显存加载后释放主机内存 | ggml 后端 buffer 迁移，`-ngl 99` 权重全上卡即释放 host 副本 | ORT IOBinding 行为不透明，DML 尤甚 |
+| 单一执行文件 | C/C++ 可静态链接进 Rust exe（产品已依赖 llama-cpp-2）；模型可嵌入资源或同包 | ORT+sherpa 一堆 DLL，静态链接支持差 |
+
+**支撑事实（全部已核实）**：
+* llama.cpp 官方支持 Qwen3-ASR：`tools/mtmd/models/qwen3a.cpp`（mtmd 音频路径），
+  ggml-org 官方 GGUF 仓库自 2026-04 存在（0.6B/1.7B，LM+mmproj 双文件），
+  README 用法即 `llama-server -hf ggml-org/Qwen3-ASR-1.7B-GGUF`；
+* 官方 `convert_lora_to_gguf.py` 存在；更稳的路径是 peft 合并后走
+  `convert_hf_to_gguf.py`（音频塔 LoRA 也一并进 mmproj，无 ONNX 路线的映射难题）；
+* 体积账（单文件 ≤2GiB）：1.7B LM Q4_K_M ≈1.1GB + mmproj Q8_0 356MB ≈ **1.5GB ✓**；
+  0.6B Q8_0 全家 ≈1.0GB ✓；1.7B Q8_0 全家 2.35GiB ✗（超）；
+* Rust 绑定缺口：llama-cpp-2 0.1.157（产品已锁）**没有 mtmd 绑定**——需要手写
+  薄 FFI（mtmd.h 用到 ~12 个函数）或推动上游；这是集成阶段的主要工程量。
+
+**验证链**：E1（本轮，`finetune.yml mode=gguf-e1`）官方 0.6B GGUF + llama-server
+证明运行时与 **system 段 context 通道**（任务开关的 GGUF 等价物）→ E2 合并 LoRA
+→ convert → quantize → 同探针断言直出中文（--expect cjk）→ E3 Rust FFI 集成 +
+移除 LLM 四段 + 单 exe 打包（含体积断言）。VAD 归属（silero 现依赖 sherpa-onnx）
+在 E3 一并解决：候选为保留极小 ORT 仅跑 VAD、或换 Rust 侧 silero 实现。

@@ -21,10 +21,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调；gpu-train=GPU 训练；onnx-inspect=Gate1 探针；onnx-patch=Gate2 补丁+sherpa-onnx 验证"
+        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调；gpu-train=GPU 训练；onnx-inspect=Gate1 探针；onnx-patch=Gate2 补丁+sherpa-onnx 验证；gguf-e1=llama.cpp GGUF 运行时探针"
         type: choice
         default: "cpu-smoke"
-        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect, onnx-patch]
+        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect, onnx-patch, gguf-e1]
       model:
         description: "基座模型"
         type: choice
@@ -607,3 +607,100 @@ jobs:
             out/patch/verify_report.json
           if-no-files-found: warn
           retention-days: 60
+
+  # ------------------------------------------------------------------ GGUF E1
+  # 运行时切换验证（用户决策：弃 ORT/ sherpa-onnx 补丁路线，改用最适合本模型的
+  # llama.cpp/GGUF——CUDA/Vulkan 硬件加速、权重入显存即释放主机内存、可静态链接
+  # 进单 exe）。E1 用 ggml-org 官方 0.6B GGUF + llama-server 证明：
+  #   1. llama.cpp（tools/mtmd/models/qwen3a.cpp 路径）能转录 Qwen3-ASR；
+  #   2. system 段 context 通道可用（S2TT 任务开关在新运行时的等价物）；
+  #   3. CPU 计时基线。E2 才换上「合并 LoRA 后的自产 GGUF」断言直出中文。
+  gguf-e1:
+    name: GGUF 运行时 E1：官方 GGUF + llama-server 探针
+    if: ${{ inputs.mode == 'gguf-e1' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Console UTF-8
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 还原产品模型缓存（只取 test_wavs/ja1.wav 作测试音频）
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: qwen3-models-v4-0.6B
+          fail-on-cache-miss: true
+
+      - name: 下载 llama.cpp 预编译（win-cpu-x64，pin b11201）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "b11201"
+          curl.exe -sL --fail --retry 3 -o llama.zip "https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-win-cpu-x64.zip"
+          Expand-Archive llama.zip -DestinationPath llama-bin -Force
+          $srv = Get-ChildItem llama-bin -Recurse -Filter llama-server.exe | Select-Object -First 1
+          if (-not $srv) { throw "包里找不到 llama-server.exe" }
+          Write-Host "llama-server: $($srv.FullName)"
+          & $srv.FullName --version
+          "LLAMA_SERVER=$($srv.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 下载官方 Qwen3-ASR-0.6B GGUF（Q8_0 + mmproj，~1.0GB）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main"
+          curl.exe -sL --fail --retry 3 -o asr.gguf "$base/Qwen3-ASR-0.6B-Q8_0.gguf"
+          curl.exe -sL --fail --retry 3 -o mmproj.gguf "$base/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
+          Get-Item asr.gguf, mmproj.gguf | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+      - name: 音频时长
+        shell: pwsh
+        run: |
+          $wav = "models/sherpa-onnx-qwen3-asr-0.6B-int8/test_wavs/ja1.wav"
+          $secs = python -c "import wave; w=wave.open(r'$wav'); print(w.getnframes()/w.getframerate())"
+          Write-Host "ja1.wav = $secs s"
+          "AUDIO_SECS=$secs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 启动 llama-server 并跑探针
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $p = Start-Process -FilePath $env:LLAMA_SERVER -ArgumentList @(
+            '-m', 'asr.gguf', '--mmproj', 'mmproj.gguf',
+            '--port', '8080', '--jinja', '-t', '4', '-c', '4096'
+          ) -RedirectStandardOutput server.out.log -RedirectStandardError server.err.log -PassThru -NoNewWindow
+          try {
+            python finetune/gguf_server_probe.py --url http://127.0.0.1:8080 `
+              --audio models/sherpa-onnx-qwen3-asr-0.6B-int8/test_wavs/ja1.wav `
+              --expect kana --audio-secs $env:AUDIO_SECS `
+              --out out/gguf/e1_report.json
+            $code = $LASTEXITCODE
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "=== server stderr 末尾 ==="
+          Get-Content server.err.log -Tail 25 -ErrorAction SilentlyContinue
+          Get-Content server.out.log -Tail 15 -ErrorAction SilentlyContinue
+          if ($code -ne 0) { throw "GGUF E1 探针失败（退出码 $code）" }
+
+      - name: 上传 E1 报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-gguf-e1
+          path: |
+            out/gguf/e1_report.json
+            server.out.log
+            server.err.log
+          if-no-files-found: warn
+          retention-days: 30
