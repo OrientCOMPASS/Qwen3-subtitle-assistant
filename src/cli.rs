@@ -193,6 +193,12 @@ pub struct Args {
     #[arg(long)]
     pub from_srt: bool,
 
+    /// 只做转录（+可选质检），写出 .raw.srt / .verified.srt 后停止，不加载翻译 LLM。
+    /// 用途：单独考察 ASR 行为（例如验证 --asr-hotwords 这个 context 通道
+    /// 能否让模型直接输出目标语言），以及"只要原文字幕"的场景。
+    #[arg(long)]
+    pub asr_only: bool,
+
     /// 输出目录（默认与源文件同目录）
     #[arg(long)]
     pub output_dir: Option<PathBuf>,

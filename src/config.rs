@@ -57,6 +57,7 @@ pub struct Config {
 
     // ---- 运行方式 ----
     pub from_srt: bool,
+    pub asr_only: bool,
     pub output_dir: Option<PathBuf>,
 }
 
@@ -101,6 +102,12 @@ impl Config {
             args.max_cue_secs
         };
 
+        if args.from_srt && args.asr_only {
+            anyhow::bail!("--from-srt 与 --asr-only 互斥（前者跳过 ASR，后者跳过翻译）");
+        }
+        if args.asr_only && args.no_review {
+            info!("--asr-only 模式下不会翻译，--no-review 无实际作用");
+        }
         if args.from_srt {
             for f in &args.files {
                 if f.extension().and_then(|e| e.to_str()) != Some("srt") {
@@ -164,6 +171,7 @@ impl Config {
             layout_enabled: !args.no_layout,
             review_enabled: !args.no_review,
             from_srt: args.from_srt,
+            asr_only: args.asr_only,
             output_dir: args.output_dir.clone(),
         };
         info!("使用 LLM 模型: {:?}", cfg.llm_model);
@@ -396,6 +404,7 @@ mod tests {
             no_layout: false,
             no_review: true,
             from_srt: false,
+            asr_only: false,
             output_dir: None,
             log_file: None,
             no_pause: true,
