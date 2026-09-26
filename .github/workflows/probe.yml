@@ -1,0 +1,196 @@
+# ============================================================================
+# 实验线专用（仅手动触发）：T4 —— ASR context 通道探针
+#
+# 为什么这么精简：产品回归（构建 / 单测 / T1 真实视频 / T2 摘要分块 /
+# T3 迁移目录）全部在 master 的 ci.yml。本分支是研究分支，只回答一个问题：
+#
+#   不做任何微调，只把指令塞进 Qwen3-ASR 的 system 段（--asr-hotwords），
+#   能不能让它直接输出中文？
+#
+# 因此这里 **不重新编译**：直接下载 master 最新一次 CI 上传的 win-x64-runtime
+# 产物（exe + DLL），模型与测试媒体也复用 master 已建好的缓存。
+# 整个 job 只跑 ASR（--asr-only --no-qc，完全不加载 1.7B LLM），约 5 分钟。
+#
+# 注：GitHub 只索引「默认分支上存在」或「曾经运行过」的 workflow。本文件首次
+# 落地时借一次 push 触发完成了注册（workflow id 367556133），此后只能手动触发
+# （ref 选 exp/asr-s2tt 或 master 均可）。
+# ============================================================================
+name: probe-asr-context
+
+on:
+  workflow_dispatch:
+    inputs:
+      hotwords:
+        description: "塞进 system 段的指令（留空 = 不注入 context）"
+        default: "Please translate the Japanese speech into Simplified Chinese. Output only the Chinese translation, no Japanese."
+      control:
+        description: "是否同时跑一次「不注入 context」的对照组"
+        type: choice
+        options: ["yes", "no"]
+        default: "yes"
+      pytorch_context:
+        description: "是否用官方未量化实现交叉验证（区分「量化丢能力」与「context 本就不能翻译」，需下载 ~1.2GB 模型）"
+        type: choice
+        options: ["no", "yes"]
+        default: "no"
+      bvid:
+        description: "指定测试视频 BV 号（留空 = 用缓存里最短的一条）"
+        default: ""
+
+permissions:
+  contents: read
+  actions: read   # 跨 run 下载 master 的构建产物需要
+
+concurrency:
+  group: probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # push 触发时 inputs 为空，用 || 兜住默认值
+  HW: ${{ inputs.hotwords || 'Please translate the Japanese speech into Simplified Chinese. Output only the Chinese translation, no Japanese.' }}
+  CONTROL: ${{ inputs.control || 'yes' }}
+  PT: ${{ inputs.pytorch_context || 'no' }}
+  WANT_BV: ${{ inputs.bvid || '' }}
+
+jobs:
+  probe:
+    name: T4 context 通道探针
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Console UTF-8
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+          "PYTHONIOENCODING=utf-8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 安装 ffmpeg / ffprobe（exe 解码媒体时需要）
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress -y | Out-Null
+          RefreshEnv
+          ffmpeg -version | Select-Object -First 1
+
+      - name: 取 master 最新一次带 win-x64-runtime 的 CI run
+        id: find-build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $runs = Invoke-RestMethod -Headers $h -Uri "$api/actions/runs?branch=master&per_page=30"
+          $pick = $null
+          foreach ($r in $runs.workflow_runs) {
+            $arts = Invoke-RestMethod -Headers $h -Uri "$($r.artifacts_url)?per_page=30"
+            if ($arts.artifacts | Where-Object { $_.name -eq 'win-x64-runtime' }) { $pick = $r; break }
+          }
+          if (-not $pick) { throw "找不到带 win-x64-runtime 产物的 master run" }
+          "run-id=$($pick.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha=$($pick.head_sha)"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "复用 master run $($pick.id)（$($pick.head_sha.Substring(0,7))）的构建产物，不重新编译"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 下载构建产物（exe + DLL）
+        uses: actions/download-artifact@v4
+        with:
+          name: win-x64-runtime
+          run-id: ${{ steps.find-build.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: target/release
+
+      - name: 还原模型缓存（~2.7GB，复用 master 建好的）
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: qwen3-models-v4-0.6B
+          fail-on-cache-miss: true
+
+      - name: 还原测试媒体缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: media-cache
+          key: e2e-media-bilibili-v3
+          fail-on-cache-miss: true
+
+      - name: 选定探针片段（默认取最短的一条）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path media | Out-Null
+          $all = Get-ChildItem media-cache -File | Where-Object { $_.Length -gt 100KB }
+          if ($env:WANT_BV) { $all = $all | Where-Object { $_.BaseName -like "*$($env:WANT_BV)*" } }
+          if (-not $all) { throw "缓存里没有匹配的媒体文件（WANT_BV=$env:WANT_BV）" }
+          $pick = $all | Sort-Object Length | Select-Object -First 1
+          $dest = "media/probe$($pick.Extension)"
+          Copy-Item $pick.FullName $dest -Force
+          "PROBE_MEDIA=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "探针片段：$($pick.Name)（$([math]::Round($pick.Length/1MB,2)) MB）→ $dest"
+
+      - name: T4a 对照组：不注入 context（预期输出日语）
+        if: env.CONTROL == 'yes'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path media/t4-control | Out-Null
+          & ./target/release/subtitle-assistant.exe --no-pause --asr-only --no-qc `
+              --output-dir media/t4-control --log-file media/t4-control.log `
+              --device cpu --asr-threads 4 $env:PROBE_MEDIA
+          Write-Host "T4a 退出码=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { Get-Content media/t4-control.log -Tail 30; throw "对照组运行失败" }
+
+      - name: T4b 实验组：把翻译指令塞进 system 段
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "注入的 context: $env:HW"
+          New-Item -ItemType Directory -Force -Path media/t4 | Out-Null
+          & ./target/release/subtitle-assistant.exe --no-pause --asr-only --no-qc `
+              --asr-hotwords "$env:HW" `
+              --output-dir media/t4 --log-file media/t4.log `
+              --device cpu --asr-threads 4 $env:PROBE_MEDIA
+          Write-Host "T4b 退出码=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { Get-Content media/t4.log -Tail 30; throw "实验组运行失败" }
+
+      - name: 判定：context 通道能否改变输出语言
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probe = Get-ChildItem media/t4 -Filter *.raw.srt | Select-Object -First 1
+          if (-not $probe) { throw "实验组没有产出 .raw.srt" }
+          $ctl = Get-ChildItem media/t4-control -Filter *.raw.srt -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ctl) {
+            Write-Warning "没有对照组，改用实验组自比（结论强度下降）"
+            $ctl = $probe
+          }
+          python scripts/probe_asr_context.py --control $ctl.FullName --probe $probe.FullName |
+            Tee-Object -FilePath probe-report.txt
+
+      - name: 交叉验证（可选）：官方未量化实现的 context 通道
+        if: env.PT == 'yes'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet torch numpy soundfile qwen-asr
+          python finetune/probe_context_pytorch.py --media "$env:PROBE_MEDIA" --context "$env:HW" |
+            Tee-Object -FilePath probe-report-pytorch.txt
+
+      - name: 上传探针产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-asr-context
+          path: |
+            probe-report*.txt
+            media/t4/*.raw.srt
+            media/t4-control/*.raw.srt
+            media/t4.log
+            media/t4-control.log
+          if-no-files-found: warn
+          retention-days: 14

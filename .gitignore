@@ -7,3 +7,7 @@
 /bundle
 # 测试夹具必须入库
 !tests/fixtures/*.srt
+/finetune/data
+/finetune/out
+__pycache__/
+*.pyc

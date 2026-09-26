@@ -1,0 +1,475 @@
+# ============================================================================
+# Qwen3-ASR -> S2TT（日语语音直接输出中文字幕）微调实验。
+#
+# 全部模式仅手动触发（workflow_dispatch），push 不消耗 runner；产品回归在 ci.yml。
+# 源于 exp/asr-s2tt 实验分支，随双版本路线并入 master。
+#
+# 两种模式：
+#   cpu-smoke（默认，GitHub 托管 runner）：4 条样本 + 2 步 LoRA，**只验证管线可跑通**
+#       （数据格式、prefix/target 切分、labels 掩码、训练回路、适配器保存与挂载、评测脚本）。
+#       用 stub 伪翻译，因此翻译质量指标必然不达标——这是预期的，不作为失败。
+#   gpu-train（需要 self-hosted + gpu 标签的 runner）：真实训练，用 --translator api
+#       调 OpenAI 兼容端点做日->中翻译，产出可用的 LoRA 适配器。
+#
+# 为什么托管 runner 只能冒烟：GitHub 托管 runner 无 GPU，而 0.6B 音频 LLM 的全量训练
+# 在 4 vCPU 上不可行；质量验证必须上 GPU（见 finetune/README.md 的硬件表）。
+# ============================================================================
+name: finetune-experiment
+
+# 实验分支：只在手动触发时跑，push 不消耗 runner（精简后的分支 CI 见 probe.yml）。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调(用提交的对照表，无需 API key)；gpu-train=GPU 真实训练；onnx-inspect=ONNX 权重补丁可行性探针"
+        type: choice
+        default: "cpu-smoke"
+        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect]
+      model:
+        description: "基座模型"
+        type: choice
+        default: "Qwen/Qwen3-ASR-0.6B"
+        options: [Qwen/Qwen3-ASR-0.6B, Qwen/Qwen3-ASR-1.7B]
+      samples:
+        description: "训练样本数（gpu-train 建议 >= 2000）"
+        type: string
+        default: "4"
+      steps:
+        description: "最大训练步数（-1 = 按 epochs 走完）"
+        type: string
+        default: "2"
+      translator:
+        description: "翻译后端（gpu-train 请用 api）"
+        type: choice
+        default: "stub"
+        options: [stub, api]
+      adapter_run:
+        description: "onnx-inspect 用：s2tt-real-mini 适配器所在 run id"
+        type: string
+        default: "36238661344"
+
+permissions:
+  contents: read
+  actions: read   # onnx-inspect 跨 run 下载适配器 artifact 需要
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  ADAPTER_RUN: ${{ inputs.adapter_run || '36238661344' }}
+
+jobs:
+  cpu-smoke:
+    name: CPU 管线冒烟（非质量验证）
+    if: ${{ inputs.mode == 'cpu-smoke' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace 模型（0.6B 约 1.8GB）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-0.6B-v1
+
+      - name: 安装依赖（CPU 版 torch + qwen-asr + peft）
+        run: |
+          set -e
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          # qwen-asr 会锁定 transformers==4.57.6 / accelerate==1.12.0
+          pip install --quiet qwen-asr peft datasets soundfile librosa
+          # 注意：qwen-asr 0.0.6 的 __init__.py 里 __all__ 声明了 __version__ 却从未定义它
+          # （上游 packaging bug），所以版本号只能从 importlib.metadata 取。
+          python -c "import importlib.metadata as md, torch, transformers, peft, qwen_asr; \
+            print('torch', torch.__version__, '| transformers', transformers.__version__, \
+                  '| peft', peft.__version__, '| qwen-asr', md.version('qwen-asr')); \
+            print('Qwen3ASRModel:', qwen_asr.Qwen3ASRModel)"
+
+      - name: 构造数据（FLEURS ja_jp + stub 伪翻译 + 静音样本）
+        run: |
+          python finetune/prepare_data.py \
+            --source fleurs --limit 4 --eval-limit 2 \
+            --max-audio-secs 12 --translator stub --asr-ratio 0.5 \
+            --silence-samples 2 \
+            --audio-dir data/audio --out data/train.jsonl --eval-out data/eval.jsonl
+          echo "--- train.jsonl（首行，audio 路径已截断）---"
+          python -c "import json;l=open('data/train.jsonl',encoding='utf-8').readline();d=json.loads(l);d['audio']='...'+d['audio'][-24:];print(json.dumps(d,ensure_ascii=False,indent=2))"
+          wc -l data/train.jsonl data/eval.jsonl
+
+      - name: 导出 FLEURS 转写（供离线翻译成对照表）
+        run: |
+          # 这一步只为拿到"CI 实际会抽到的那批日语文本"，翻译成人力可控的对照表后
+          # 就能用 --translator table 做**真实**微调实验，全程不需要任何 API key。
+          # FLEURS 流式读取顺序是确定的，所以 --limit 相同则抽到的样本相同。
+          python finetune/prepare_data.py \
+            --source fleurs --limit 300 --eval-limit 0 --max-audio-secs 15 \
+            --translator none --asr-ratio 1.0 \
+            --audio-dir data/audio_dump --out data/dump_only.jsonl \
+            --eval-out data/dump_eval.jsonl \
+            --dump-transcripts data/transcripts.txt
+          wc -l data/transcripts.txt
+          head -5 data/transcripts.txt
+
+      - name: LoRA 微调 2 步（CPU）
+        run: |
+          python finetune/sft_lora.py \
+            --model Qwen/Qwen3-ASR-0.6B --train data/train.jsonl --eval data/eval.jsonl \
+            --out out/smoke --device cpu --lora --lora-r 8 \
+            --max-samples 4 --max-steps 2 --batch-size 1 --grad-acc 1 --lr 2e-4 --log-steps 1
+
+      - name: 评测（CPU；stub 数据下质量指标不达标属预期）
+        run: |
+          python finetune/eval_s2tt.py \
+            --model Qwen/Qwen3-ASR-0.6B --adapter out/smoke/lora \
+            --eval data/eval.jsonl --limit 2 --device cpu --silence-secs 2 \
+            --out out/smoke/eval_report.json
+
+      - name: 管线冒烟判定
+        run: |
+          python - <<'PY'
+          import json, math, pathlib
+          rep = json.loads(pathlib.Path('out/smoke/train_report.json').read_text(encoding='utf-8'))
+          ev = json.loads(pathlib.Path('out/smoke/eval_report.json').read_text(encoding='utf-8'))
+          fails = []
+          loss = rep.get('final_loss')
+          if not isinstance(loss, float) or not math.isfinite(loss) or loss <= 0:
+              fails.append(f'final_loss 异常: {loss!r}')
+          if rep.get('train_samples', 0) < 1:
+              fails.append('训练样本数为 0')
+          if rep.get('trainable_params_m', 0) <= 0:
+              fails.append('LoRA 可训练参数为 0（适配器没挂上）')
+          if not ev.get('translated_samples') and not ev.get('transcribed_samples'):
+              fails.append('评测没有任何输出样本')
+          sil = ev.get('silence') or {}
+          sil_errs = [f"{k}: {v['error']}" for k, v in sil.items()
+                      if isinstance(v, dict) and v.get('error')]
+          if sil_errs:
+              fails.append(f"静音推理报错: {sil_errs}")
+          print('=== 管线冒烟结论 ===')
+          print(f"  final_loss        = {loss}")
+          print(f"  可训练参数(M)     = {rep.get('trainable_params_m')}")
+          print(f"  训练耗时(s)       = {rep.get('train_seconds')}")
+          print(f"  翻译组输出假名占比 = {ev['metrics']['translated_avg_kana']}")
+          print(f"  转写组输出假名占比 = {ev['metrics']['transcribed_avg_kana']}")
+          print(f"  静音输出          = {json.dumps(ev.get('silence'), ensure_ascii=False)}")
+          print('注意：本轮用 stub 伪翻译 + CPU + 2 步，翻译质量指标不达标是预期行为，')
+          print('      本判定只检查"管线是否跑通"。质量验证请用 gpu-train 模式。')
+          if fails:
+              print('失败项:', fails)
+              raise SystemExit(1)
+          print('✔ 数据格式 / prefix-target 切分 / 训练回路 / 适配器保存与挂载 / 评测脚本 全部跑通')
+          PY
+
+      - name: 上传实验产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-cpu-smoke
+          path: |
+            out/smoke/train_report.json
+            out/smoke/eval_report.json
+            data/train.jsonl
+            data/eval.jsonl
+            data/transcripts.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+  real-mini:
+    name: CPU 真实微调（固定对照表，无需 API key）
+    if: ${{ inputs.mode == 'real-mini' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace 模型
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-0.6B-v1
+
+      - name: 安装依赖
+        run: |
+          set -e
+          pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet qwen-asr peft datasets soundfile librosa
+
+      - name: 检查对照表
+        run: |
+          if [ ! -f finetune/parallel_ja_zh.tsv ]; then
+            echo "::error::缺少 finetune/parallel_ja_zh.tsv。"
+            echo "先跑一次 cpu-smoke，从 artifact 里取 data/transcripts.txt，"
+            echo "翻译成 日文<TAB>中文 的两列 TSV 提交进仓库，再触发本模式。"
+            exit 1
+          fi
+          echo "对照表行数: $(grep -cv '^#' finetune/parallel_ja_zh.tsv)"
+          head -3 finetune/parallel_ja_zh.tsv
+
+      - name: 构造数据（table 翻译，未命中即跳过；混入静音样本）
+        run: |
+          # --limit/--eval-limit 必须落在对照表覆盖范围内（表覆盖 FLEURS 流式顺序的前 120 条），
+          # 否则评测集会因未命中而被全部跳过。100 训练 + 20 评测：
+          #   asr-ratio 0.3 => 约 70 条"带 prompt 的翻译样本" + 30 条"无 prompt 的转写样本"（抗遗忘锚点）
+          # --silence-samples 20 => 合成静音/低噪样本（目标 language None+空文本，双模式各半），
+          #   保住「静音->空输出」行为——上一轮 real-mini（run 36221464174）翻译/抗遗忘都达标，
+          #   唯独静音被训坏（输出中文幻觉），而逐句质检依赖它剔除噪音段。
+          python finetune/prepare_data.py \
+            --source fleurs --limit 100 --eval-limit 20 --max-audio-secs 15 \
+            --translator table --table finetune/parallel_ja_zh.tsv --skip-untranslated \
+            --asr-ratio 0.3 --silence-samples 20 \
+            --audio-dir data/audio \
+            --out data/train.jsonl --eval-out data/eval.jsonl \
+            --dump-transcripts data/transcripts.txt
+          echo "训练集 $(wc -l < data/train.jsonl) 条 / 评测集 $(wc -l < data/eval.jsonl) 条"
+          python - <<'PY'
+          import json, pathlib
+          rows = [json.loads(l) for l in pathlib.Path('data/train.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()]
+          sil  = [r for r in rows if r['text'].startswith('language None')]
+          real = [r for r in rows if not r['text'].startswith('language None')]
+          mt   = [r for r in real if r['prompt']]
+          asr  = [r for r in real if not r['prompt']]
+          print(f'  翻译 {len(mt)} 条 / 转写 {len(asr)} 条 / 静音 {len(sil)} 条'
+                f'（静音中带 prompt {len([r for r in sil if r["prompt"]])} 条）')
+          for r in mt[:3]:
+              print('   例:', r['text'][:80])
+          if not mt:
+              raise SystemExit('没有翻译样本，无法验证 S2TT')
+          if not sil:
+              raise SystemExit('没有静音样本（--silence-samples 未生效？）')
+          PY
+          wc -l data/train.jsonl data/eval.jsonl
+
+      - name: LoRA 微调（CPU）
+        run: |
+          python finetune/sft_lora.py \
+            --model "${{ inputs.model }}" --train data/train.jsonl --eval data/eval.jsonl \
+            --out out/real --device cpu --lora --lora-r 32 --lora-alpha 64 \
+            --epochs 4 --max-steps -1 --batch-size 1 --grad-acc 2 \
+            --lr 3e-4 --log-steps 10
+          # 120 样本（100 真实 + 20 静音）/ (1×2) × 4 epoch = 240 个优化步；
+          # CPU 实测约 5.8 秒/步 => 约 23 分钟（上一轮 200 步实测 19.3 分钟）
+
+      - name: 评测（真实数据：翻译是否生效 / 是否遗忘 / 静音行为）
+        run: |
+          python finetune/eval_s2tt.py \
+            --model "${{ inputs.model }}" --adapter out/real/lora \
+            --eval data/eval.jsonl --limit 20 --device cpu --silence-secs 2 \
+            --out out/real/eval_report.json
+
+      - name: 基座模型静音诊断（归因用，不挂适配器）
+        run: |
+          # 判定静音检查前先归因：基座模型在 transformers+float32 路径下对 2s 纯数字静音
+          # 是否本来就输出空。若基座也非空，静音问题就不是微调造成的（判定里只警示不判红）。
+          python finetune/eval_s2tt.py \
+            --model "${{ inputs.model }}" --silence-only \
+            --device cpu --silence-secs 2 \
+            --out out/real/base_silence.json
+
+      - name: 判定
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          ev = json.loads(pathlib.Path('out/real/eval_report.json').read_text(encoding='utf-8'))
+          tr = json.loads(pathlib.Path('out/real/train_report.json').read_text(encoding='utf-8'))
+          bp = pathlib.Path('out/real/base_silence.json')
+          base = json.loads(bp.read_text(encoding='utf-8')) if bp.is_file() else None
+          m, c = ev['metrics'], ev['checks']
+          print('=== 真实微调结论 ===')
+          print(f"  训练样本 {tr['train_samples']} 条 / loss {tr['final_loss']:.4f} / {tr['train_seconds']:.0f}s")
+          print(f"  带 prompt（翻译模式）输出假名占比 = {m['translated_avg_kana']}")
+          print(f"  不带 prompt（转写模式）输出假名占比 = {m['transcribed_avg_kana']}"
+                f"（整条泄漏 {m.get('transcribed_leak_count')} / 20）")
+          print(f"  静音输出（适配器） = {json.dumps(ev.get('silence'), ensure_ascii=False)}")
+          if base is not None:
+              print(f"  静音输出（基座）   = {json.dumps(base.get('silence'), ensure_ascii=False)}")
+          for s in ev['translated_samples'][:5]:
+              print(f"    [翻译] {s['out'][:60]}")
+          for s in ev['transcribed_samples'][:3]:
+              print(f"    [转写] {s['out'][:60]}")
+          for k, v in c.items():
+              print(f"  {'✔' if v else '✘'} {k}")
+          # README 判定标准：三项必须同时成立（上一轮只强制了翻译生效，静音 ✘ 仍判绿，收敛掉）
+          fails = []
+          if not c.get('translation_takes_effect'):
+              fails.append('翻译未生效：带 prompt 时输出仍以日语为主。'
+                           '需要更多样本/更多步数/更大 LoRA 秩，或改用 GPU 全参微调。')
+          if not c.get('no_catastrophic_forgetting'):
+              fails.append('灾难性遗忘：不带 prompt 时输出不再以日语为主。'
+                           '提高 --asr-ratio 或减少训练步数。')
+          base_ok = bool(base and base.get('checks', {}).get('silence_is_empty'))
+          if c.get('silence_is_empty') is False:
+              if base_ok:
+                  fails.append('静音行为被训坏（基座静音输出为空、挂适配器后幻觉）：'
+                               '增大 --silence-samples、降低学习率或减少 epoch。')
+              else:
+                  print('⚠ 基座模型在 transformers 路径下对纯数字静音也非空——'
+                        '静音异常不归因于本次微调，仅作参考（产品路径 sherpa-onnx 的行为需另行验证）。')
+          if fails:
+              for f in fails:
+                  print('✘', f)
+              raise SystemExit(1)
+          if c.get('silence_is_empty') is False:
+              print('✔ 结论：翻译生效 / 未遗忘 两项通过；静音行为与基座一致（不归因于本次微调），'
+                    'context 可作为任务开关')
+          else:
+              print('✔ 结论：三项判定全部通过——翻译生效 / 未遗忘 / 静音行为保留，'
+                    'context 可作为任务开关，微调后 ASR 能直接输出中文')
+          PY
+
+      - name: 上传适配器与报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-real-mini
+          path: |
+            out/real/lora
+            out/real/train_report.json
+            out/real/eval_report.json
+            out/real/base_silence.json
+            data/train.jsonl
+            data/eval.jsonl
+          if-no-files-found: warn
+          retention-days: 60
+
+  gpu-train:
+    name: GPU 真实训练（需 self-hosted + gpu runner）
+    if: ${{ inputs.mode == 'gpu-train' }}
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          set -e
+          pip install --quiet --upgrade pip
+          pip install --quiet qwen-asr peft datasets soundfile librosa
+          # FlashAttention-2 可显著省显存/提速（需要 Ampere+）；失败不阻塞
+          MAX_JOBS=4 pip install -U flash-attn --no-build-isolation || echo "flash-attn 安装失败，继续"
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+
+      - name: 构造数据（FLEURS ja_jp + API 翻译）
+        env:
+          S2TT_API_KEY: ${{ secrets.S2TT_API_KEY }}
+        run: |
+          python finetune/prepare_data.py \
+            --source fleurs --limit ${{ inputs.samples }} --eval-limit 40 \
+            --max-audio-secs 20 --translator ${{ inputs.translator }} \
+            --api-base "${{ vars.S2TT_API_BASE }}" --api-model "${{ vars.S2TT_API_MODEL }}" \
+            --api-key-env S2TT_API_KEY --asr-ratio 0.5 \
+            --audio-dir data/audio --out data/train.jsonl --eval-out data/eval.jsonl
+          wc -l data/train.jsonl data/eval.jsonl
+
+      - name: LoRA 微调
+        run: |
+          python finetune/sft_lora.py \
+            --model "${{ inputs.model }}" --train data/train.jsonl --eval data/eval.jsonl \
+            --out out/s2tt --lora --lora-r 16 --lora-alpha 32 \
+            --epochs 1 --max-steps ${{ inputs.steps }} --batch-size 4 --grad-acc 4 \
+            --lr 2e-4 --warmup-steps 50 --log-steps 10 --save-steps 200 --grad-ckpt
+
+      - name: 评测（翻译是否生效 / 是否遗忘 / 静音行为）
+        run: |
+          python finetune/eval_s2tt.py \
+            --model "${{ inputs.model }}" --adapter out/s2tt/lora \
+            --eval data/eval.jsonl --limit 40 --silence-secs 2 \
+            --out out/s2tt/eval_report.json
+
+      - name: 上传适配器与报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-lora-adapter
+          path: |
+            out/s2tt/lora
+            out/s2tt/train_report.json
+            out/s2tt/eval_report.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ------------------------------------------------------------------ ONNX 探针
+  # 「快速直出版」的落地路线 B2：不重写导出器，而是把 LoRA 的 ΔW=B·A·(α/r) 手术式
+  # 写回官方 sherpa-onnx decoder.int8.onnx（LoRA 只挂 LM 解码器 7 类投影，音频塔/
+  # projector/tokenizer 原样复用）。本 job 是动手术前的全部前置事实核查：
+  # 张量地图（命名/dtype/量化 axis/scale-zp）、HF↔ONNX 同源抽样、ΔW 幅度、
+  # 按原 scale 重量化的削顶率。详见 finetune/INTEGRATION.md 与脚本 docstring。
+  onnx-inspect:
+    name: ONNX 权重补丁可行性探针（LoRA→decoder.int8）
+    if: ${{ inputs.mode == 'onnx-inspect' }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Console UTF-8
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 还原产品模型缓存（sherpa-onnx int8 包，master CI 建好）
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: qwen3-models-v4-0.6B
+          fail-on-cache-miss: true
+
+      - name: Cache HuggingFace 基座（windows key，s2tt-e2e 已建）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen3-asr-0.6B-win-v1
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet onnx safetensors huggingface_hub numpy
+
+      - name: 下载 LoRA 适配器（real-mini 产物）
+        uses: actions/download-artifact@v4
+        with:
+          name: s2tt-real-mini
+          run-id: ${{ env.ADAPTER_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: art
+
+      - name: 运行探针
+        shell: pwsh
+        run: |
+          python finetune/inspect_onnx_lora.py `
+            --model-dir models/sherpa-onnx-qwen3-asr-0.6B-int8 `
+            --hf-model Qwen/Qwen3-ASR-0.6B `
+            --adapter art/out/real/lora `
+            --out out/inspect/onnx_patch_report.json
+          if ($LASTEXITCODE -ne 0) { throw "探针运行失败" }
+
+      - name: 上传探针报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2tt-onnx-inspect
+          path: out/inspect/onnx_patch_report.json
+          if-no-files-found: warn
+          retention-days: 60
