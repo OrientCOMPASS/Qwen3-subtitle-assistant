@@ -11,14 +11,13 @@
 # 产物（exe + DLL），模型与测试媒体也复用 master 已建好的缓存。
 # 整个 job 只跑 ASR（--asr-only --no-qc，完全不加载 1.7B LLM），约 5 分钟。
 #
-# 注：GitHub 只索引「默认分支上存在」或「曾经运行过」的 workflow，所以本文件
-# 首次落地时需要一次 push 触发来完成注册；注册后即可长期只用手动触发。
+# 注：GitHub 只索引「默认分支上存在」或「曾经运行过」的 workflow。本文件首次
+# 落地时借一次 push 触发完成了注册（workflow id 367556133），此后 push 到本分支
+# 不再触发任何 workflow，只能用手动触发（ref 选 exp/asr-s2tt）。
 # ============================================================================
 name: probe-asr-context
 
 on:
-  push:
-    branches: [exp/asr-s2tt]
   workflow_dispatch:
     inputs:
       hotwords:
@@ -69,6 +68,13 @@ jobs:
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $OutputEncoding = [System.Text.Encoding]::UTF8
           "PYTHONIOENCODING=utf-8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 安装 ffmpeg / ffprobe（exe 解码媒体时需要）
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress -y | Out-Null
+          RefreshEnv
+          ffmpeg -version | Select-Object -First 1
 
       - name: 取 master 最新一次带 win-x64-runtime 的 CI run
         id: find-build
@@ -131,6 +137,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path media/t4-control | Out-Null
           & ./target/release/subtitle-assistant.exe --no-pause --asr-only --no-qc `
               --output-dir media/t4-control --log-file media/t4-control.log `
               --device cpu --asr-threads 4 $env:PROBE_MEDIA
@@ -142,6 +149,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           Write-Host "注入的 context: $env:HW"
+          New-Item -ItemType Directory -Force -Path media/t4 | Out-Null
           & ./target/release/subtitle-assistant.exe --no-pause --asr-only --no-qc `
               --asr-hotwords "$env:HW" `
               --output-dir media/t4 --log-file media/t4.log `
