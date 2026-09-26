@@ -69,16 +69,29 @@ models/sherpa-onnx-qwen3-asr-0.6B-s2tt-int8/
 
 **残留风险**：若某个被 LoRA 命中的权重在 ONNX 里被导出器折叠/吸收进别的算子
 （值匹配找不到同源张量），该模块无法补丁——探针会以 NO-GO 明示，届时降级到
-「重训一个只挂 LM 且可映射的适配器」或路线 A。197 个量化 MatMul 与 196+embed
-的账目差 1（多出的那个由 v2 值匹配指认，可能是 tied lm_head 或 projector）。
+「重训一个只挂 LM 且可映射的适配器」或路线 A。
+
+### Gate 1 结果（run 36252216017，v2.1 探针，真实官方 0.6B 包）：**三项全 GO**
+
+| 判据 | 结果 |
+|---|---|
+| 适配器映射 | **250/250**（decoder 196 个 uint8 + encoder 54 个 int8；308 个量化权重全部值匹配成功，未匹配 0） |
+| HF↔ONNX 同源 | 适配器相关张量最大 rel_err **1.22e-2**（中位 9.1e-3，量化噪声量级） |
+| 按原 scale 重量化削顶 | 最坏 **0.109%** < 1%（逐模块 3~10e-4，requant MSE ~5e-8）→ **补丁直接沿用原 scale/zp，无需重算** |
+
+补充事实：全部权重按 MatMulInteger B 侧 **(K,N) 转置存储**（补丁写回时要转置 ΔW）；
+LM 侧 uint8 非对称（带 zp）、音频塔 int8 对称；ΔW 相对幅度最大 0.0402。
+唯一 flag：`onnx::MatMul_9785_quantized` 值匹配二义（best 与 second 均 8.13e-3）——
+tied lm_head/embed_tokens 等值所致，不在 LoRA 范围内，无害。
+**结论：B2 路线放行，进入 Gate 2（补丁器 + sherpa-onnx 推理验证）。**
 
 ## 4. 验证链（三道闸，全在 CI，不过闸不发布）
 
-| 闸 | 内容 | 工具 |
-|---|---|---|
-| Gate 1 | 上述前置事实核查，输出 go/no-go | `finetune.yml` mode=onnx-inspect（windows，复用产品模型缓存+HF 缓存+适配器 artifact，~10 分钟） |
-| Gate 2 | 补丁器写出 s2tt 模型目录 → **sherpa-onnx 运行时**（pip）推理：FLEURS eval 带 hotwords 直出中文（假名≤5%）/ 不带仍日语 / 静音→空；与 PyTorch sidecar 输出交叉一致 | 新增 `finetune/patch_onnx_lora.py` + verify job |
-| Gate 3 | **产品级**：Rust exe + `--asr-model-dir …s2tt…` + `--asr-hotwords "translate to Chinese"` 跑与 `s2tt-e2e` 同一视频，字幕一致率达标。T4 的教训：int8 量化会改变模型行为，**必须**在最终运行时上复测，不能只信 PyTorch 侧 | master `ci.yml` 增加 T5 用例（或 s2tt-e2e 加 sherpa 模式） |
+| 闸 | 内容 | 工具 | 状态 |
+|---|---|---|---|---|
+| Gate 1 | 上述前置事实核查，输出 go/no-go | `finetune.yml` mode=onnx-inspect（windows，复用产品模型缓存+HF 缓存+适配器 artifact，~10 分钟） | ✅ **三项全 GO**（run 36252216017，见 §3） |
+| Gate 2 | 补丁器写出 s2tt 模型目录 → **sherpa-onnx 运行时**（pip）推理：FLEURS eval 带 hotwords 直出中文（假名≤5%）/ 不带仍日语 / 静音→空；与 PyTorch sidecar 输出交叉一致 | 新增 `finetune/patch_onnx_lora.py` + verify job | 待做 |
+| Gate 3 | **产品级**：Rust exe + `--asr-model-dir …s2tt…` + `--asr-hotwords "translate to Chinese"` 跑与 `s2tt-e2e` 同一视频，字幕一致率达标。T4 的教训：int8 量化会改变模型行为，**必须**在最终运行时上复测，不能只信 PyTorch 侧 | master `ci.yml` 增加 T5 用例（或 s2tt-e2e 加 sherpa 模式） | 待做 |
 
 ## 5. Rust 侧最小改动清单（Gate 2 过后动工）
 
