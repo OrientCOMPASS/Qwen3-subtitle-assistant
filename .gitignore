@@ -9,3 +9,5 @@
 !tests/fixtures/*.srt
 /finetune/data
 /finetune/out
+__pycache__/
+*.pyc
