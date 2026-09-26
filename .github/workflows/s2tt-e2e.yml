@@ -60,7 +60,9 @@ permissions:
   actions: read   # 跨 run 下载适配器与 master e2e 产物需要
 
 concurrency:
-  group: s2tt-e2e-${{ github.ref }}
+  # 分组带上 bvid/adapter/model：不同视频/模型的实验可以并行，互不取消
+  # （实测教训：两个 dispatch 同组，后一个把前一个秒杀了）
+  group: s2tt-e2e-${{ github.ref }}-${{ inputs.bvid || 'default' }}-${{ inputs.adapter_run || 'default' }}-${{ inputs.model || 'default' }}
   cancel-in-progress: true
 
 env:
