@@ -86,6 +86,15 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     log(f"保存合并模型 -> {out}")
     t2 = time.time()
+    # 官方 generation_config.json 带着 do_sample=False + temperature=1e-6（还有 top_p/top_k），
+    # transformers 4.57.6 的严格校验拒绝将其落盘（ValueError: GenerationConfig is invalid）。
+    # 贪心解码本来就不消费采样参数，置 None 语义无损。
+    gc = getattr(top, "generation_config", None)
+    if gc is not None and not getattr(gc, "do_sample", False):
+        for attr in ("temperature", "top_p", "top_k"):
+            if getattr(gc, attr, None) is not None:
+                log(f"  generation_config.{attr}={getattr(gc, attr)} -> None（贪心模式不消费）")
+                setattr(gc, attr, None)
     top.save_pretrained(str(out), safe_serialization=True)
     # processor / tokenizer（convert_hf_to_gguf 需要 tokenizer 与 chat template）
     try:
