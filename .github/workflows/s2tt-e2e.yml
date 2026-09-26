@@ -17,14 +17,19 @@
 #   * 适配器复用 real-mini run 的 s2tt-real-mini artifact（默认 36238661344），
 #     不重新训练。
 #
-# 注：与 probe.yml 同理，GitHub 只索引「默认分支上存在」或「曾经运行过」的
-# workflow。首次落地借一次 push 触发完成注册，注册后撤掉 push 触发。
+# 为什么必须跑在 windows-latest（实测踩过，run 36243911058）：
+#   媒体缓存是 master CI 在 windows runner 上存的，actions/cache 默认
+#   enableCrossOsArchive=false，**跨 OS 不能还原**——ubuntu 上 restore 必 miss。
+#   probe.yml 同样为此选 windows。PyTorch CPU + qwen-asr 在 windows runner
+#   已由 probe.yml 的交叉验证步骤证明可行。含 bash 语法的步骤显式 shell: bash
+#   （windows runner 自带 git-bash）。
+#
+# 注：GitHub 只索引「默认分支上存在」或「曾经运行过」的 workflow。本文件已借
+# 首次 push 触发完成注册（run 36243911058），此后仅手动触发。
 # ============================================================================
 name: s2tt-e2e
 
 on:
-  push:
-    branches: [exp/asr-s2tt]   # 临时：仅为注册本 workflow（首次 push 触发一轮真实测试）
   workflow_dispatch:
     inputs:
       bvid:
@@ -58,7 +63,6 @@ env:
   PYTHONIOENCODING: utf-8
   HF_HUB_DISABLE_PROGRESS_BARS: "1"
   TOKENIZERS_PARALLELISM: "false"
-  # push 事件下 inputs 为空，用 || 兜住默认值
   BVID: ${{ inputs.bvid || 'BV16r421g797' }}
   ADAPTER_RUN: ${{ inputs.adapter_run || '36238661344' }}
   MODES: ${{ inputs.modes || 'both' }}
@@ -67,31 +71,43 @@ env:
 jobs:
   e2e:
     name: S2TT 直出字幕（无 LLM 后处理）
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: windows-latest
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+
+      - name: Console UTF-8
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Cache HuggingFace 模型（与 finetune.yml 同 key，命中免下载）
+      - name: 安装 ffmpeg / ffprobe（媒体解码）
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress -y | Out-Null
+          RefreshEnv
+          ffmpeg -version | Select-Object -First 1
+
+      # HF 模型缓存：finetune.yml 的缓存建在 ubuntu（跨 OS 不可还原），
+      # 这里用 windows 专属 key；首次 miss 会下载 ~1.8GB，之后命中。
+      - name: Cache HuggingFace 模型（windows 专属 key）
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-qwen3-asr-0.6B-v1
+          key: hf-qwen3-asr-0.6B-win-v1
 
       - name: 安装依赖（CPU torch + qwen-asr + peft + silero-vad）
         run: |
-          set -e
-          pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade pip
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
           pip install --quiet qwen-asr peft soundfile librosa "silero-vad>=5.1,<7"
-          python -c "import torch, silero_vad, importlib.metadata as md; \
-            print('torch', torch.__version__, '| silero-vad', md.version('silero-vad'), \
-                  '| qwen-asr', md.version('qwen-asr'))"
-          ffmpeg -version | head -1
+          python -c "import torch, silero_vad, importlib.metadata as md; print('torch', torch.__version__, '| silero-vad', md.version('silero-vad'), '| qwen-asr', md.version('qwen-asr'))"
 
       - name: 下载 LoRA 适配器（来自 real-mini run）
         uses: actions/download-artifact@v4
@@ -102,6 +118,7 @@ jobs:
           path: art
 
       - name: 校验适配器
+        shell: bash
         run: |
           ls -la art/out/real/lora/
           test -f art/out/real/lora/adapter_model.safetensors || \
@@ -110,6 +127,7 @@ jobs:
 
       - name: 取 master 最新带 e2e-results 的 run（两段式管线基线）
         id: find-master
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -128,7 +146,7 @@ jobs:
               if any(a["name"] == "e2e-results" for a in arts):
                   pick = run; break
           if pick:
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
                   f.write(f"run-id={pick['id']}\n")
               print("master e2e 基线 run:", pick["id"], pick["head_sha"][:8])
           else:
@@ -153,6 +171,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: 选定测试视频
+        shell: bash
         run: |
           set -e
           mkdir -p media/out
@@ -167,6 +186,7 @@ jobs:
 
       - name: 实验组：适配器 + context 直出中文（无 LLM）
         if: env.MODES == 'both' || env.MODES == 'translate'
+        shell: bash
         run: |
           set -o pipefail
           python finetune/s2tt_pipeline.py --media "$MEDIA" \
@@ -177,6 +197,7 @@ jobs:
 
       - name: 对照组：同一适配器不带 context（应仍出日语）
         if: env.MODES == 'both' || env.MODES == 'transcribe'
+        shell: bash
         run: |
           set -o pipefail
           python finetune/s2tt_pipeline.py --media "$MEDIA" \
@@ -186,6 +207,7 @@ jobs:
             2>&1 | tee media/out/transcribe.log
 
       - name: 判定 + 三方对照报告
+        shell: bash
         run: |
           set -o pipefail
           python scripts/s2tt_e2e_report.py \
