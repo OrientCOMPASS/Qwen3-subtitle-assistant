@@ -537,7 +537,7 @@ jobs:
           # 整份日志聚合判定：质检统计每个文件各一条、丢弃率、回退条数、审校修正数
           python scripts/check_e2e.py --name "T1-日志汇总" --srt (($files[0] -replace '\.[^.]+$','') + ".srt") `
             --log media/t1.log --target-lang any --expect-qc --expect-qc-files $files.Count `
-            --max-qc-drop-ratio 0.35 --max-untranslated 8 --expect-log-contains "审校"
+            --max-qc-drop-ratio 0.25 --max-untranslated 8 --expect-log-contains "审校"
           if ($LASTEXITCODE -ne 0) { $bad++ }
           if ($bad -gt 0) { throw "T1 断言失败（$bad 项）" }
 
