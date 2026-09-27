@@ -154,10 +154,14 @@ cargo test --release         # VAD 黄金向量 / 流式段状态机↔批量参
   运行期硬依赖系统 Vulkan loader（vulkan-1.dll / libvulkan.so.1，GPU 驱动必带）；
   不加该特性即纯 CPU 单文件（VM/容器场景自建）。Windows 构建的三个雷
   （Ninja 生成器 / vcvars / MAX_PATH）与对策见 ci.yml windows 腿注释。
-* **CUDA**：Linux 可全静态进单文件（cudart/cublas 静态，运行仅需驱动
-  libcuda.so.1）；Windows 因 NVIDIA 不提供静态 cublas 只能 DLL 伴生（回到
-  v0.2 cuda12 zip 形态）。体积/可行性实测探针：`.github/workflows/cuda-probe.yml`
-  （手动 dispatch，报告 MiB 数、内嵌 SASS/PTX 架构清单、2GiB 上限判定）。
+* **CUDA**：Linux 可全静态进单文件（cudart/cublas 静态，运行仅需 NVIDIA 驱动
+  自带的 libcuda.so.1）；Windows 因 NVIDIA 不提供静态 cublas 只能 DLL 伴生
+  （回到 v0.2 cuda12 zip 形态）。**实测**（`.github/workflows/cuda-probe.yml`，
+  ubuntu-24.04 + CUDA 12.6 + archs=86;89 + vulkan 合一）：单文件 **858 MiB
+  < 2GiB 上限 ✓**——体积大头是 cublas(Lt)_static（原始 885MB，链接只取所需
+  对象）；架构数与体积近线性，全覆盖 10 代架构 + PTX 估计 1.5~1.8GiB，仍
+  可发但接近上限。注意此类二进制**启动硬依赖 libcuda.so.1**（仅 NVIDIA 驱动
+  机器可运行），只能作为可选附加资产，不能顶替通用 Vulkan 版。
 * **动态链接形态（CUDA 开发者选项）**：`cargo build --release --features dynamic-link`
   产出 exe + llama/ggml DLL；此形态下 `--cuda-libs <DIR>` 可加载 llama.cpp 官方
   release 的 `ggml-cuda.dll`（连同 cudart/cublas/cudnn 放同一目录）。
