@@ -289,7 +289,8 @@ jobs:
         run: |
           set -e
           BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
-          "$BIN" --gguf-selftest s2tt-Q4_K_M.gguf mmproj-s2tt-q8.gguf | tee selftest.out
+          # 自检结果走 stdout（println），设备选择等 info 走 stderr——合并捕获
+          "$BIN" --gguf-selftest s2tt-Q4_K_M.gguf mmproj-s2tt-q8.gguf 2>&1 | tee selftest.out
           grep -q "自检通过" selftest.out
           if [ "${{ runner.os }}" = "macOS" ]; then
             grep -qi "metal" selftest.out && echo "Metal 后端已发现 ✓" || echo "::warning::mac 腿未见 Metal 设备（自检仍通过，CPU 兜底）"
@@ -476,20 +477,22 @@ jobs:
           Write-Host "从 CWD=$env:TEMP 启动 $pkg\subtitle-assistant.exe --gguf-selftest"
           Push-Location $env:TEMP
           try {
+            # 自检结果打印在 stdout（println，不受日志级别影响）——合并捕获再断言
             & (Join-Path $pkg "subtitle-assistant.exe") --gguf-selftest `
                 "$pkg\models\qwen3-asr-s2tt\model.gguf" `
                 "$pkg\models\qwen3-asr-s2tt\mmproj.gguf" `
-                --log-file "$env:TEMP\qsa-t3.log"
+                --log-file "$env:TEMP\qsa-t3.log" *> "$env:TEMP\qsa-t3.out"
             $code = $LASTEXITCODE
           } finally { Pop-Location }
           Write-Host "T3 退出码=$code"
-          Copy-Item "$env:TEMP\qsa-t3.log" (Join-Path $repo "media/t3.log") -Force -ErrorAction SilentlyContinue
-          if ($code -ne 0) { Get-Content "$env:TEMP\qsa-t3.log" -Tail 30; throw "T3 自检失败（详见 media/t3.log）" }
+          Get-Content "$env:TEMP\qsa-t3.out" -ErrorAction SilentlyContinue
+          Copy-Item "$env:TEMP\qsa-t3.out" (Join-Path $repo "media/t3.log") -Force -ErrorAction SilentlyContinue
+          if ($code -ne 0) { Get-Content "$env:TEMP\qsa-t3.log" -Tail 30 -ErrorAction SilentlyContinue; throw "T3 自检失败（详见 media/t3.log）" }
 
       - name: T3 断言
         shell: pwsh
         run: |
-          python -c "import pathlib,sys; t=pathlib.Path('media/t3.log').read_text(encoding='utf-8',errors='replace'); ok='自检通过' in t; print('T3 日志含自检通过:', ok); sys.exit(0 if ok else 1)"
+          python -c "import pathlib,sys; t=pathlib.Path('media/t3.log').read_text(encoding='utf-8',errors='replace'); ok='自检通过' in t; print('T3 输出含自检通过:', ok); sys.exit(0 if ok else 1)"
           if ($LASTEXITCODE -ne 0) { throw "T3 断言失败" }
 
       # ============ T1：真实日语视频全流程（默认参数 = 用户开箱体验） ============
