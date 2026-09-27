@@ -1,6 +1,6 @@
 [package]
 name = "subtitle-assistant"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "本地离线字幕助手（S2TT 微调 Qwen3-ASR 单模型直出 · llama.cpp/GGUF 静态单文件 · 流式 VAD→ASR · 纯 Rust silero VAD · 字幕排版）"
 license = "Unlicense"
@@ -51,8 +51,10 @@ static-libs = ["llama-cpp-sys-2/static-openmp", "llama-cpp-sys-2/static-stdcxx"]
 # 后端 DLL）时启用；CI 发布包不使用：
 #   cargo build --release --features dynamic-link
 dynamic-link = ["llama-cpp-sys-2/dynamic-link", "llama-cpp-sys-2/dynamic-backends"]
-# 本地开发者若装有 CUDA Toolkit，想自己编译 CUDA 后端（仅动态链接形态有意义）：
-#   cargo build --release --features "dynamic-link,cuda-build"
+# CUDA 后端（需本机 CUDA Toolkit/nvcc）：Linux 可全静态单文件（cudart/cublas
+# 静态，运行仅需 NVIDIA 驱动 libcuda.so.1）；Windows 因 NVIDIA 不提供静态
+# cublas，产物需 cudart/cublas DLL 伴生（非单文件）。体积实测探针：
+# .github/workflows/cuda-probe.yml（cublas_static 是大头，架构列表裁剪可控体积）。
 cuda-build = ["llama-cpp-sys-2/cuda"]
 
 [profile.release]

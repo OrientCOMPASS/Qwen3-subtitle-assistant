@@ -22,11 +22,11 @@ VAD 是内嵌权重的纯 Rust silero v4，**无任何 ONNX Runtime 依赖**。
 >    视频曾丢 313/427 段）；v0.5 默认**保留一切有文本的段**，只有显式传
 >    `--filter-fragments` 才启用该启发式（空文本段始终跳过——没有内容可写）。
 >    **相邻重复句自动丢弃**（v0.5.1）：与上一条字幕完全相同的识别结果不再进字幕。
-> 6. **GPU 加速形态**：macOS 版内嵌 **Metal**（Apple GPU 开箱即用）；
->    Windows/Linux 各发两种单文件——**GPU 版**（`-vulkan` 后缀，Vulkan 后端
->    静态编入，自动发现 NVIDIA/AMD/Intel GPU，v0.4 的探测行为回归）与**兼容版**
->    （纯 CPU，无 GPU 驱动的机器也能启动）。CUDA 仍走动态链接形态开发者自建
->    （`--features dynamic-link` + `--cuda-libs`，见「开发」）。
+> 6. **GPU 加速形态**（v0.5.2 收敛）：每平台只发**一个**单文件——Windows/
+>    Linux-x64 内嵌 **Vulkan**（自动发现 NVIDIA/AMD/Intel GPU；无 GPU 设备自动
+>    回退 CPU），macOS 内嵌 **Metal**，Linux-arm64 纯 CPU。注意 Vulkan 版启动
+>    依赖系统 Vulkan loader（vulkan-1.dll / libvulkan.so.1——GPU 驱动/桌面
+>    发行版必有）；完全无驱动的 VM/容器请源码自建纯 CPU 版（见「开发」）。
 >
 > v0.4（E3 单模型化）的背景：移除「ASR(日语) → 1.7B LLM 质检/摘要/翻译/审校」
 > 双模型工作流，S2TT 微调直出质量实测追平（`finetune/README.md` §11），
@@ -53,16 +53,15 @@ VAD 是内嵌权重的纯 Rust silero v4，**无任何 ONNX Runtime 依赖**。
 * **🔒 完全离线**：转录+翻译一体完成，数据不出域；
 * **🎯 任务开关**：`--context "translate to Chinese"`（默认）直出中文；
   `--context ""` 转写源语言——同一套权重，system 段切换（微调时双任务混训保住）；
-* **⚡ 推理设备**：macOS 自动 **Metal**；Windows/Linux 下 GPU 版（`-vulkan`）
-  自动 **Vulkan**（索引最大的 GPU，多显卡机器通常即主力独显），兼容版纯 CPU
-  （4 线程实测 1.7B Q4_K_M RTF≈0.6）；有 GPU 时权重全量上卡、主机副本自动释放；
+* **⚡ 推理设备**：Windows/Linux-x64 自动 **Vulkan**（多卡选索引最大者），
+  macOS 自动 **Metal**，arm64 纯 CPU（4 线程实测 1.7B Q4_K_M RTF≈0.6）；
+  无 GPU 设备时全部自动回退 CPU；有 GPU 时权重全量上卡、主机副本自动释放；
 * **🖱 极简交互**：媒体文件拖到可执行文件上即处理；失败窗口不闪退（`--no-pause` 可关）。
 
 ## 📦 快速开始
 
 1. 从 Release 下载**两样东西**：
-   * 你平台的单文件二进制：`subtitle-assistant-<ver>-<平台>`（约几十 MB；
-     Windows/Linux 有 GPU 就选 `-vulkan` 后缀的 GPU 版，其余场景选兼容版）；
+   * 你平台的单文件二进制：`subtitle-assistant-<ver>-<平台>`（8~50MB）；
    * 模型：`s2tt-Q4_K_M.gguf`（LM，≈1.0GiB）+ `mmproj-s2tt-q8.gguf`（音频编码器，≈0.3GiB）；
 2. 按下面结构摆放（模型文件名保持下载原样即可被自动识别：`mmproj` 前缀=编码器，
    其余 `.gguf`=LM）：
@@ -81,15 +80,19 @@ VAD 是内嵌权重的纯 Rust silero v4，**无任何 ONNX Runtime 依赖**。
 
 | 平台 | 资产 | 推理设备 | 备注 |
 |---|---|---|---|
-| Windows x64 | `*-windows-x64-vulkan.exe`（**GPU 版，推荐**） | Vulkan：自动发现 NVIDIA/AMD/Intel GPU | 需已装 GPU 驱动（驱动自带 vulkan-1.dll）；无可用 GPU 时自动回退 CPU |
-| Windows x64 | `*-windows-x64.exe`（兼容版） | CPU（OpenMP） | 任何机器可启动（VM/无驱动环境用这个） |
-| Linux x64 | `*-linux-x64-vulkan` / `*-linux-x64` | Vulkan / CPU | 需 glibc ≥ 2.39（Ubuntu 24.04 工具链构建）；GPU 版需系统 libvulkan.so.1（桌面发行版标配） |
-| Linux arm64 | `*-linux-arm64` | CPU | armv8-a 基线（树莓派 4 及以上均可） |
-| macOS Apple Silicon | `*-macos-arm64` | **Metal GPU**（自动） | 无 GPU 环境自动 CPU 兜底（Accelerate BLAS） |
+| Windows x64 | `*-windows-x64.exe` | **Vulkan**：自动发现 NVIDIA/AMD/Intel GPU（多卡选索引最大者，通常即主力独显）；无 GPU 设备自动回退 CPU | 需 GPU 驱动（自带 vulkan-1.dll）+ VC++ 2015-2022 运行库（缺失时装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)）；CPU 需 AVX2（2013 年后 x64 均可） |
+| Linux x64 | `*-linux-x64` | **Vulkan** → CPU 回退 | glibc ≥ 2.39（Ubuntu 24.04 工具链构建）；libvulkan.so.1 桌面发行版标配 |
+| Linux arm64 | `*-linux-arm64` | CPU（OpenMP） | armv8-a 基线（树莓派 4 及以上均可） |
+| macOS Apple Silicon | `*-macos-arm64` | **Metal GPU**（自动） | CI 硬断言 MTL 设备被发现；无 GPU 自动 CPU 兜底（Accelerate BLAS） |
 
-Windows 两版均需 VC++ 2015-2022 运行库（vcruntime140/vcomp140，绝大多数机器已随
-常见软件装好；缺失时装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)）。
-x64 需 CPU 支持 AVX2（2013 年后的 x64 均可，与 llama.cpp 官方 haswell 发行同级）。
+体积说明：Windows/Linux-x64 版比 arm64/mac 版大（~35-50MB vs ~8MB）是正常的——
+Vulkan 后端内嵌**几百个预编译 SPIR-V shader 变体**；Metal 只嵌一个编译好的
+metallib（几 MB）。两个 GPU 后端都有 CI 真机断言（Windows PE 导入表含 vulkan-1、
+Linux ldd 含 libvulkan、mac 自检选定 MTL 设备并全量入显存），不是"只有 CPU"的空壳。
+
+无 GPU 驱动的 VM/精简容器：发行版无法启动（缺 Vulkan loader）。这类环境自行
+`cargo build --release --features static-libs`（Linux，不加 vulkan 特性）即得纯
+CPU 单文件。
 
 环境自检：`subtitle-assistant --gguf-selftest models\qwen3-asr-s2tt\s2tt-Q4_K_M.gguf models\qwen3-asr-s2tt\mmproj-s2tt-q8.gguf`
 （打印后端设备、加载耗时、进程内存；GPU 下内存应远小于模型体积=权重已入显存）。
@@ -145,22 +148,29 @@ cargo test --release         # VAD 黄金向量 / 流式段状态机↔批量参
   `LLAMA_STATIC_CRT=1`/`RUSTFLAGS=-C target-feature=+crt-static`：cmake-rs 的
   `static_crt` 传导不进 llama.cpp 全部目标，实测链接期 `__imp_fputs`/`__imp_getenv`
   LNK2001 大爆炸；且 MSVC OpenMP 的 vcomp140.dll 本就没有静态版，静态 CRT 收益为零。
-* **GPU 版单文件（Windows/Linux）**：加 `--features vulkan`——Vulkan 后端静态编入，
-  编译期需要 Vulkan SDK（Windows 装 LunarG SDK 并设 `VULKAN_SDK`；Linux
-  `apt install libvulkan-dev glslc libvulkan1`）。运行期硬依赖系统 Vulkan loader
-  （vulkan-1.dll / libvulkan.so.1，GPU 驱动必带）；无 loader 的机器请用兼容版。
+* **Vulkan 单文件（Windows/Linux-x64 发行形态）**：加 `--features vulkan`——
+  Vulkan 后端静态编入，编译期需要 Vulkan SDK（Windows 装 LunarG SDK 并设
+  `VULKAN_SDK`；Linux `apt install libvulkan-dev glslc spirv-headers`）。
+  运行期硬依赖系统 Vulkan loader（vulkan-1.dll / libvulkan.so.1，GPU 驱动必带）；
+  不加该特性即纯 CPU 单文件（VM/容器场景自建）。Windows 构建的三个雷
+  （Ninja 生成器 / vcvars / MAX_PATH）与对策见 ci.yml windows 腿注释。
+* **CUDA**：Linux 可全静态进单文件（cudart/cublas 静态，运行仅需驱动
+  libcuda.so.1）；Windows 因 NVIDIA 不提供静态 cublas 只能 DLL 伴生（回到
+  v0.2 cuda12 zip 形态）。体积/可行性实测探针：`.github/workflows/cuda-probe.yml`
+  （手动 dispatch，报告 MiB 数、内嵌 SASS/PTX 架构清单、2GiB 上限判定）。
 * **动态链接形态（CUDA 开发者选项）**：`cargo build --release --features dynamic-link`
   产出 exe + llama/ggml DLL；此形态下 `--cuda-libs <DIR>` 可加载 llama.cpp 官方
   release 的 `ggml-cuda.dll`（连同 cudart/cublas/cudnn 放同一目录）。
   CI 发布包不再使用该形态。
 
-CI（`.github/workflows/ci.yml`）：push/PR 自动 **6 腿矩阵构建**（windows-x64{,-vulkan} /
-linux-x64{,-vulkan} / linux-arm64 / macos-arm64，全部静态单文件 + 依赖闭包检查）+
+CI（`.github/workflows/ci.yml`）：push/PR 自动 **4 腿矩阵构建**（windows-x64(Vulkan) /
+linux-x64(Vulkan) / linux-arm64 / macos-arm64(Metal)，全部静态单文件 + 依赖闭包检查）+
 单元测试 + windows 真实视频 e2e（T1 默认参数全流程与**终端清洁度断言** / T1b 任务
 开关对照 / T1c `--verbose --filter-fragments --raw-srt` 对照 / T3 迁移目录）；可运行
-的腿在 GGUF 缓存命中时顺带真实模型自检（mac 腿验证 Metal；linux-vulkan 腿验证
-「loader 在、0 ICD → 优雅回退 CPU」的降级路径）。手动 dispatch 才收集 6 平台二进制 +
-模型发布 GitHub Release。
+的腿在 GGUF 缓存命中时顺带真实模型自检（mac 腿**硬断言** Metal；linux-x64 腿验证
+「loader 在、0 ICD → 优雅回退 CPU」的降级路径；e2e 用的就是发行的 Vulkan 版
+exe，在 runner 上同样走该降级路径跑全量真实转录）。手动 dispatch 才收集 4 平台
+二进制 + 模型发布 GitHub Release。
 
 ## 📄 License
 

@@ -6,9 +6,9 @@
 #
 # 三个 job：
 #   build    矩阵构建单一可执行文件（llama.cpp 静态编入，无任何伴生 DLL/so/dylib），
-#            6 腿：windows-x64（CPU 兼容版）/ windows-x64-vulkan（GPU 版，Vulkan
-#            静态编入）/ linux-x64 / linux-x64-vulkan / linux-arm64（libstdc++/
-#            libgomp 静态）/ macos-arm64（Metal GPU 后端默认编入）。
+#            4 腿：windows-x64（Vulkan 静态编入）/ linux-x64（Vulkan + libstdc++/
+#            libgomp 静态）/ linux-arm64（纯 CPU）/ macos-arm64（Metal GPU 后端
+#            默认编入，腿内硬断言 MTL 设备被发现）。
 #            cargo test + 冒烟 + 依赖闭包检查（PE 导入表 / ldd / otool）；
 #            可运行的腿顺带真实模型 --gguf-selftest（GGUF 跨 OS 缓存命中时）。
 #   e2e      needs build：windows 真实日语视频全流程（T1 默认参数 / T1b 任务开关 /
@@ -19,12 +19,14 @@
 #
 # v0.5 形态说明（与 v0.4 的差异）：
 #   * 发布物 = 单一可执行文件。llama.cpp（含 mtmd）静态链接进 exe；
-#     GPU 加速按平台：macOS=Metal（内嵌）；Windows/Linux=**双版本**——
-#     GPU 版静态编入 Vulkan 后端（自动发现 N卡/A卡/Intel 核显；运行硬依赖
-#     系统 Vulkan loader，GPU 驱动必带）+ 兼容版纯 CPU（任何机器可启动）。
-#     Vulkan 不能进"唯一"exe 的原因：本版 ggml-vulkan 硬链接 vulkan-1（无
-#     dlopen 机制），无 loader 的机器（VM/精简系统/CI runner）exe 直接起不来。
-#     CUDA 仍需动态链接形态（`--features dynamic-link` + 用户 --cuda-libs）。
+#     GPU 加速按平台：macOS=Metal（内嵌，CI 硬断言）；Windows/Linux-x64=Vulkan
+#     静态编入（自动发现 N卡/A卡/Intel 核显；无 GPU 设备时运行时回退 CPU）。
+#     v0.5.2 起不再发纯 CPU 兼容版（维护者决策）：本版 ggml-vulkan 硬链接
+#     vulkan-1 loader（无 dlopen 机制），无 loader 的机器（VM/精简容器）无法
+#     启动发行版——该场景走源码构建（不加 vulkan 特性即纯 CPU 单文件）。
+#     CUDA：linux 可全静态（cudart/cublas_static，运行仅需驱动 libcuda.so.1），
+#     windows 无法静态（NVIDIA 不提供 win 静态 cublas）；体积评估见
+#     .github/workflows/cuda-probe.yml（dispatch 实测）。
 #   * Windows CRT：双侧动态 CRT（/MD）——exe 依赖 VC++ 2015-2022 发行版的
 #     vcruntime140/ucrtbase/vcomp140（OpenMP 运行库无静态版，静态 CRT 无收益；
 #     实测强行静态会 LNK2001）。冒烟步骤显式校验 PE 导入闭包。
@@ -98,19 +100,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # v0.5.2：Windows/Linux-x64 只发 Vulkan 版（GPU 自动发现，无 GPU 设备时
+          # 运行时优雅回退 CPU——loader 由 GPU 驱动提供，物理机必有）。
+          # 纯 CPU 形态仍可随时源码构建（cargo build --release 不加 vulkan 特性），
+          # 但不再作为 Release 资产：无 loader 的机器（VM/精简容器）本就无法运行
+          # Vulkan 版，这类环境属于开发者自建场景。
           - name: windows-x64
             os: windows-latest
             bin: subtitle-assistant-windows-x64.exe
-            exe_suffix: ".exe"
-            features: ""
-            selftest: true
-            vulkan: false
-          # GPU 版：Vulkan 后端静态编入（仍是单文件；运行硬依赖系统 vulkan-1.dll，
-          # GPU 驱动必带）。runner 无 GPU/多数无 loader：自检跳过，改做
-          # 「loader 布阵 + --version 启动冒烟 + PE 导入表含 vulkan-1」验证。
-          - name: windows-x64-vulkan
-            os: windows-latest
-            bin: subtitle-assistant-windows-x64-vulkan.exe
             exe_suffix: ".exe"
             features: "--features vulkan"
             selftest: false
@@ -118,16 +115,6 @@ jobs:
           - name: linux-x64
             os: ubuntu-24.04
             bin: subtitle-assistant-linux-x64
-            exe_suffix: ""
-            features: "--features static-libs"
-            selftest: true
-            vulkan: false
-          # GPU 版（Linux）：apt 装 libvulkan1（loader，无 ICD）后可直接跑
-          # 启动/自检冒烟——ggml 对「loader 在、0 设备」的路径优雅回退 CPU，
-          # 这正好覆盖用户机器上"驱动残缺/VM"的降级行为。
-          - name: linux-x64-vulkan
-            os: ubuntu-24.04
-            bin: subtitle-assistant-linux-x64-vulkan
             exe_suffix: ""
             features: "--features vulkan,static-libs"
             selftest: true
@@ -447,7 +434,11 @@ jobs:
           grep -q "自检通过" selftest.out
           if [ "${{ runner.os }}" = "macOS" ]; then
             # Metal 设备在 ggml 里叫 MTL0/MTL1（也接受日志里直接出现 Metal 字样）
-            grep -qiE "MTL[0-9]|metal" selftest.out && echo "Metal 后端已发现 ✓" || echo "::warning::mac 腿未见 Metal 设备（自检仍通过，CPU 兜底）"
+            # 硬断言：mac 发行版必须带 Metal（GGML_METAL 在 Apple 平台默认 ON、
+            # shader 内嵌）。CI 曾实测「选定推理设备: [0] MTL0」；这里从 warning
+            # 升级为失败闸门，防止未来工具链变化悄悄把 Metal 弄丢。
+            grep -qiE "MTL[0-9]|metal" selftest.out || { echo "::error::macOS 腿未发现 Metal 设备——Metal 后端没编进去？"; exit 1; }
+            echo "Metal 后端已发现 ✓"
           fi
 
       # ---------------- 收集产物 ----------------
@@ -483,6 +474,9 @@ jobs:
           name: bin-windows-x64
           path: dist-bin
 
+      # 注：e2e 用的就是发行的 windows-x64（Vulkan 内嵌）二进制。runner 镜像带
+      # vulkan-1.dll（System32，实测确认）但无 GPU ICD——正好每轮 e2e 都在验证
+      # 「loader 在、0 设备 → 回退 CPU」这条发行版降级路径上跑全量真实转录。
       - name: 布阵 exe（后续步骤沿用 target/release/subtitle-assistant.exe 路径）
         shell: pwsh
         run: |
@@ -792,12 +786,10 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
           mkdir -p dist
           ls -lh bins/
-          # 6 平台二进制：统一命名 subtitle-assistant-<ver>-<platform>
+          # 4 平台二进制：统一命名 subtitle-assistant-<ver>-<platform>
           declare -A MAP=(
             [subtitle-assistant-windows-x64.exe]="subtitle-assistant-$VER-windows-x64.exe"
-            [subtitle-assistant-windows-x64-vulkan.exe]="subtitle-assistant-$VER-windows-x64-vulkan.exe"
             [subtitle-assistant-linux-x64]="subtitle-assistant-$VER-linux-x64"
-            [subtitle-assistant-linux-x64-vulkan]="subtitle-assistant-$VER-linux-x64-vulkan"
             [subtitle-assistant-linux-arm64]="subtitle-assistant-$VER-linux-arm64"
             [subtitle-assistant-macos-arm64]="subtitle-assistant-$VER-macos-arm64"
           )
@@ -836,23 +828,21 @@ jobs:
 
           | 平台 | 资产 | 推理设备 |
           |---|---|---|
-          | Windows x64（**GPU 版，推荐**） | \`*-windows-x64-vulkan.exe\` | **Vulkan：自动发现 NVIDIA/AMD/Intel GPU**（需已装 GPU 驱动——驱动自带 vulkan-1.dll）；无 GPU 时自动回退 CPU |
-          | Windows x64（兼容版） | \`*-windows-x64.exe\` | 纯 CPU（OpenMP 多线程；任何机器可启动，无 GPU 驱动也行） |
-          | Linux x64（GPU 版） | \`*-linux-x64-vulkan\` | Vulkan（需系统 libvulkan.so.1，桌面发行版标配） |
-          | Linux x64（兼容版） | \`*-linux-x64\` | 纯 CPU（glibc ≥ 2.39，Ubuntu 24.04 工具链构建） |
+          | Windows x64 | \`*-windows-x64.exe\` | **Vulkan：自动发现 NVIDIA/AMD/Intel GPU**；无 GPU 自动回退 CPU（OpenMP）。需 GPU 驱动（自带 vulkan-1.dll）+ VC++ 2015-2022 运行库（vcruntime140/vcomp140，绝大多数机器已装；缺失时装 https://aka.ms/vs/17/release/vc_redist.x64.exe ）；CPU 需 AVX2（2013 年后 x64 均可） |
+          | Linux x64 | \`*-linux-x64\` | Vulkan（桌面发行版标配 libvulkan.so.1）→ CPU 回退；glibc ≥ 2.39 |
           | Linux arm64 | \`*-linux-arm64\` | 纯 CPU（armv8-a 基线，树莓派 4 及以上均可） |
-          | macOS Apple Silicon | \`*-macos-arm64\` | **Metal GPU 加速默认开启**，CPU 兜底 |
+          | macOS Apple Silicon | \`*-macos-arm64\` | **Metal GPU 加速**（CI 实测选定 MTL 设备），CPU 兜底 |
 
-          Windows 两版均需 VC++ 2015-2022 运行库（vcruntime140/vcomp140，绝大多数机器已随常见软件安装；缺失时装 https://aka.ms/vs/17/release/vc_redist.x64.exe ）；x64 需 CPU 支持 AVX2（2013 年后的 x64 均可）。
+          注：Windows/Linux-x64 版内嵌 Vulkan 后端，**启动依赖系统 Vulkan loader**（vulkan-1.dll / libvulkan.so.1，GPU 驱动/桌面发行版必有）；完全无驱动的 VM/容器环境请自行源码构建纯 CPU 版（\`cargo build --release\`，不加 vulkan 特性）。
 
           用法：把视频/音频拖到可执行文件上，或 \`subtitle-assistant 视频.mp4\`；
           同目录得到排版好的 \`视频.srt\`（默认直出中文；\`--context ""\` 转写源语言）。
 
           ### v0.5.x 相对 v0.4 的行为变化
-          * **单一可执行文件**：llama.cpp/mtmd 静态链接进二进制，按平台提供
-            **GPU 版（Vulkan 静态编入，自动发现 N卡/A卡/Intel 核显）**、
-            兼容版（纯 CPU）、macOS 版（Metal GPU 默认开启）；
-            CUDA 仍需动态链接形态源码构建（\`--features dynamic-link\`，见 README）。
+          * **单一可执行文件**：llama.cpp/mtmd 静态链接进二进制。Windows/Linux-x64
+            内嵌 **Vulkan**（自动发现 N卡/A卡/Intel 核显，无 GPU 设备自动回退 CPU；
+            启动依赖系统 Vulkan loader——GPU 驱动/桌面发行版必有）；macOS 内嵌
+            **Metal**；Linux arm64 纯 CPU。v0.5.2 起不再发纯 CPU 兼容版。
           * **流式管线**：VAD 切出一段立即送 ASR（不再全片切完再整批转录），首条字幕
             等待时间 ≈ 第一句话时长；内存有界。实测同素材全流程提速 ~40%。
           * **终端默认干净但保留产出**：逐条识别出的字幕内容（[ASR✔] 时间戳+文本）

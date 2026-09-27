@@ -1,0 +1,129 @@
+# ============================================================================
+# CUDA 静态内联体积探针（仅手动 dispatch，不进 Release）。
+#
+# 回答的问题：把 CUDA 后端（ggml-cuda）静态编进单文件可执行、只编实际需要的
+# GPU 架构时，产物多大？能否 < GitHub Release 2GiB 资产上限？
+#
+# 已知约束（llama-cpp-sys-2 0.1.157 build.rs + llama.cpp CMake 实测梳理）：
+#   * Linux：cudart_static + cublas_static + cublasLt_static + culibos 全静态，
+#     运行期只依赖 NVIDIA 驱动自带的 libcuda.so.1 → 真·单文件（但只有装了
+#     NVIDIA 驱动的机器能启动，故只能作为可选附加资产，不能顶替通用版）；
+#   * Windows：NVIDIA 不提供 win 静态 cublas（build.rs 注释明说），cudart/
+#     cublas/cublasLt 只能动态 → 不是单文件，回到 v0.2 时代 cuda12 zip 形态；
+#   * 本版 llama.cpp 无 GGML_CUDA_NO_CUBLAS（cuBLAS 必选）——cublas_static
+#     是体积大头，架构列表裁剪是主要缩体积手段；
+#   * 架构裁剪注入：llama.cpp 仅在 CMAKE_CUDA_ARCHITECTURES 未定义时才设默认
+#     大列表，这里用 CMAKE_PROJECT_INCLUDE_BEFORE 环境（CMake ≥3.15 官方支持）
+#     在 project() 前强制注入自定义列表。
+#
+# 产物大小经验公式（跑完后回填到 README）：
+#   base(CPU静态) ~8.5MB + fatbin(≈每架构 40-70MB) + cublas/cublasLt 静态引用
+#   + cudart_static ~15MB。
+# ============================================================================
+name: cuda-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: "CMAKE_CUDA_ARCHITECTURES（分号分隔；如 86;89 或 75;80;86;89;90-virtual）"
+        type: string
+        default: "86;89"
+      with_vulkan:
+        description: "同时编入 Vulkan 后端（模拟最终合一形态的体积）"
+        type: boolean
+        default: false
+      upload_bin:
+        description: "上传产物二进制为 artifact（很大，默认不传）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
+
+jobs:
+  probe:
+    name: CUDA 静态构建体积探针 (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: CUDA 工具链探测
+        run: |
+          set -e
+          ls -d /usr/local/cuda* 2>/dev/null || echo "（无预装 CUDA）"
+          if [ -x /usr/local/cuda/bin/nvcc ]; then
+            export PATH=/usr/local/cuda/bin:$PATH
+          else
+            echo "预装 CUDA 缺失，apt 安装 nvidia-cuda-toolkit（慢，~5-10 分钟）"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq nvidia-cuda-toolkit >/dev/null
+            export PATH=/usr/bin:$PATH
+          fi
+          nvcc --version | tail -2
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$(dirname $(dirname $(command -v nvcc)))" >> "$GITHUB_ENV"
+
+      - name: 构建准备（libclang / 静态库 / 架构注入）
+        run: |
+          set -e
+          sudo apt-get update -qq
+          if ! ldconfig -p | grep -q libclang; then
+            sudo apt-get install -y -qq libclang-dev clang >/dev/null
+          fi
+          echo "LIBCLANG_PATH=$(dirname "$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)")" >> "$GITHUB_ENV"
+          g++ --print-file-name=libstdc++.a
+          g++ --print-file-name=libgomp.a
+          # 架构裁剪注入（llama.cpp 只在 CMAKE_CUDA_ARCHITECTURES 未定义时用默认大列表）
+          printf 'set(CMAKE_CUDA_ARCHITECTURES "%s" CACHE STRING "" FORCE)\n' "${{ inputs.archs }}" > /tmp/cuda-arch.cmake
+          cat /tmp/cuda-arch.cmake
+          echo "CMAKE_PROJECT_INCLUDE_BEFORE=/tmp/cuda-arch.cmake" >> "$GITHUB_ENV"
+          CUDAH=$(dirname $(dirname $(command -v nvcc)))
+          for a in libcublas_static.a libcublasLt_static.a libcudart_static.a libculibos.a; do
+            ls -lh "$CUDAH"/lib64/$a 2>/dev/null || echo "（缺 $a）"
+          done
+
+      - name: Build（cuda-build + static-libs [+ vulkan]）
+        run: |
+          set -e
+          FEAT="cuda-build,static-libs"
+          if [ "${{ inputs.with_vulkan }}" = "true" ]; then
+            sudo apt-get install -y -qq libvulkan-dev glslc spirv-headers >/dev/null
+            FEAT="$FEAT,vulkan"
+          fi
+          echo "features: $FEAT"
+          time cargo build --release --features "$FEAT" 2>&1 | tail -25
+
+      - name: 体积报告
+        run: |
+          set -e
+          BIN=target/release/subtitle-assistant
+          ls -lh "$BIN"
+          SZ=$(stat -c %s "$BIN")
+          echo "字节数: $SZ ($(echo "scale=1; $SZ/1048576" | bc) MiB)"
+          echo "--- ldd（预期：libcuda.so.1 not found = 正常，runner 无 NVIDIA 驱动）---"
+          ldd "$BIN" || true
+          echo "--- 内嵌 CUDA 架构（cuobjdump）---"
+          CUDAH=$(dirname $(dirname $(command -v nvcc)))
+          "$CUDAH"/bin/cuobjdump --list-elf "$BIN" 2>/dev/null | grep -oE 'sm_[0-9]+' | sort | uniq -c || echo "(cuobjdump 不可用)"
+          "$CUDAH"/bin/cuobjdump --list-ptx "$BIN" 2>/dev/null | grep -oE 'compute_[0-9]+' | sort | uniq -c || true
+          if [ "$SZ" -lt 2147483648 ]; then
+            echo "::notice::CUDA 静态单文件 = $((SZ/1048576)) MiB < 2GiB 上限 ✓ (archs=${{ inputs.archs }}, vulkan=${{ inputs.with_vulkan }})"
+          else
+            echo "::error::CUDA 静态单文件 = $((SZ/1048576)) MiB ≥ 2GiB 上限 ✘"
+          fi
+
+      - name: Upload binary（可选）
+        if: inputs.upload_bin
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-probe-bin
+          path: target/release/subtitle-assistant
+          if-no-files-found: error
+          retention-days: 7
