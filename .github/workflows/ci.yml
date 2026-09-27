@@ -95,10 +95,25 @@ jobs:
       # （build.rs: cache_root = <target>/sherpa-onnx-prebuilt）——fingerprint 被恢复但库被删掉，
       # 就会 LNK1181。所以那个目录单独用 actions/cache 保一份，构建前还原回去。
       # release 走全量构建（cache-targets: false + 显式清空 target），保证发布物干净可复现。
-      - uses: Swatinem/rust-cache@v2
+      # 依赖构建缓存：不用 Swatinem/rust-cache——读其源码（src/save.ts + cleanup.ts）证实：
+      # 保存前 rmExcept(build/.fingerprint/deps, 工作区包名) 会把**所有 registry 依赖产物**
+      # 删掉（checkTimestamp 未传=false），单成员工作区下缓存只剩 ~50MB 自身产物，
+      # 每轮仍全量重建依赖 + 重跑 llama.cpp cmake（实测 ~7 分钟/run）。
+      # 改为原生 actions/cache 精确缓存依赖产物目录，key 挂 Cargo.lock 哈希：
+      # lock 不变则完整复用（llama.cpp/mtmd 原生构建零重跑），lock 变更自动失效重建。
+      - name: Rust 依赖构建缓存（target 依赖产物 + cargo registry）
+        if: ${{ !inputs.release }}
+        uses: actions/cache@v4
         with:
-          cache-targets: ${{ inputs.release && 'false' || 'true' }}
-          cache-on-failure: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release/build
+            target/release/.fingerprint
+            target/release/deps
+          key: rust-deps-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-deps-v1-${{ runner.os }}-
 
       - name: Restore sherpa-onnx prebuilt libs
         id: sherpa-cache
