@@ -214,6 +214,26 @@ jobs:
             New-Item -ItemType Junction -Path "$PWD\target" -Target "C:\ct" | Out-Null
           }
           Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=C:\ct"
+          # MSBuild 调度雷区（实测踩过）：VS18/MSBuild 18 + ggml-vulkan 的
+          # CMP0147 NEW（并行自定义构建步骤）会让 vulkan-shaders-gen 的
+          # ExternalProject 步骤乱序（install 抢在 configure 完成前跑，报
+          # "Not a file: cmake_install.cmake"）。换 Ninja 生成器整体绕开
+          # MSBuild 调度（顺带更快、无 FileTracker/PDB 长路径问题）。
+          # Ninja + cl.exe 需要 MSVC 环境（INCLUDE/LIB/PATH）→ vcvars64 显式布阵
+          # （cmake-rs 只会传 -DCMAKE_C_COMPILER 绝对路径，不会自己跑 vcvars）。
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath | Select-Object -First 1
+          if (-not $vs) { throw "vswhere 未找到 Visual Studio" }
+          cmd /c ('"' + $vs + '\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && set') | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              Add-Content -Path $env:GITHUB_ENV -Value ($matches[1] + '=' + $matches[2])
+            }
+          }
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --no-progress -y | Out-Null
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "CMAKE_GENERATOR=Ninja"
+          ninja --version
           Write-Host "VULKAN_SDK=$sdk"
           Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdk"
           & (Join-Path $sdk 'Bin\glslc.exe') --version | Select-Object -First 1
