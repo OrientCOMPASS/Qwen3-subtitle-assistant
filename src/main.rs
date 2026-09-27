@@ -2,6 +2,7 @@ mod asr;
 mod cli;
 mod config;
 mod ffmpeg;
+mod gguf_asr;
 mod llm;
 mod prompt;
 mod qc;
@@ -29,6 +30,25 @@ fn main() {
 
     // Windows 控制台 UTF-8，避免中文日志乱码
     runtime::enable_utf8_console();
+
+    // GGUF 自检模式（E3）：不处理媒体，验证 llama.cpp/mtmd 链路的加载与后端发现
+    if args.gguf_selftest.len() == 2 {
+        match gguf_asr::selftest(
+            &args.gguf_selftest[0],
+            &args.gguf_selftest[1],
+            args.asr_threads,
+            args.cuda_libs.as_deref(),
+        ) {
+            Ok(msg) => {
+                info!("{}", msg);
+                return;
+            }
+            Err(e) => {
+                error!("GGUF 自检失败: {:#}", e);
+                std::process::exit(2);
+            }
+        }
+    }
 
     let no_pause = args.no_pause;
     let n_files = args.files.len();

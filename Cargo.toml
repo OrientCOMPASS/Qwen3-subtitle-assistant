@@ -36,6 +36,13 @@ llama-cpp-2 = { version = "=0.1.157", default-features = false, features = [
     "dynamic-link",     # 生成并链接 llama.dll / ggml*.dll（而非静态库）
     "dynamic-backends", # ggml 后端做成运行时模块，从 exe 目录自动发现 ggml-cuda.dll 等
     "openmp",
+    "mtmd",             # 多模态（tools/mtmd）：Qwen3-ASR GGUF 的音频编码/拼接推理库
+] }
+# E3 单模型路线需要 mtmd/ggml 的原始 C 符号（llama-cpp-2 未 re-export sys crate）：
+# sys 开 mtmd feature 后 bindgen 会生成 mtmd_* 全量绑定（allowlist "mtmd_.*"）。
+# feature 与上面 llama-cpp-2 的选择由 cargo 统一（同版本自动并集）。
+llama-cpp-sys-2 = { version = "=0.1.157", default-features = false, features = [
+    "dynamic-link", "dynamic-backends", "openmp", "mtmd",
 ] }
 
 [features]

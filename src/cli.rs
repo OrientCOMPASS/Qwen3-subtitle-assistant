@@ -11,7 +11,7 @@ use std::path::PathBuf;
 )]
 pub struct Args {
     /// 需要处理的媒体文件（可拖入多个，按顺序处理）；配合 --from-srt 时为 .srt 文件
-    #[arg(required = true, num_args = 1..)]
+    #[arg(required_unless_present = "gguf_selftest", num_args = 1..)]
     pub files: Vec<PathBuf>,
 
     // ---------------- 模型与资源路径 ----------------
@@ -40,6 +40,16 @@ pub struct Args {
     /// 附加 DLL 搜索目录（cudart/cublas/cudnn 等 CUDA 运行时不放 exe 同目录时指定，可多次传入）
     #[arg(long = "lib-dir", value_name = "DIR")]
     pub lib_dirs: Vec<PathBuf>,
+
+    /// CUDA/cuDNN 运行库目录：仅当指定时才启用 CUDA 加速（GGUF 路线——ggml 从该目录
+    /// 加载 ggml-cuda.dll 及其依赖链；未指定则按 Vulkan → CPU 顺序回退）
+    #[arg(long = "cuda-libs", value_name = "DIR")]
+    pub cuda_libs: Option<PathBuf>,
+
+    /// [自检] GGUF/mtmd 推理链自检：传 <LM_GGUF> <MMPROJ_GGUF> 两个路径，
+    /// 加载模型并打印后端设备/能力/内存信息后退出（E3 阶段诊断用，不需要媒体文件）
+    #[arg(long = "gguf-selftest", num_args = 2, value_names = ["LM_GGUF", "MMPROJ_GGUF"])]
+    pub gguf_selftest: Vec<PathBuf>,
 
     /// LLM GPU offload 层数：-1=自动（探测到 CUDA 则全部上卡，否则 0）
     #[arg(long, default_value_t = -1)]
