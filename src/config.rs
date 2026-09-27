@@ -371,6 +371,8 @@ mod tests {
             prompts_dir: PathBuf::from("."),
             device: crate::runtime::DevicePref::Cpu,
             lib_dirs: vec![],
+            cuda_libs: None,
+            gguf_selftest: vec![],
             gpu_layers: 0,
             ctx_size: 4096,
             prefill_batch: 512,
