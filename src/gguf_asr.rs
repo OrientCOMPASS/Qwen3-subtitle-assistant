@@ -91,14 +91,14 @@ impl GgufAsr {
 
         unsafe {
             let c_lm = to_cstring(lm)?;
-            let mut mparams = sys::llama_model_params_default();
+            let mut mparams = sys::llama_model_default_params();
             mparams.n_gpu_layers = ngl;
             let model = sys::llama_model_load_from_file(c_lm.as_ptr(), mparams);
             if model.is_null() {
                 bail!("GGUF 模型加载失败: {:?}（确认文件完整且为 llama.cpp 格式）", lm);
             }
 
-            let mut cparams = sys::llama_context_params_default();
+            let mut cparams = sys::llama_context_default_params();
             cparams.n_ctx = 4096;       // 音频 12.5 token/s + 文本 prompt + 生成，4k 足够单段
             cparams.n_batch = 2048;
             cparams.n_threads = threads.max(1) as u32;
