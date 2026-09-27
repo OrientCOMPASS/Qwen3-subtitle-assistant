@@ -31,7 +31,12 @@ pub struct Config {
     // ---- VAD ----
     pub vad_threshold: f32,
     pub vad_min_silence: f32,
-    pub vad_buffer_secs: f32,
+    /// 单段语音长度上限（秒，超长硬拆；旧名 --vad-buffer-secs）
+    pub vad_max_seg_secs: f32,
+
+    // ---- 流式管线缓冲 ----
+    /// VAD→ASR 滞回缓冲容量（字节，--buffer-mb × 1e6）
+    pub buffer_bytes: usize,
 
     // ---- 排版与输出 ----
     pub max_line_width: usize,
@@ -54,7 +59,7 @@ impl Config {
             bail!("--temperature 必须 > 0（当前 {}）；想要确定性输出请用 --greedy", args.temperature);
         }
         let (lm, mmproj) = resolve_model(&args.model, &args.mmproj,
-                                         args.asr_model_dir.as_deref(), probe.exe_dir())
+                                         args.model_dir.as_deref(), probe.exe_dir())
             .context("定位 S2TT GGUF 模型失败")?;
         info!("LM: {:?} | mmproj: {:?}", lm, mmproj);
         if args.context.trim().is_empty() {
@@ -68,7 +73,7 @@ impl Config {
             cuda_libs: args.cuda_libs.clone(),
             threads: args.threads.max(1),
             gpu_layers: args.gpu_layers,
-            max_new_tokens: args.asr_max_new_tokens.max(16),
+            max_new_tokens: args.max_new_tokens.max(16),
             greedy: args.greedy,
             temperature: args.temperature,
             top_p: args.top_p.clamp(0.0, 1.0).max(if args.top_p > 0.0 { 1e-6 } else { 0.0 }),
@@ -84,7 +89,8 @@ impl Config {
             },
             vad_threshold: args.vad_threshold,
             vad_min_silence: args.vad_min_silence,
-            vad_buffer_secs: args.vad_buffer_secs,
+            vad_max_seg_secs: args.vad_max_seg_secs,
+            buffer_bytes: args.buffer_mb.max(1) * 1_000_000,
             max_line_width: args.max_line_width,
             max_cue_secs: args.max_cue_secs,
             output_dir: args.output_dir.clone(),
@@ -336,7 +342,7 @@ mod tests {
     fn output_paths() {
         let args = Args {
             files: vec![],
-            asr_model_dir: None,
+            model_dir: None,
             model: None,
             mmproj: None,
             context: String::new(),
@@ -344,10 +350,11 @@ mod tests {
             device: DevicePref::Cpu,
             threads: 1,
             gpu_layers: 0,
-            asr_max_new_tokens: 128,
+            max_new_tokens: 128,
             vad_threshold: 0.5,
             vad_min_silence: 0.5,
-            vad_buffer_secs: 60.0,
+            vad_max_seg_secs: 60.0,
+            buffer_mb: 50,
             max_line_width: 44,
             max_cue_secs: 15.0,
             output_dir: Some(PathBuf::from("out")),
@@ -370,7 +377,8 @@ mod tests {
                 lm_gguf: "x".into(), mmproj_gguf: "y".into(), context: String::new(),
                 device: DevicePref::Cpu, cuda_libs: None, threads: 1, gpu_layers: 0,
                 max_new_tokens: 128, vad_threshold: 0.5, vad_min_silence: 0.5,
-                vad_buffer_secs: 60.0, max_line_width: 44, max_cue_secs: 15.0,
+                vad_max_seg_secs: 60.0, buffer_bytes: 50_000_000,
+                max_line_width: 44, max_cue_secs: 15.0,
                 output_dir: Some(PathBuf::from("out")), raw_srt: false,
                 filter_fragments: false,
                 greedy: false, temperature: 0.7, top_p: 0.8, top_k: 20, seed: 42,

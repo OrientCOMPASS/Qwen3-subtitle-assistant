@@ -3,8 +3,9 @@
 //!
 //! v0.5 起为生产者/消费者流式管线：生产者线程读 ffmpeg PCM、跑 VAD，**每确认
 //! 一个语音段立即送入滞回缓冲队列**；消费者（主线程）拿到一段就 ASR 一段——
-//! 两个推理天然并行。v0.6 队列改滞回流控（用户指定）：满（8 段）时 VAD 暂停
-//! 生产，消费到半容量（4 段）才恢复，减少阻塞/唤醒抖动。
+//! 两个推理天然并行。v0.6 队列**按波形字节计量**（`--buffer-mb`，默认 50MB）：
+//! 占用满时 VAD 暂停生产，消费到半容量才恢复（高低水位滞回，减少阻塞/唤醒
+//! 抖动）；缓冲占用实时显示在进度条消息里。
 //! 与旧版「VAD 切完全片再整批 ASR」相比：
 //! * 首条字幕的等待时间 ≈ 第一句话的长度（而非全片 VAD 时长）；
 //! * 内存有界（队列容量 + VAD 窗口），不再全片缓冲；
@@ -29,6 +30,7 @@ use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// `--filter-fragments` 开启时，lang=None 但带文本的段的保留门槛（实测结论，
@@ -123,53 +125,69 @@ fn classify_utterance(u: &AsrUtterance, dur_secs: f64, filter_fragments: bool,
     KeepDecision::Keep
 }
 
-/// VAD→ASR 段队列容量（高水位）。背压：ASR 慢时生产者阻塞，ffmpeg 管道自然
-/// 限流，内存占用 = 容量 × 单段上限 ≈ 8 × 3.8MB，有界。
-const SEG_QUEUE_CAP: usize = 8;
-
-/// 滞回缓冲队列：VAD（生产者线程）与 ASR（消费者主线程）之间的段队列。
+/// VAD→ASR 滞回缓冲队列（**按波形字节数计量**，`--buffer-mb` 调整，默认 50MB）。
 ///
-/// 流控语义（用户指定）：**满（len ≥ cap）时生产者暂停**，直到消费掉一半
-/// （len ≤ cap/2）才恢复生产——高低水位滞回，避免"满一格放一格"的高频
-/// 阻塞/唤醒抖动，让 VAD 有机会成批跑在 ASR 前面。
+/// 流控语义（用户指定）：
+/// * 占用 ≥ 容量（高水位）→ 生产者（VAD 线程）暂停压入；
+/// * 消费到 ≤ 容量一半（低水位）→ 恢复生产——高低水位滞回，避免
+///   "满一格放一格"的高频阻塞/唤醒抖动，让 VAD 成批跑在 ASR 前面；
+/// * 单段超过总容量也不死锁：队列为空时照常入队（占用可短暂越界一个段的大小）。
 ///
-/// 注：VAD 与 ASR 本就分别跑在生产者/消费者线程上（v0.5 起真并行）；
-/// 本队列替换的是原来的 sync_channel（其为"一格"语义，无滞回）。
+/// VAD 与 ASR 本就分别跑在生产者/消费者线程上（v0.5 起真并行）；本队列替换
+/// v0.6.0 前的"8 段"计数队列——按字节计量后，内存上界与段长分布无关
+/// （60s 长段 ×8 = 30MB vs 短段 ×8 = 1MB 的不一致不复存在）。
 struct SegQueue {
     inner: Mutex<QueueInner>,
-    /// 生产者等待：队列降到半容量以下
+    /// 生产者等待：占用降到低水位（容量一半）以下
     cv_drained: Condvar,
     /// 消费者等待：有新段或队列关闭
     cv_item: Condvar,
-    cap: usize,
-    low_water: usize,
+    cap_bytes: usize,
 }
 
 struct QueueInner {
     q: VecDeque<Result<VadSeg>>,
+    /// 当前排队波形占用（字节；Err 项计 0）
+    bytes: usize,
     closed: bool,
 }
 
+fn seg_bytes(seg: &Result<VadSeg>) -> usize {
+    seg.as_ref().map(|s| s.samples.len() * std::mem::size_of::<f32>()).unwrap_or(0)
+}
+
 impl SegQueue {
-    fn new(cap: usize) -> Arc<Self> {
+    fn new(cap_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(QueueInner { q: VecDeque::new(), closed: false }),
+            inner: Mutex::new(QueueInner { q: VecDeque::new(), bytes: 0, closed: false }),
             cv_drained: Condvar::new(),
             cv_item: Condvar::new(),
-            cap,
-            low_water: (cap / 2).max(1),
+            cap_bytes: cap_bytes.max(1),
         })
     }
 
-    /// 生产者压入一段。返回 false = 队列已关闭（消费者出错退出），生产者应停止。
+    /// 当前占用（字节）——进度条展示用。
+    fn occupied(&self) -> usize {
+        self.inner.lock().map(|g| g.bytes).unwrap_or(0)
+    }
+
+    /// 容量（字节）。
+    fn cap(&self) -> usize {
+        self.cap_bytes
+    }
+
+    /// 生产者压入一段；占用 ≥ 容量时阻塞至消费过半（队列为空则总是放行，
+    /// 防单段超容死锁）。返回 false = 队列已关闭（消费者出错退出），生产者应停止。
     fn push(&self, item: Result<VadSeg>) -> bool {
+        let add = seg_bytes(&item);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        while g.q.len() >= self.cap && !g.closed {
+        while !g.q.is_empty() && g.bytes >= self.cap_bytes && !g.closed {
             g = self.cv_drained.wait(g).unwrap_or_else(|e| e.into_inner());
         }
         if g.closed {
             return false; // 消费者已弃队列（出错提前退出）
         }
+        g.bytes += add;
         g.q.push_back(item);
         drop(g);
         self.cv_item.notify_one();
@@ -181,7 +199,8 @@ impl SegQueue {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(item) = g.q.pop_front() {
-                let drained = g.q.len() <= self.low_water;
+                g.bytes = g.bytes.saturating_sub(seg_bytes(&item));
+                let drained = g.bytes <= self.cap_bytes / 2;
                 drop(g);
                 if drained {
                     self.cv_drained.notify_all(); // 半容量滞回点：放行生产者
@@ -209,6 +228,7 @@ impl SegQueue {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         g.q.clear();
+        g.bytes = 0;
         drop(g);
         self.cv_drained.notify_all();
         self.cv_item.notify_all();
@@ -220,19 +240,22 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
     let duration = ffmpeg::get_duration_secs(input).unwrap_or(0.0);
 
     let pb = make_progress(duration);
-    let queue = SegQueue::new(SEG_QUEUE_CAP);
+    let queue = SegQueue::new(cfg.buffer_bytes);
+    // 已转写（保留）段数——消费者更新，生产者读它拼进度条消息（缓冲占用展示）
+    let done = Arc::new(AtomicUsize::new(0));
 
     // ---- 生产者线程：ffmpeg 解码 + 流式 VAD，切出一段送一段 ----
     let pb_prod = pb.clone();
     let input_owned = input.to_path_buf();
-    let (vad_threshold, vad_min_silence, vad_buffer_secs) =
-        (cfg.vad_threshold, cfg.vad_min_silence, cfg.vad_buffer_secs);
+    let (vad_threshold, vad_min_silence, vad_max_seg_secs) =
+        (cfg.vad_threshold, cfg.vad_min_silence, cfg.vad_max_seg_secs);
     let q_prod = Arc::clone(&queue);
+    let done_prod = Arc::clone(&done);
     let producer = std::thread::Builder::new()
         .name("vad-feed".into())
         .spawn(move || {
             let result = vad_feed(&input_owned, duration, vad_threshold, vad_min_silence,
-                                  vad_buffer_secs, &q_prod, &pb_prod);
+                                  vad_max_seg_secs, &q_prod, &done_prod, &pb_prod);
             if let Err(e) = result {
                 // 消费者可能已因 ASR 错误退出（队列 closed）——push 返回 false 就静默收尾
                 let _ = q_prod.push(Err(e));
@@ -302,9 +325,11 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
                     end_ms,
                     text,
                 });
-                pb.set_message(format!("已转写 {} 段", out.len()));
+                done.store(out.len(), Ordering::Relaxed);
             }
         }
+        // 每段处理完刷新一次：已转写数 + 缓冲区占用（用户要求终端可见）
+        pb.set_message(queue_msg(&queue, &done));
     }
 
     // 收尾：出错提前 break 时 abort 解除生产者的满队列阻塞；join 回收线程
@@ -340,15 +365,15 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
 }
 
 /// 生产者主体：ffmpeg PCM 流 → f32 样本 → VadSegmenter.accept（返回即发送）。
-fn vad_feed(input: &Path, duration: f64, threshold: f32, min_silence: f32, buffer_secs: f32,
-            queue: &SegQueue, pb: &ProgressBar) -> Result<()> {
+fn vad_feed(input: &Path, duration: f64, threshold: f32, min_silence: f32, max_seg_secs: f32,
+            queue: &SegQueue, done: &AtomicUsize, pb: &ProgressBar) -> Result<()> {
     let mut stream = ffmpeg::spawn_decode_stream(input)
         .with_context(|| format!("启动 ffmpeg 解码失败: {:?}", input))?;
     let mut reader = stream
         .take_stdout()
         .context("无法取得 ffmpeg stdout（内部错误）")?;
 
-    let mut segmenter = VadSegmenter::new(threshold, min_silence, buffer_secs)
+    let mut segmenter = VadSegmenter::new(threshold, min_silence, max_seg_secs)
         .context("初始化 VAD 失败")?;
 
     // ---- 读取 f32le PCM 流喂 VAD（跨 read 边界保留半个采样，逻辑承自旧管线） ----
@@ -392,6 +417,7 @@ fn vad_feed(input: &Path, duration: f64, threshold: f32, min_silence: f32, buffe
         if duration > 0.0 {
             pb.set_position((total_bytes / 4 / SAMPLE_RATE as u64).min(duration as u64));
         }
+        pb.set_message(queue_msg(queue, done));
     }
     stream.finish().context("ffmpeg 进程未正常结束")?;
 
@@ -402,6 +428,14 @@ fn vad_feed(input: &Path, duration: f64, threshold: f32, min_silence: f32, buffe
         }
     }
     Ok(())
+}
+
+/// 进度条消息：已转写段数 + 缓冲区占用/容量（MB）。
+fn queue_msg(queue: &SegQueue, done: &AtomicUsize) -> String {
+    format!("已转写 {} 段 · 缓冲 {:.1}/{}MB",
+            done.load(Ordering::Relaxed),
+            queue.occupied() as f64 / 1e6,
+            (queue.cap() as f64 / 1e6).round() as usize)
 }
 
 fn make_progress(duration: f64) -> ProgressBar {
@@ -528,15 +562,16 @@ mod tests {
         assert!(!is_pure_filler("太阳"));
     }
 
-    /// 滞回队列：多线程正确性（顺序、总量、关闭语义、满队列阻塞后能恢复）。
+    /// 滞回队列（字节计量）：多线程正确性——顺序、总量、关闭语义。
     #[test]
     fn seg_queue_hysteresis_threads() {
-        let q = SegQueue::new(4); // cap=4, low_water=2
+        let cap = 64 * 1024; // 64KB；每段 512B（128 样本）
+        let q = SegQueue::new(cap);
         let qp = Arc::clone(&q);
-        let n = 100usize;
+        let n = 1000usize;
         let producer = std::thread::spawn(move || {
             for i in 0..n {
-                let seg = VadSeg { start_sample: i * 512, samples: vec![i as f32; 8] };
+                let seg = VadSeg { start_sample: i * 512, samples: vec![i as f32; 128] };
                 assert!(qp.push(Ok(seg)), "push 不应在正常路径失败");
             }
             qp.close();
@@ -546,21 +581,65 @@ mod tests {
             got.push(item.unwrap().start_sample);
         }
         producer.join().unwrap();
-        assert_eq!(got.len(), n);
         assert_eq!(got, (0..n).map(|i| i * 512).collect::<Vec<_>>(), "顺序必须保持");
-        // close 后 pop 立即 None（不阻塞）
+        assert!(q.pop().is_none(), "close 后 pop 应立即 None（不阻塞）");
+    }
+
+    /// 高水位停顿：不消费时生产者应停在容量处（越界 ≤ 一个段），
+    /// 消费过半后恢复生产，最终全部收到——这就是「满→暂停、半→恢复」滞回。
+    #[test]
+    fn seg_queue_bytes_hysteresis_bounds() {
+        let cap = 4 * 1024usize;      // 4KB
+        let seg_bytes = 128 * 4usize; // 512B/段
+        let q = SegQueue::new(cap);
+        let qp = Arc::clone(&q);
+        let n = 100usize;
+        let producer = std::thread::spawn(move || {
+            for i in 0..n {
+                let seg = VadSeg { start_sample: i, samples: vec![0.0f32; 128] };
+                if !qp.push(Ok(seg)) {
+                    return i;
+                }
+            }
+            qp.close();
+            n
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let occ = q.occupied();
+        assert!(occ >= cap, "应生产到高水位: occ={occ} cap={cap}");
+        assert!(occ <= cap + seg_bytes, "越界不应超过一个段: occ={occ}");
+        let mut got = 0usize;
+        while let Some(item) = q.pop() {
+            let _ = item.unwrap();
+            got += 1;
+        }
+        assert_eq!(producer.join().unwrap(), n, "生产者应完成全部推送");
+        assert_eq!(got, n);
+    }
+
+    /// 单段超过总容量：队列为空时照常入队（不死锁），占用短暂越界后恢复。
+    #[test]
+    fn seg_queue_oversized_single_segment_no_deadlock() {
+        let q = SegQueue::new(1024); // 容量 1KB；单段 8KB
+        let seg = VadSeg { start_sample: 0, samples: vec![0.0f32; 2048] };
+        assert!(q.push(Ok(seg)));
+        assert!(q.occupied() > q.cap(), "占用应如实反映越界");
+        let got = q.pop().unwrap().unwrap();
+        assert_eq!(got.samples.len(), 2048);
+        assert_eq!(q.occupied(), 0);
+        q.close();
         assert!(q.pop().is_none());
     }
 
     /// abort 解除生产者的满队列阻塞（消费者出错提前退出的场景）。
     #[test]
     fn seg_queue_abort_unblocks_producer() {
-        let q = SegQueue::new(2);
+        let q = SegQueue::new(1024); // 1KB → 两个 512B 段即停
         let qp = Arc::clone(&q);
         let producer = std::thread::spawn(move || {
             let mut pushed = 0;
             for i in 0..1000usize {
-                let seg = VadSeg { start_sample: i, samples: vec![0.0; 4] };
+                let seg = VadSeg { start_sample: i, samples: vec![0.0f32; 128] };
                 if !qp.push(Ok(seg)) {
                     break; // 队列关闭：正常退出而非永久阻塞
                 }
@@ -568,13 +647,13 @@ mod tests {
             }
             pushed
         });
-        // 消费一个后直接 abort（模拟 ASR 出错）
-        let _ = q.pop();
+        let _ = q.pop(); // 消费一个后直接 abort（模拟 ASR 出错）
         q.abort();
-        let pushed = std::time::Instant::now();
-        let n = producer.join().unwrap();
-        assert!(n < 1000, "生产者应被 abort 截停（实际推了 {n}）");
-        assert!(pushed.elapsed().as_secs() < 10, "join 不应长时间阻塞");
+        let t = std::time::Instant::now();
+        let pushed = producer.join().unwrap();
+        assert!(pushed < 1000, "生产者应被 abort 截停（实际推了 {pushed}）");
+        assert!(t.elapsed().as_secs() < 10, "join 不应长时间阻塞");
         assert!(q.pop().is_none());
+        assert_eq!(q.occupied(), 0, "abort 应清空占用");
     }
 }

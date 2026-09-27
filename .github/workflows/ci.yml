@@ -311,10 +311,20 @@ jobs:
           BIN="target/release/Qwen3-subtitle-assistant${{ matrix.exe_suffix }}"
           "$BIN" --version
           "$BIN" --help | head -12
-          # v0.5 新增行为开关必须出现在 CLI 面上
-          "$BIN" --help | grep -q -- "--raw-srt"
-          "$BIN" --help | grep -q -- "--verbose"
-          "$BIN" --help | grep -q -- "--filter-fragments"
+          # v0.5/v0.6 行为开关与重命名后的 flag 必须出现在 CLI 面上
+          for f in --raw-srt --verbose --filter-fragments --buffer-mb --greedy                    --temperature --model-dir --vad-max-seg-secs; do
+            "$BIN" --help | grep -q -- "$f" || { echo "!! --help 缺少 $f"; exit 1; }
+          done
+          # 旧名以隐藏 alias 保留（不显示在 --help，但必须仍被 clap 接受：
+          # 若 alias 失效会报 "unexpected argument"，据此断言）
+          out=$("$BIN" --asr-model-dir . 2>&1 || true)
+          if echo "$out" | grep -q "unexpected argument"; then
+            echo "!! 隐藏 alias --asr-model-dir 失效"; echo "$out" | head -3; exit 1
+          fi
+          out=$("$BIN" --vad-buffer-secs 30 2>&1 || true)
+          if echo "$out" | grep -q "unexpected argument"; then
+            echo "!! 隐藏 alias --vad-buffer-secs 失效"; exit 1
+          fi
           echo "SMOKE_OK"
 
       # ---------------- 依赖闭包检查：证明「单一可执行文件」成立 ----------------
@@ -376,7 +386,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "vulkan 版 --version 退出码 $LASTEXITCODE" }
             $help = & ./target/release/Qwen3-subtitle-assistant.exe --help 2>&1
             if ($LASTEXITCODE -ne 0) { throw "vulkan 版 --help 退出码 $LASTEXITCODE" }
-            foreach ($f in @("--raw-srt", "--verbose", "--filter-fragments")) {
+            foreach ($f in @("--raw-srt", "--verbose", "--filter-fragments", "--buffer-mb",
+                              "--greedy", "--temperature", "--model-dir", "--vad-max-seg-secs")) {
               if (-not ($help -match [regex]::Escape($f))) { throw "vulkan 版 --help 缺少 $f" }
             }
             Write-Host "VK_LAUNCH_OK + SMOKE_OK"
@@ -707,7 +718,7 @@ jobs:
           if ($env:T1_SKIPPED) { exit 0 }
           $one = ($env:MEDIA_LIST -split ';')[0]
           & ./target/release/Qwen3-subtitle-assistant.exe --no-pause `
-              --verbose --filter-fragments --raw-srt `
+              --verbose --filter-fragments --raw-srt --buffer-mb 20 `
               --output-dir media/t1c --log-file media/t1c.log $one *> media/t1c_console.txt
           if ($LASTEXITCODE -ne 0) { throw "T1c 退出码非 0" }
           Get-Content media/t1c_console.txt | Select-Object -First 30
@@ -854,8 +865,11 @@ jobs:
             ② 丢弃规则升级：判重先去标点；「上一条与本次都是纯语气词（哎/啊/嗯/哼…）」
             的连续语气词段丢弃；③ 模型目录拍平：exe 同级或差一级 models/ 均可，
             不再需要 qwen3-asr-s2tt 目录（旧布局仍兼容）；④ 产物更名
-            Qwen3-subtitle-assistant；⑤ VAD→ASR 队列改滞回流控（满 8 段暂停生产、
-            消费到 4 段恢复）。
+            Qwen3-subtitle-assistant；⑤ VAD→ASR 缓冲按**字节**计量（--buffer-mb，
+            默认 50MB，满→暂停生产、消费过半→恢复），占用实时显示在进度条；
+            ⑥ flag 命名整理 + 常用短参数（-m/-c/-d/-t/-T/-g/-b/-o/-l/-v/-f），
+            旧名 --asr-model-dir/--asr-max-new-tokens/--vad-buffer-secs 保留为
+            隐藏 alias。
           NOTES
           # 去缩进（heredoc 里的前导空格）
           sed -i 's/^          //' RELEASE_BODY.md

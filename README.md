@@ -1,203 +1,248 @@
-# Qwen3 Subtitle Assistant（单文件直出版，产物名 `Qwen3-subtitle-assistant`）
+# Qwen3 Subtitle Assistant
 
-**完全本地离线**的视频/音频字幕工具：媒体文件拖上去，排版好的**中文字幕 SRT** 出来。
+**完全本地离线**的视频/音频字幕工具：把媒体文件交给它，得到排版好的 **SRT 字幕**。
 
-单个微调模型完成全部工作：**S2TT 微调版 Qwen3-ASR-1.7B**（LoRA 定向「听日语、写中文」，
-GGUF Q4_K_M）在 llama.cpp 运行时上直出目标语言字幕——**没有 LLM 后处理段**，
-VAD 是内嵌权重的纯 Rust silero v4，**无任何 ONNX Runtime 依赖**。
+核心能力由一个微调模型完成：**S2TT 版 Qwen3-ASR-1.7B**（LoRA 定向「听日语、写中文」）
+在 llama.cpp 上直接输出目标语言字幕——转录和翻译一步到位，没有 LLM 后处理环节。
 
-> **v0.6 相对 v0.5 的变化**
-> 1. **默认温度采样**：ASR 解码从恒贪心改为基座 Qwen3-1.7B 官方推荐参数
->    （temperature=0.7 / top_p=0.8 / top_k=20，固定种子可复现）；`--greedy`
->    回到旧贪心行为。贪心在长静音/重复背景音处更易复读与幻觉，采样可打散循环。
-> 2. **丢弃规则升级**：判重**先去标点**（"你好。"="你好，"）；新增「上一条与
->    本次都是纯语气词（哎/啊/嗯/哼…闭集）」的连续语气词丢弃——首条语气词保留，
->    不误伤真实应答。
-> 3. **模型目录拍平**：exe 同级或差一级 `models/` 直接放两个 GGUF 即可，
->    不再需要 `qwen3-asr-s2tt` 目录（旧布局仍兼容探测）；探测序见 `--asr-model-dir` 帮助。
-> 4. **产物更名** `Qwen3-subtitle-assistant-<平台>`；Release 文件名不再带版本号
->    （版本由 tag 承载）。
-> 5. **VAD→ASR 队列改滞回流控**：满 8 段暂停 VAD 生产、消费到半容量（4 段）恢复，
->    减少阻塞/唤醒抖动（两线程本就并行，此为流控策略细化）。
->
-> **v0.5 相对 v0.4 的变化**
-> 1. **单一可执行文件发行**：llama.cpp（含 mtmd）从源码**静态链接**进可执行文件，
->    发布物是各平台的裸二进制，**没有任何伴生 DLL/so/dylib**；不再打 1.5GiB 大
->    zip，模型 GGUF 作为独立 Release 资产下载。
-> 2. **流式转录管线**：VAD 每确认一个语音段**立即**送 ASR（生产者/消费者 +
->    有界队列），不再「全片切完再整批转录」——首条字幕等待时间 ≈ 第一句话时长，
->    内存有界（不再全片缓冲波形）。实测同素材全流程提速 ~40%（3 视频 4.8→2.9 分钟）。
-> 3. **终端只留有用信息**：模型加载日志（llama.cpp/ggml/mtmd 原生数百行）与
->    跳过/丢弃类明细收敛为 debug 级（`--log-file` 文件通道恒全量、`--verbose`
->    放开终端）；**逐条识别出的字幕内容照常打印**（`[ASR✔] 时间戳 (时长) 文本`）。
-> 4. **单输出文件**：默认只产出 `<视频名>.srt`；排版前对照 `.raw.srt` 需显式
->    `--raw-srt`。
-> 5. **碎片过滤默认关闭**：v0.4 会把「lang=None 短碎片」当幻觉丢弃（一个真实
->    视频曾丢 313/427 段）；v0.5 默认**保留一切有文本的段**，只有显式传
->    `--filter-fragments` 才启用该启发式（空文本段始终跳过——没有内容可写）。
->    **相邻重复句自动丢弃**（v0.5.1）：与上一条字幕完全相同的识别结果不再进字幕。
-> 6. **GPU 加速形态**（v0.5.2 收敛）：每平台只发**一个**单文件——Windows/
->    Linux-x64 内嵌 **Vulkan**（自动发现 NVIDIA/AMD/Intel GPU；无 GPU 设备自动
->    回退 CPU），macOS 内嵌 **Metal**，Linux-arm64 纯 CPU。注意 Vulkan 版启动
->    依赖系统 Vulkan loader（vulkan-1.dll / libvulkan.so.1——GPU 驱动/桌面
->    发行版必有）；完全无驱动的 VM/容器请源码自建纯 CPU 版（见「开发」）。
->
-> v0.4（E3 单模型化）的背景：移除「ASR(日语) → 1.7B LLM 质检/摘要/翻译/审校」
-> 双模型工作流，S2TT 微调直出质量实测追平（`finetune/README.md` §11），
-> 运行时从 sherpa-onnx(ORT) 换到 llama.cpp(GGUF)，VAD 纯 Rust 化。
+| 特性 | 说明 |
+|---|---|
+| 🔒 完全离线 | 模型随包下载，推理不出本机，无需任何 API key |
+| 📦 单一可执行文件 | llama.cpp 静态链接进二进制，无 DLL/so 伴生（Windows/Linux 约 35~50MB，macOS 约 8MB） |
+| ⚡ GPU 加速 | Windows/Linux 内嵌 **Vulkan**（NVIDIA/AMD/Intel 自动发现）；macOS 内嵌 **Metal**；无 GPU 自动回退 CPU |
+| 🌊 流式管线 | VAD 每切出一句立即送 ASR（两线程并行 + 字节计量滞回缓冲），第一句字幕不用等全片扫完 |
+| 🧹 终端干净 | 默认只显示进度条、逐条字幕和结果；全部诊断明细进 `--log-file` 或 `--verbose` |
+| 🎯 任务开关 | 默认直出中文；`--context ""` 转写源语言（同一套权重） |
 
 ---
 
-## ✨ 工作流（v0.5 流式）
+## 📥 下载与安装
 
-```
-媒体文件 ──ffmpeg──▶ 16k f32le PCM ──纯 Rust silero v4（流式）──┐
-                                                               │ 每确认一段立即送
-                                                               ▼
-              S2TT 微调 Qwen3-ASR（llama.cpp/mtmd，context="translate to Chinese"）
-              ├─ 空输出（纯静音/噪音）→ 跳过（无内容可写）
-              ├─ 与上一条字幕完全相同 → 丢弃（重复音频/幻觉循环）
-              ├─ lang=None 短碎片 → 默认保留；--filter-fragments 时丢弃
-              └─ 直出中文正文（终端逐条打印 [ASR✔]）
-                                                               │
-                                                               ▼
-              排版（CJK 折行 + 长 cue 句读拆分）──▶ 单个 .srt（--raw-srt 才另存对照）
-```
+从 [Releases](../../releases/latest) 下载 **1 个二进制 + 2 个模型文件**：
 
-* **🔒 完全离线**：转录+翻译一体完成，数据不出域；
-* **🎯 任务开关**：`--context "translate to Chinese"`（默认）直出中文；
-  `--context ""` 转写源语言——同一套权重，system 段切换（微调时双任务混训保住）；
-* **⚡ 推理设备**：Windows/Linux-x64 自动 **Vulkan**（多卡选索引最大者），
-  macOS 自动 **Metal**，arm64 纯 CPU（4 线程实测 1.7B Q4_K_M RTF≈0.6）；
-  无 GPU 设备时全部自动回退 CPU；有 GPU 时权重全量上卡、主机副本自动释放；
-* **🖱 极简交互**：媒体文件拖到可执行文件上即处理；失败窗口不闪退（`--no-pause` 可关）。
-
-## 📦 快速开始
-
-1. 从 Release 下载**两样东西**：
-   * 你平台的单文件二进制：`subtitle-assistant-<ver>-<平台>`（8~50MB）；
-   * 模型：`s2tt-Q4_K_M.gguf`（LM，≈1.0GiB）+ `mmproj-s2tt-q8.gguf`（音频编码器，≈0.3GiB）；
-2. 按下面结构摆放（模型文件名保持下载原样即可被自动识别：`mmproj` 前缀=编码器，
-   其余 `.gguf`=LM；两种摆法都支持）：
-   ```
-   任意目录/
-   ├── Qwen3-subtitle-assistant-windows-x64.exe   # 或对应平台产物
-   └── models/                                    # 差一级 models/（推荐）
-       ├── s2tt-Q4_K_M.gguf
-       └── mmproj-s2tt-q8.gguf
-   ```
-   或直接把两个 GGUF 与 exe 放同一目录（同级摆放）。旧的
-   `models/qwen3-asr-s2tt/` 布局也仍被探测（v0.5 用户无需挪文件）。
-3. 确保系统 PATH 里有 **ffmpeg / ffprobe**（音视频解码，各平台包管理器均有）；
-4. 把视频/音频拖到可执行文件上（或命令行传入，支持多文件批处理）；
-5. 同目录得到 `<视频名>.srt`，终端逐条打印识别出的字幕内容。
-
-平台说明：
-
-| 平台 | 资产 | 推理设备 | 备注 |
-|---|---|---|---|
-| Windows x64 | `*-windows-x64.exe` | **Vulkan**：自动发现 NVIDIA/AMD/Intel GPU（多卡选索引最大者，通常即主力独显）；无 GPU 设备自动回退 CPU | 需 GPU 驱动（自带 vulkan-1.dll）+ VC++ 2015-2022 运行库（缺失时装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)）；CPU 需 AVX2（2013 年后 x64 均可） |
-| Linux x64 | `*-linux-x64` | **Vulkan** → CPU 回退 | glibc ≥ 2.39（Ubuntu 24.04 工具链构建）；libvulkan.so.1 桌面发行版标配 |
-| Linux arm64 | `*-linux-arm64` | CPU（OpenMP） | armv8-a 基线（树莓派 4 及以上均可） |
-| macOS Apple Silicon | `*-macos-arm64` | **Metal GPU**（自动） | CI 硬断言 MTL 设备被发现；无 GPU 自动 CPU 兜底（Accelerate BLAS） |
-
-体积说明：Windows/Linux-x64 版比 arm64/mac 版大（~35-50MB vs ~8MB）是正常的——
-Vulkan 后端内嵌**几百个预编译 SPIR-V shader 变体**；Metal 只嵌一个编译好的
-metallib（几 MB）。两个 GPU 后端都有 CI 真机断言（Windows PE 导入表含 vulkan-1、
-Linux ldd 含 libvulkan、mac 自检选定 MTL 设备并全量入显存），不是"只有 CPU"的空壳。
-
-无 GPU 驱动的 VM/精简容器：发行版无法启动（缺 Vulkan loader）。这类环境自行
-`cargo build --release --features static-libs`（Linux，不加 vulkan 特性）即得纯
-CPU 单文件。
-
-环境自检：`Qwen3-subtitle-assistant-windows-x64.exe --gguf-selftest models\s2tt-Q4_K_M.gguf models\mmproj-s2tt-q8.gguf`
-（打印后端设备、加载耗时、进程内存；GPU 下内存应远小于模型体积=权重已入显存）。
-
-## 🛠 常用参数
-
-| 参数 | 默认 | 说明 |
+| 你的系统 | 下载资产 | 运行要求 |
 |---|---|---|
-| `--context` | `translate to Chinese` | 任务开关；空串=转写源语言 |
-| `--asr-model-dir` | 自动探测 | 模型目录；不传时按序探测 exe目录/models → exe目录 → ./models → 旧版 qwen3-asr-s2tt 布局 |
-| `--model` / `--mmproj` | 自动探测 | 显式指定 LM / 音频编码器 GGUF |
-| `--temperature` / `--top-p` / `--top-k` | 0.7 / 0.8 / 20 | 采样参数（基座 Qwen3-1.7B 官方非思考模式推荐值） |
-| `--seed` | 42（固定可复现） | 采样种子；传 0 = 每次运行随机 |
-| `--greedy` | 关 | 强制贪心解码（v0.5 及以前的固定行为） |
-| `--verbose` / `-v` | 关 | 终端输出全部诊断明细（等价 `RUST_LOG=debug`） |
-| `--log-file PATH` | 无 | 日志落盘，**文件内恒为全量诊断**（终端不受影响） |
-| `--raw-srt` | 关 | 另存排版前 `<名>.raw.srt`（默认只出一个 `.srt`） |
-| `--filter-fragments` | 关 | 启用「lang=None 短碎片=幻觉」过滤（默认保留一切有文本的段） |
-| `--threads` | 4 | CPU 推理线程 |
-| `--gpu-layers` | -1（自动全量） | 上卡层数（macOS Metal 生效） |
-| `--vad-min-silence` | 0.5s | 断句静音阈值 |
-| `--vad-buffer-secs` | 60s | 单段上限（超长硬拆） |
-| `--max-line-width` / `--max-cue-secs` | 44 / 15s | 排版 |
-| `--output-dir` / `--no-pause` | — | 输出与运行方式 |
-| `--cuda-libs DIR` | 无 | **仅动态链接构建生效**（见下），单文件版忽略后回退 CPU |
+| Windows x64 | `Qwen3-subtitle-assistant-windows-x64.exe` | GPU 驱动（自带 vulkan-1.dll）+ [VC++ 2015-2022 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)；CPU 需 AVX2（2013 年后的 x64 均可） |
+| Linux x64 | `Qwen3-subtitle-assistant-linux-x64` | glibc ≥ 2.39（Ubuntu 24.04+ 等）；libvulkan.so.1（桌面发行版标配） |
+| Linux arm64 | `Qwen3-subtitle-assistant-linux-arm64` | glibc ≥ 2.39；纯 CPU（armv8-a，树莓派 4+） |
+| macOS (Apple Silicon) | `Qwen3-subtitle-assistant-macos-arm64` | 无额外依赖，Metal GPU 自动启用 |
+
+模型（所有平台通用）：`s2tt-Q4_K_M.gguf`（约 1.1GB）+ `mmproj-s2tt-q8.gguf`（约 0.36GB）。
+
+另需系统 PATH 里有 **ffmpeg / ffprobe**（音视频解码；Windows 可用 `winget install ffmpeg`，
+macOS `brew install ffmpeg`，Linux 发行版包管理器同名安装）。
+
+摆放成下面任一结构即可（**推荐图一**；两种都会自动发现，旧的 `models/qwen3-asr-s2tt/`
+布局也兼容）：
+
+```
+任意目录/                                任意目录/
+├── Qwen3-subtitle-assistant-…(.exe)    ├── Qwen3-subtitle-assistant-…(.exe)
+└── models/                             ├── s2tt-Q4_K_M.gguf        ← 与 exe 同级也行
+    ├── s2tt-Q4_K_M.gguf                └── mmproj-s2tt-q8.gguf
+    └── mmproj-s2tt-q8.gguf
+```
+
+文件名不必改：目录内 `mmproj` 前缀的 `.gguf` 识别为音频编码器，其余 `.gguf` 识别为
+语言模型。
+
+> Windows/Linux 版内嵌 Vulkan 后端，启动依赖系统 Vulkan loader（GPU 驱动/桌面
+> 发行版必有）。完全无驱动的 VM/精简容器请自行源码构建纯 CPU 版（见「开发者」）。
+
+## 🚀 快速开始
+
+```bash
+# 方式一：把视频/音频文件拖到可执行文件图标上（Windows/macOS）
+
+# 方式二：命令行（支持多文件批处理）
+./Qwen3-subtitle-assistant-linux-x64 视频.mp4 访谈.m4a
+
+# 输出：每个输入同目录下的 视频.srt / 访谈.srt（简体中文、已折行、长句已拆分）
+```
+
+运行时终端所见（默认级别）：
+
+```
+模式: S2TT 单模型直出｜context="translate to Chinese"｜设备: auto｜…
+选定推理设备: [0] NVIDIA GeForce RTX 4060（权重将全量入显存…）
+[1/1] 处理: "视频.mp4"
+⠹ [00:02:31] [███████████▌----------] 316s/742s · 已转写 57 段 · 缓冲 12.4/50MB
+[ASR✔] 00:00:04,672 (1.0s) 对大家来说。
+[ASR✔] 00:00:06,400 (2.2s) 我最喜欢的口技，是中国的口技。
+…（逐条实时打印识别出的字幕）
+转录完成：427 段语音 → 380 条字幕（47 段空输出跳过，3 段重复丢弃）
+已写出字幕: "视频.srt"（392 条）
+全部 1 个文件处理成功。
+```
+
+常用变体：
+
+```bash
+Qwen3-subtitle-assistant… --context "" 视频.mp4        # 转写源语言（日语原文字幕）
+Qwen3-subtitle-assistant… --greedy 视频.mp4            # 确定性贪心解码（完全可复现）
+Qwen3-subtitle-assistant… -o subs -l run.log 视频.mp4  # 输出到 subs/，全量诊断进 run.log
+Qwen3-subtitle-assistant… --gguf-selftest models/s2tt-Q4_K_M.gguf models/mmproj-s2tt-q8.gguf
+                                                        # 环境自检：设备/加载/内存，不处理媒体
+```
+
+## ⚙️ 工作原理
+
+```
+媒体文件
+   │  ffmpeg 子进程（-vn -ac 1 -ar 16000 -f f32le → stdout 管道）
+   ▼
+16kHz f32 单声道 PCM 流
+   │  生产者线程：纯 Rust silero v4 VAD（权重内嵌 exe，0.62MB）
+   │  逐帧(32ms)算语音概率，状态机流式切段：进入/退出阈值、min_silence 断句、
+   │  合并窗、±0.1s pad、超长硬拆（--vad-max-seg-secs）
+   ▼  每确认一段立即压入
+滞回缓冲队列（--buffer-mb，默认 50MB，按波形字节计量；占用实时显示在进度条。
+   │        占用满 → VAD 暂停生产；消费到半容量 → 恢复。内存上界与段长无关）
+   ▼  消费者线程（主线程）逐段取出
+S2TT Qwen3-ASR（llama.cpp + mtmd 音频编码，静态链接）
+   │  chat 模板 system="translate to Chinese"（或空=转写），贪心或温度采样
+   │  （默认 temp=0.7/top_p=0.8/top_k=20，基座官方推荐值；--greedy 回到贪心）
+   │  原始输出 `language X<asr_text>正文` → 解析出语言与正文
+   ▼
+丢弃规则（顺序判定，均有单测）
+   │  ① 空文本（模型判定纯静音/噪音）→ 跳过（无内容可写，恒开）
+   │  ② 与上一条保留字幕相同（去标点后比较）→ 丢弃（复读/幻觉循环，恒开）
+   │  ③ 上一条与本次都是纯语气词（哎啊嗯哼呀哇哦噢…闭集）→ 丢弃本次（恒开）
+   │  ④ lang=None 且 <2s 或 <4 字的碎片 → 仅 --filter-fragments 时丢弃
+   ▼
+排版（CJK 显示宽度折行 --max-line-width；长 cue 按句读拆分 --max-cue-secs）
+   ▼
+<视频名>.srt        （--raw-srt 时另存排版前对照 .raw.srt）
+```
+
+**推理设备选择**（`--device auto` 默认）：`--cuda-libs` 指定的 CUDA（仅动态链接
+构建）→ Vulkan/Metal 中索引最大的 GPU（多显卡机器上通常是主力独显）→ CPU。
+有 GPU 时权重全量上卡，主机内存副本由 ggml 自动释放。
+
+**终端输出设计**：应用日志双通道——终端默认 info 级（模式行、设备行、逐条字幕
+`[ASR✔]`、每文件总结）；llama.cpp/ggml/mtmd 的原生 C 日志经 `llama_log_set`/
+`ggml_log_set`/`mtmd_helper_log_set` 桥接进同一门面降为 debug；跳过/丢弃明细也是
+debug。`--log-file` 的文件通道**恒为 debug 全量**（终端干净的同时排障有料），
+`--verbose` 或 `RUST_LOG=debug` 把 debug 也放开到终端。
+
+**VAD 实现**：silero v4 的纯 Rust 移植（无 onnxruntime），与 ORT 参照实现位精确
+对拍（375 个中间层误差 <3.2e-6，黄金向量回放测试在 CI 常跑）；流式段切分状态机
+与旧批量实现有 600 组随机序列的等价性对拍测试。
+
+## 🎛 参数总览
+
+短参数：`-m` model `-c` context `-d` device `-t` threads `-T` temperature
+`-g` greedy `-b` buffer-mb `-o` output-dir `-l` log-file `-v` verbose
+`-f` filter-fragments（`-h` 帮助 / `-V` 版本）。完整表：`--help`。
+
+| 分组 | 参数 | 默认 | 说明 |
+|---|---|---|---|
+| 模型 | `--model-dir DIR` | 自动探测 | 探测序：exe目录/models → exe目录 → ./models → 旧版布局；alias: `--asr-model-dir` |
+| | `--model` / `--mmproj` | 目录扫描 | 显式指定 LM / 音频编码器 GGUF |
+| | `--context STR` | `translate to Chinese` | 任务开关；`""` = 转写源语言 |
+| 设备 | `--device` | `auto` | `auto` / `cpu` / `cuda`（cuda 需 `--cuda-libs` 且动态链接构建） |
+| | `--threads N` | 4 | CPU 推理线程 |
+| | `--gpu-layers N` | -1（自动全量） | 上卡层数 |
+| | `--cuda-libs DIR` | 无 | 外置 CUDA 后端目录（仅动态链接构建生效） |
+| 采样 | `--temperature F` | 0.7 | 基座 Qwen3-1.7B 官方推荐；`--greedy` 时忽略 |
+| | `--top-p F` / `--top-k N` | 0.8 / 20 | 同上 |
+| | `--seed N` | 42 | 固定=可复现；0=每次随机 |
+| | `--greedy` | 关 | 强制贪心（v0.5 及以前行为） |
+| VAD | `--vad-threshold F` | 0.5 | 语音概率阈值 |
+| | `--vad-min-silence F` | 0.5s | 断句静音阈值 |
+| | `--vad-max-seg-secs F` | 60s | 单段上限（超长硬拆）；alias: `--vad-buffer-secs` |
+| 管线 | `--buffer-mb N` | 50 | VAD→ASR 滞回缓冲容量（MB，满→停、半→续） |
+| | `--max-new-tokens N` | 256 | 单段生成上限；alias: `--asr-max-new-tokens` |
+| 输出 | `--output-dir DIR` | 输入同目录 | SRT 输出目录 |
+| | `--raw-srt` | 关 | 另存排版前 `.raw.srt` 对照 |
+| | `--max-line-width N` / `--max-cue-secs F` | 44 / 15 | 排版：折行宽度 / 长 cue 拆分阈值 |
+| 日志 | `--log-file PATH` | 无 | 全量诊断落盘（终端不受影响） |
+| | `--verbose` | 关 | 终端放开 debug 明细 |
+| | `--no-pause` | 关 | 失败时不等待回车（拖拽场景默认等待） |
+| 过滤 | `--filter-fragments` | 关 | 启用 lang=None 短碎片启发式丢弃 |
+| 自检 | `--gguf-selftest LM MMPROJ` | — | 加载模型打印设备/能力/内存后退出 |
 
 ## 🧪 质量与边界（如实说明）
 
-* 语言定向 100% 可靠（真实视频假名占比 0.0%），静音行为双模式全空；
-* 与旧精翻管线对照：叙事内容互有胜负；**残留差距**是世界知识纠错（口误同音词
-  LLM 能纠、单模型忠实直译）与个别专名/指代漂移；含糊音频两者同样无能为力；
-* 碎片过滤默认关闭意味着**静音段偶发的短幻觉文本会保留在字幕里**（模型对
-  纯静音大多输出空文本、被自然跳过；lang=None 短碎片是少数）——在意纯净度的
-  场景加 `--filter-fragments`；与上一条字幕完全相同的重复句则始终自动丢弃；
-* 120 对小样本微调的当前模型已达上述水平；数据放量（`finetune/` 产线，≥2000 对）
-  会进一步收窄差距。质量证据链全部在 CI 可复现（`finetune/README.md` §10/§11、
-  `finetune/INTEGRATION.md`）。
+* **语言定向可靠**：真实日语视频直出中文的假名占比 0.0%（CI 每轮断言 ≤5%）；
+  静音/噪音大多输出空文本被自然跳过；
+* **采样 vs 贪心**：默认温度采样能显著减少长静音/重复背景音处的复读与幻觉循环
+  （配套还有去标点判重、连续语气词丢弃两道后处理）；需要逐位可复现时用
+  `--greedy` + 默认固定 seed 之外的任何组合都保证同输入同输出；
+* **残留差距**（对比旧「ASR+LLM 精翻」两段式）：世界知识纠错（口误同音词）与
+  个别专名漂移——单模型忠实直译，无 LLM 兜底；含糊音频两者同样无能为力；
+* 当前模型用 120 对小样本微调；数据放量（`finetune/` 产线）会进一步收窄差距。
+  质量证据链全部在 CI 可复现（`finetune/README.md` §10/§11）。
 
-## 🏭 模型产线（finetune/）
+## 🧯 开发者
 
-微调 → 评测 → GGUF 化的全链路在 `finetune/`（全部 CI 可复现，无需 GPU/密钥起步）：
-`prepare_data.py`（FLEURS+对照表+静音样本）→ `sft_lora.py`（CPU 可训）→
-`eval_s2tt.py`（三项判定）→ `merge_lora_hf.py` + llama.cpp 官方转换器 →
-Q4_K_M + mmproj（`finetune.yml` mode=gguf-e2，产物存跨 OS 缓存供产品 CI/发布用）。
+### 构建与测试
 
-## 🧯 开发
-
-```
-cargo build --release        # 静态单文件（默认，产物 target/release/Qwen3-subtitle-assistant）：
-                             # 只需 CMake + LLVM(libclang)，无 CUDA/Vulkan SDK
-cargo test --release         # VAD 黄金向量 / 流式段状态机↔批量参照等价性 / 滞回队列 /
-                             # 判重与语气词规则 / 模型目录拍平发现 / 排版 / SRT / 输出解析
+```bash
+cargo build --release    # 产物 target/release/Qwen3-subtitle-assistant[.exe]
+cargo test --release     # 36 个单测：VAD 黄金向量/流式等价性/滞回队列/丢弃规则/排版/SRT/目录发现
 ```
 
-* **静态单文件形态（发布默认）**：llama.cpp/mtmd 静态编入；Linux 加
-  `--features static-libs`（libstdc++/libgomp 静态，产物只剩 glibc 依赖）；
-  macOS 自动含 Metal。Windows 两侧都用默认动态 CRT（`/MD`）——不要加
-  `LLAMA_STATIC_CRT=1`/`RUSTFLAGS=-C target-feature=+crt-static`：cmake-rs 的
-  `static_crt` 传导不进 llama.cpp 全部目标，实测链接期 `__imp_fputs`/`__imp_getenv`
-  LNK2001 大爆炸；且 MSVC OpenMP 的 vcomp140.dll 本就没有静态版，静态 CRT 收益为零。
-* **Vulkan 单文件（Windows/Linux-x64 发行形态）**：加 `--features vulkan`——
-  Vulkan 后端静态编入，编译期需要 Vulkan SDK（Windows 装 LunarG SDK 并设
-  `VULKAN_SDK`；Linux `apt install libvulkan-dev glslc spirv-headers`）。
-  运行期硬依赖系统 Vulkan loader（vulkan-1.dll / libvulkan.so.1，GPU 驱动必带）；
-  不加该特性即纯 CPU 单文件（VM/容器场景自建）。Windows 构建的三个雷
-  （Ninja 生成器 / vcvars / MAX_PATH）与对策见 ci.yml windows 腿注释。
-* **CUDA**：Linux 可全静态进单文件（cudart/cublas 静态，运行仅需 NVIDIA 驱动
-  自带的 libcuda.so.1）；Windows 因 NVIDIA 不提供静态 cublas 只能 DLL 伴生
-  （回到 v0.2 cuda12 zip 形态）。**实测**（`.github/workflows/cuda-probe.yml`，
-  ubuntu-24.04 + CUDA 12.6 + archs=86;89 + vulkan 合一）：单文件 **858 MiB
-  < 2GiB 上限 ✓**——体积大头是 cublas(Lt)_static（原始 885MB，链接只取所需
-  对象）；架构数与体积近线性，全覆盖 10 代架构 + PTX 估计 1.5~1.8GiB，仍
-  可发但接近上限。注意此类二进制**启动硬依赖 libcuda.so.1**（仅 NVIDIA 驱动
-  机器可运行），只能作为可选附加资产，不能顶替通用 Vulkan 版。
-* **动态链接形态（CUDA 开发者选项）**：`cargo build --release --features dynamic-link`
-  产出 exe + llama/ggml DLL；此形态下 `--cuda-libs <DIR>` 可加载 llama.cpp 官方
-  release 的 `ggml-cuda.dll`（连同 cudart/cublas/cudnn 放同一目录）。
-  CI 发布包不再使用该形态。
+依赖：Rust stable + CMake + LLVM(libclang，bindgen 用)。**无需** CUDA/Vulkan SDK
+（除非启用对应 feature，见下表）。llama.cpp 由 `llama-cpp-sys-2`（版本精确锁定）
+从内嵌源码构建。
 
-CI（`.github/workflows/ci.yml`）：push/PR 自动 **4 腿矩阵构建**（windows-x64(Vulkan) /
-linux-x64(Vulkan) / linux-arm64 / macos-arm64(Metal)，全部静态单文件 + 依赖闭包检查）+
-单元测试 + windows 真实视频 e2e（T1 默认参数全流程与**终端清洁度断言** / T1b 任务
-开关对照 / T1c `--verbose --filter-fragments --raw-srt` 对照 / T3 迁移目录）；可运行
-的腿在 GGUF 缓存命中时顺带真实模型自检（mac 腿**硬断言** Metal；linux-x64 腿验证
-「loader 在、0 ICD → 优雅回退 CPU」的降级路径；e2e 用的就是发行的 Vulkan 版
-exe，在 runner 上同样走该降级路径跑全量真实转录）。手动 dispatch 才收集 4 平台
-二进制 + 模型发布 GitHub Release。
+### 构建形态（cargo features）
+
+| 形态 | 命令 | 产物 |
+|---|---|---|
+| CPU 单文件 | `cargo build --release` | 任何机器可跑（VM/容器友好） |
+| Vulkan 单文件（Win/Linux 发行形态） | `--features vulkan` | 需 Vulkan SDK 编译（Win：LunarG SDK+`VULKAN_SDK`；Linux：`apt install libvulkan-dev glslc spirv-headers`）；运行需系统 loader |
+| Linux 全静态伴生库 | `--features static-libs` | libstdc++/libgomp 静态，仅剩 glibc 依赖 |
+| CUDA 单文件（仅 Linux） | `--features cuda-build,static-libs` | 需 NVIDIA 官方 toolkit（apt 版不带静态库）；实测 858MiB（2 架构+Vulkan）<2GiB；运行需驱动 libcuda.so.1。探针：`cuda-probe.yml` |
+| 动态链接（CUDA DLL 注入玩法） | `--features dynamic-link` | exe + llama/ggml DLL；`--cuda-libs` 可用官方 ggml-cuda.dll |
+| Windows CRT | 保持默认动态 `/MD` | 勿开静态 CRT（cmake-rs 传导不进 llama.cpp，实测 LNK2001；vcomp140 反正需要 VC++ 运行库） |
+
+Windows Vulkan 构建的三个已知雷与对策（Ninja 生成器绕 MSBuild 乱序、vcvars
+显式布阵、`CARGO_TARGET_DIR` 短路径避 MAX_PATH）见 `.github/workflows/ci.yml`
+windows 腿注释。
+
+### 仓库结构
+
+```
+src/
+├── main.rs        # 入口：日志装配、自检模式、多文件循环
+├── cli.rs         # 参数定义（短参数/alias 策略见文件头）
+├── config.rs      # 配置解析 + 模型目录多候选发现
+├── logging.rs     # 双通道日志（终端分级 / 文件恒 debug 全量）
+├── ffmpeg.rs      # 解码子进程（stderr 排空、Drop 杀进程防僵尸）
+├── vad.rs         # silero v4 纯 Rust + 流式段切分状态机（SegTracker）
+├── asr.rs         # 流式管线：生产者/消费者 + 滞回缓冲 + 丢弃规则
+├── gguf_asr.rs    # llama.cpp/mtmd 推理（采样链、原生日志桥接、自检）
+├── srt.rs         # SRT 写出 + 折行/长 cue 拆分排版
+├── runtime.rs     # 设备偏好、控制台 UTF-8、退出暂停、DLL 搜索路径
+└── assets/        # silero v4 权重（include_bytes! 内嵌）
+scripts/           # e2e 断言：字幕质量 / 终端清洁度；媒体拉取
+finetune/          # S2TT 模型产线：数据→LoRA→评测→GGUF（全 CI 可复现）
+.github/workflows/ # ci.yml（4 腿矩阵+e2e+release）、finetune.yml、cuda-probe.yml
+```
+
+### CI（.github/workflows/ci.yml）
+
+* **push/PR**：4 腿矩阵构建（windows-x64 Vulkan / linux-x64 Vulkan / linux-arm64 /
+  macos-arm64 Metal，mac 腿硬断言 MTL 设备）+ 36 单测 + 冒烟（版本/帮助/flag/
+  隐藏 alias/依赖闭包：PE 导入表、ldd、otool）+ 可运行腿的真实模型自检；
+* **e2e**（windows，用发行版 exe，runner 无 GPU → 每轮实测「loader 在、0 设备 →
+  CPU 回退」降级路径）：T1 三真实日语视频默认参数全流程（中文直出/密度/排版/
+  **终端清洁度**/单 srt 输出断言）、T1b `--context ""` 转写对照、T1c
+  `--verbose --filter-fragments --raw-srt --buffer-mb 20` 开关对照、T3 迁移目录
+  （拖拽场景）回归；
+* **release**（手动 dispatch 勾选）：全部门禁过后发布 4 平台二进制 + 2 模型 +
+  SHA256SUMS；模型 GGUF 由 `finetune.yml`（mode=gguf-e2）产线构建并存跨 OS 缓存。
+
+### 模型产线
+
+微调 → 评测 → GGUF 化全链路在 `finetune/`（CPU 可起步，无需密钥）：
+`prepare_data.py` → `sft_lora.py` → `eval_s2tt.py` → `merge_lora_hf.py` →
+llama.cpp 官方转换器 → Q4_K_M + mmproj。细节见 `finetune/README.md` 与
+`finetune/INTEGRATION.md`。
 
 ## 📄 License
 
-Unlicense（本仓库代码）；模型权重与数据集遵循各自许可（Qwen3-ASR: Apache-2.0 系、
-FLEURS: CC-BY-4.0、silero-vad: MIT）。
+Unlicense（本仓库代码）。模型权重与数据集遵循各自许可：Qwen3-ASR（Apache-2.0 系）、
+FLEURS（CC-BY-4.0）、silero-vad（MIT）。
