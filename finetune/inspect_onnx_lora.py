@@ -122,6 +122,26 @@ def scan_quant_entries(model, fname: str) -> list[dict]:
     return list(entries.values()), flags
 
 
+def collect_matchable(model, fname: str, min_elems: int = 1024):
+    """全部「可与 HF 对值的权重」条目 = 量化权重（三种消费形态）+ fp32 大二维权重。
+
+    fp32 分支兼容「Q/K/V/O 保 FP32」的混合摆位导出（社区 1.7B 包的规则）。
+    """
+    ents, flags = scan_quant_entries(model, fname)
+    inits_meta = {t.name: (list(t.dims), t.data_type) for t in model.graph.initializer}
+    quant_names = {e["w"] for e in ents}
+    for name, (dims, dt) in inits_meta.items():
+        if (dt == 1 and len(dims) == 2 and dims[0] * dims[1] >= min_elems
+                and name not in quant_names
+                and not re.search(r"(_scale|_zero_point|_zp)$", name)):
+            ents.append({"w": name, "file": fname, "node_idx": None,
+                         "op": "fp32-initializer", "scale": None})
+    for e in ents:
+        e["shape"] = inits_meta[e["w"]][0]
+        e["dtype"] = inits_meta[e["w"]][1]
+    return ents, flags
+
+
 # ------------------------------------------------------------------ HF 基座
 
 def hf_open(hf_model: str):
@@ -288,30 +308,18 @@ def main() -> int:
     all_entries, scan_flags, file_info = [], [], {}
     for f in files:
         m = onnx.load(str(f))
-        inits_meta = {t.name: (list(t.dims), t.data_type) for t in m.graph.initializer}
-        ents, fl = scan_quant_entries(m, f.name)
-        # 无量化包装的 fp32 大二维权重也纳入匹配（混合摆位导出时 Q/K/V/O 可能是 fp32）
-        quant_names = {e["w"] for e in ents}
-        for name, (dims, dt) in inits_meta.items():
-            if (dt == 1 and len(dims) == 2 and dims[0] * dims[1] >= args.min_elems
-                    and name not in quant_names
-                    and not re.search(r"(_scale|_zero_point|_zp)$", name)):
-                ents.append({"w": name, "file": f.name, "node_idx": None,
-                             "op": "fp32-initializer", "scale": None})
+        ents, fl = collect_matchable(m, f.name, args.min_elems)
         pats = defaultdict(int)
-        for name in inits_meta:
-            pats[norm_pattern(name)] += 1
+        for t_ in m.graph.initializer:
+            pats[norm_pattern(t_.name)] += 1
         file_info[f.name] = {
             "size_mb": round(f.stat().st_size / 1e6, 1),
-            "initializers": len(inits_meta), "nodes": len(m.graph.node),
+            "initializers": len(m.graph.initializer), "nodes": len(m.graph.node),
             "quant_entries": len(ents),
             "top_patterns": dict(sorted(pats.items(), key=lambda kv: -kv[1])[:12]),
         }
-        log(f"  {f.name}: {f.stat().st_size/1e6:.1f}MB  initializer {len(inits_meta)}  "
+        log(f"  {f.name}: {f.stat().st_size/1e6:.1f}MB  initializer {len(m.graph.initializer)}  "
             f"节点 {len(m.graph.node)}  可匹配权重 {len(ents)}")
-        for e in ents:
-            e["shape"] = inits_meta[e["w"]][0]
-            e["dtype"] = inits_meta[e["w"]][1]
         all_entries.extend(ents)
         scan_flags.extend(fl)
         del m

@@ -49,13 +49,20 @@ on:
         description: "只处理视频前 N 秒（0 = 全部；CPU 上 3 分钟视频双模式约 20~30 分钟）"
         type: string
         default: "0"
+      model:
+        description: "基座模型（须与适配器训练基座一致）"
+        type: choice
+        default: "Qwen/Qwen3-ASR-0.6B"
+        options: [Qwen/Qwen3-ASR-0.6B, Qwen/Qwen3-ASR-1.7B]
 
 permissions:
   contents: read
   actions: read   # 跨 run 下载适配器与 master e2e 产物需要
 
 concurrency:
-  group: s2tt-e2e-${{ github.ref }}
+  # 分组带上 bvid/adapter/model：不同视频/模型的实验可以并行，互不取消
+  # （实测教训：两个 dispatch 同组，后一个把前一个秒杀了）
+  group: s2tt-e2e-${{ github.ref }}-${{ inputs.bvid || 'default' }}-${{ inputs.adapter_run || 'default' }}-${{ inputs.model || 'default' }}
   cancel-in-progress: true
 
 env:
@@ -67,6 +74,8 @@ env:
   ADAPTER_RUN: ${{ inputs.adapter_run || '36238661344' }}
   MODES: ${{ inputs.modes || 'both' }}
   MAX_SECS: ${{ inputs.max_seconds || '0' }}
+  MODEL: ${{ inputs.model || 'Qwen/Qwen3-ASR-0.6B' }}
+  MODEL_TAG: ${{ inputs.model == 'Qwen/Qwen3-ASR-1.7B' && '1.7B' || '0.6B' }}
 
 jobs:
   e2e:
@@ -96,11 +105,11 @@ jobs:
 
       # HF 模型缓存：finetune.yml 的缓存建在 ubuntu（跨 OS 不可还原），
       # 这里用 windows 专属 key；首次 miss 会下载 ~1.8GB，之后命中。
-      - name: Cache HuggingFace 模型（windows 专属 key）
+      - name: Cache HuggingFace 模型（windows key 按基座区分；1.7B 首次 miss 下载 ~3.4GB）
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-qwen3-asr-0.6B-win-v1
+          key: hf-qwen3-asr-${{ env.MODEL_TAG }}-win-v1
 
       - name: 安装依赖（CPU torch + qwen-asr + peft + silero-vad）
         run: |
@@ -190,7 +199,8 @@ jobs:
         run: |
           set -o pipefail
           python finetune/s2tt_pipeline.py --media "$MEDIA" \
-            --adapter art/out/real/lora --context "translate to Chinese" \
+            --model "$MODEL" --adapter art/out/real/lora \
+            --context "translate to Chinese" \
             --max-seconds "$MAX_SECS" \
             --out media/out/translate.srt --stats media/out/translate.stats.json \
             2>&1 | tee media/out/translate.log
@@ -201,7 +211,7 @@ jobs:
         run: |
           set -o pipefail
           python finetune/s2tt_pipeline.py --media "$MEDIA" \
-            --adapter art/out/real/lora --context "" \
+            --model "$MODEL" --adapter art/out/real/lora --context "" \
             --max-seconds "$MAX_SECS" \
             --out media/out/transcribe.srt --stats media/out/transcribe.stats.json \
             2>&1 | tee media/out/transcribe.log
@@ -219,7 +229,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: s2tt-e2e-results
+          name: s2tt-e2e-results-${{ env.MODEL_TAG }}
           path: |
             media/out/*.srt
             media/out/*.json
