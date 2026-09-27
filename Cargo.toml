@@ -1,9 +1,15 @@
 [package]
 name = "subtitle-assistant"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 description = "本地离线字幕助手（S2TT 微调 Qwen3-ASR 单模型直出 · llama.cpp/GGUF 静态单文件 · 流式 VAD→ASR · 纯 Rust silero VAD · 字幕排版）"
 license = "Unlicense"
+
+# 发行产物名（v0.6 起）：Qwen3-subtitle-assistant(.exe)。
+# package 名保持 subtitle-assistant（crate/日志 target 不变，避免无谓 churn）。
+[[bin]]
+name = "Qwen3-subtitle-assistant"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

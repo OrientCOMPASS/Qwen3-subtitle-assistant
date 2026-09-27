@@ -107,28 +107,28 @@ jobs:
           # Vulkan 版，这类环境属于开发者自建场景。
           - name: windows-x64
             os: windows-latest
-            bin: subtitle-assistant-windows-x64.exe
+            bin: Qwen3-subtitle-assistant-windows-x64.exe
             exe_suffix: ".exe"
             features: "--features vulkan"
             selftest: false
             vulkan: true
           - name: linux-x64
             os: ubuntu-24.04
-            bin: subtitle-assistant-linux-x64
+            bin: Qwen3-subtitle-assistant-linux-x64
             exe_suffix: ""
             features: "--features vulkan,static-libs"
             selftest: true
             vulkan: true
           - name: linux-arm64
             os: ubuntu-24.04-arm
-            bin: subtitle-assistant-linux-arm64
+            bin: Qwen3-subtitle-assistant-linux-arm64
             exe_suffix: ""
             features: "--features static-libs"
             selftest: true
             vulkan: false
           - name: macos-arm64
             os: macos-14
-            bin: subtitle-assistant-macos-arm64
+            bin: Qwen3-subtitle-assistant-macos-arm64
             exe_suffix: ""
             features: ""
             selftest: true
@@ -308,7 +308,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          BIN="target/release/Qwen3-subtitle-assistant${{ matrix.exe_suffix }}"
           "$BIN" --version
           "$BIN" --help | head -12
           # v0.5 新增行为开关必须出现在 CLI 面上
@@ -326,7 +326,7 @@ jobs:
           $env:QSA_VULKAN = "${{ matrix.vulkan }}"
           python -c @"
           import os, pefile, sys
-          pe = pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True)
+          pe = pefile.PE(r'target/release/Qwen3-subtitle-assistant.exe', fast_load=True)
           pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
           imports = sorted(e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT)
           print('imports:', imports)
@@ -372,9 +372,9 @@ jobs:
             }
           }
           if (-not $skip) {
-            & ./target/release/subtitle-assistant.exe --version
+            & ./target/release/Qwen3-subtitle-assistant.exe --version
             if ($LASTEXITCODE -ne 0) { throw "vulkan 版 --version 退出码 $LASTEXITCODE" }
-            $help = & ./target/release/subtitle-assistant.exe --help 2>&1
+            $help = & ./target/release/Qwen3-subtitle-assistant.exe --help 2>&1
             if ($LASTEXITCODE -ne 0) { throw "vulkan 版 --help 退出码 $LASTEXITCODE" }
             foreach ($f in @("--raw-srt", "--verbose", "--filter-fragments")) {
               if (-not ($help -match [regex]::Escape($f))) { throw "vulkan 版 --help 缺少 $f" }
@@ -387,7 +387,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          BIN="target/release/Qwen3-subtitle-assistant${{ matrix.exe_suffix }}"
           ldd "$BIN" | tee /tmp/ldd.txt
           if grep -E 'libstdc\+\+|libgomp|llama|ggml|mtmd' /tmp/ldd.txt; then
             echo "!! 单文件形态被破坏：存在 C++/OpenMP/llama 动态依赖"; exit 1
@@ -403,7 +403,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          BIN="target/release/Qwen3-subtitle-assistant${{ matrix.exe_suffix }}"
           otool -L "$BIN" | tee /tmp/otool.txt
           # 只允许 /usr/lib、/System 前缀（含 Metal/Foundation 等系统框架）
           if tail -n +2 /tmp/otool.txt | awk '{print $1}' | grep -v -E '^/usr/lib|^/System' ; then
@@ -428,7 +428,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          BIN="target/release/Qwen3-subtitle-assistant${{ matrix.exe_suffix }}"
           # 自检结果走 stdout（println），设备选择等 info 走 stderr——合并捕获
           "$BIN" --gguf-selftest s2tt-Q4_K_M.gguf mmproj-s2tt-q8.gguf 2>&1 | tee selftest.out
           grep -q "自检通过" selftest.out
@@ -447,7 +447,7 @@ jobs:
         run: |
           set -e
           mkdir -p dist-bin
-          cp "target/release/subtitle-assistant${{ matrix.exe_suffix }}" "dist-bin/${{ matrix.bin }}"
+          cp "target/release/Qwen3-subtitle-assistant${{ matrix.exe_suffix }}" "dist-bin/${{ matrix.bin }}"
           chmod +x "dist-bin/${{ matrix.bin }}" || true
           ls -lh dist-bin/
 
@@ -477,12 +477,12 @@ jobs:
       # 注：e2e 用的就是发行的 windows-x64（Vulkan 内嵌）二进制。runner 镜像带
       # vulkan-1.dll（System32，实测确认）但无 GPU ICD——正好每轮 e2e 都在验证
       # 「loader 在、0 设备 → 回退 CPU」这条发行版降级路径上跑全量真实转录。
-      - name: 布阵 exe（后续步骤沿用 target/release/subtitle-assistant.exe 路径）
+      - name: 布阵 exe（后续步骤沿用 target/release/Qwen3-subtitle-assistant.exe 路径）
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path target/release | Out-Null
-          Copy-Item dist-bin/subtitle-assistant-windows-x64.exe target/release/subtitle-assistant.exe -Force
-          & ./target/release/subtitle-assistant.exe --version
+          Copy-Item dist-bin/Qwen3-subtitle-assistant-windows-x64.exe target/release/Qwen3-subtitle-assistant.exe -Force
+          & ./target/release/Qwen3-subtitle-assistant.exe --version
 
       - name: Console UTF-8
         shell: pwsh
@@ -521,17 +521,19 @@ jobs:
           key: qwen3-s2tt-gguf-1.7B-v1
           enableCrossOsArchive: true
 
-      - name: 布阵模型目录（models/qwen3-asr-s2tt/{model,mmproj}.gguf）
+      - name: 布阵模型目录（v0.6 拍平布局 models/{model,mmproj}.gguf）
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           if (-not (Test-Path s2tt-Q4_K_M.gguf)) {
             throw "s2tt GGUF 缓存缺失——请先手动触发 finetune.yml (mode=gguf-e2, model=1.7B) 构建并保存缓存"
           }
-          New-Item -ItemType Directory -Force -Path models/qwen3-asr-s2tt | Out-Null
-          Copy-Item s2tt-Q4_K_M.gguf models/qwen3-asr-s2tt/model.gguf -Force
-          Copy-Item mmproj-s2tt-q8.gguf models/qwen3-asr-s2tt/mmproj.gguf -Force
-          Get-ChildItem models/qwen3-asr-s2tt | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+          # 拍平布局：models/ 直接放两个 GGUF。T1 系列不再传 --asr-model-dir，
+          # 用默认发现序实测新布局（旧 qwen3-asr-s2tt 布局兼容由 config.rs 单测覆盖）
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          Copy-Item s2tt-Q4_K_M.gguf models/model.gguf -Force
+          Copy-Item mmproj-s2tt-q8.gguf models/mmproj.gguf -Force
+          Get-ChildItem models | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
 
       # ---------------- 测试媒体（bilibili 日语视频，缓存） ----------------
       - name: Restore e2e media
@@ -619,16 +621,16 @@ jobs:
           $repo = $PWD.Path
           $pkg = Join-Path $env:TEMP "qsa-pkg"
           Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path "$pkg\models\qwen3-asr-s2tt" | Out-Null
-          Copy-Item target/release/subtitle-assistant.exe $pkg/
-          Copy-Item models/qwen3-asr-s2tt/*.gguf "$pkg\models\qwen3-asr-s2tt\"
-          Write-Host "从 CWD=$env:TEMP 启动 $pkg\subtitle-assistant.exe --gguf-selftest"
+          New-Item -ItemType Directory -Force -Path "$pkg\models" | Out-Null
+          Copy-Item target/release/Qwen3-subtitle-assistant.exe $pkg/
+          Copy-Item models/*.gguf "$pkg\models\"
+          Write-Host "从 CWD=$env:TEMP 启动 $pkg\Qwen3-subtitle-assistant.exe --gguf-selftest"
           Push-Location $env:TEMP
           try {
             # 自检结果打印在 stdout（println，不受日志级别影响）——合并捕获再断言
-            & (Join-Path $pkg "subtitle-assistant.exe") --gguf-selftest `
-                "$pkg\models\qwen3-asr-s2tt\model.gguf" `
-                "$pkg\models\qwen3-asr-s2tt\mmproj.gguf" `
+            & (Join-Path $pkg "Qwen3-subtitle-assistant.exe") --gguf-selftest `
+                "$pkg\models\model.gguf" `
+                "$pkg\models\mmproj.gguf" `
                 --log-file "$env:TEMP\qsa-t3.log" *> "$env:TEMP\qsa-t3.out"
             $code = $LASTEXITCODE
           } finally { Pop-Location }
@@ -658,8 +660,7 @@ jobs:
           $files = $env:MEDIA_LIST -split ';'
           Write-Host "=== 待处理 $($files.Count) 个视频（单模型直出，流式 VAD→ASR） ==="
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          & ./target/release/subtitle-assistant.exe --no-pause `
-              --asr-model-dir models/qwen3-asr-s2tt `
+          & ./target/release/Qwen3-subtitle-assistant.exe --no-pause `
               --log-file media/t1.log @files *> media/t1_console.txt
           $code = $LASTEXITCODE
           $sw.Stop()
@@ -690,9 +691,8 @@ jobs:
         run: |
           if ($env:T1_SKIPPED) { exit 0 }
           $one = ($env:MEDIA_LIST -split ';')[0]
-          & ./target/release/subtitle-assistant.exe --no-pause --context "" `
-              --asr-model-dir models/qwen3-asr-s2tt --output-dir media/t1b `
-              --log-file media/t1b.log $one
+          & ./target/release/Qwen3-subtitle-assistant.exe --no-pause --context "" `
+              --output-dir media/t1b --log-file media/t1b.log $one
           if ($LASTEXITCODE -ne 0) { throw "T1b 退出码非 0" }
           python scripts/check_s2tt_e2e.py transcribe media/t1b
           if ($LASTEXITCODE -ne 0) { throw "T1b 断言失败：不带 context 不再是日语（任务开关失效）" }
@@ -706,10 +706,9 @@ jobs:
         run: |
           if ($env:T1_SKIPPED) { exit 0 }
           $one = ($env:MEDIA_LIST -split ';')[0]
-          & ./target/release/subtitle-assistant.exe --no-pause `
+          & ./target/release/Qwen3-subtitle-assistant.exe --no-pause `
               --verbose --filter-fragments --raw-srt `
-              --asr-model-dir models/qwen3-asr-s2tt --output-dir media/t1c `
-              --log-file media/t1c.log $one *> media/t1c_console.txt
+              --output-dir media/t1c --log-file media/t1c.log $one *> media/t1c_console.txt
           if ($LASTEXITCODE -ne 0) { throw "T1c 退出码非 0" }
           Get-Content media/t1c_console.txt | Select-Object -First 30
           python scripts/check_console_clean.py media/t1c_console.txt media/t1c.log --verbose-run
@@ -786,17 +785,15 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
           mkdir -p dist
           ls -lh bins/
-          # 4 平台二进制：统一命名 subtitle-assistant-<ver>-<platform>
-          declare -A MAP=(
-            [subtitle-assistant-windows-x64.exe]="subtitle-assistant-$VER-windows-x64.exe"
-            [subtitle-assistant-linux-x64]="subtitle-assistant-$VER-linux-x64"
-            [subtitle-assistant-linux-arm64]="subtitle-assistant-$VER-linux-arm64"
-            [subtitle-assistant-macos-arm64]="subtitle-assistant-$VER-macos-arm64"
-          )
-          for src in "${!MAP[@]}"; do
-            [ -f "bins/$src" ] || { echo "缺少平台产物: $src"; exit 1; }
-            cp "bins/$src" "dist/${MAP[$src]}"
-            chmod +x "dist/${MAP[$src]}" || true
+          # 4 平台二进制：build 腿已按 Qwen3-subtitle-assistant-<platform> 命名，
+          # 版本由 Release tag 承载，文件名不再重复带版本号（v0.6 起，维护者定名）
+          for f in Qwen3-subtitle-assistant-windows-x64.exe \
+                   Qwen3-subtitle-assistant-linux-x64 \
+                   Qwen3-subtitle-assistant-linux-arm64 \
+                   Qwen3-subtitle-assistant-macos-arm64; do
+            [ -f "bins/$f" ] || { echo "缺少平台产物: $f"; exit 1; }
+            cp "bins/$f" "dist/$f"
+            chmod +x "dist/$f" || true
           done
           # 模型资产（缓存 miss 则中止——没有模型的 Release 对用户无意义）
           [ "${{ steps.gguf-rel.outputs.cache-hit }}" = "true" ] || {
@@ -820,10 +817,10 @@ jobs:
 
           \`\`\`
           任意目录/
-          ├── subtitle-assistant-<平台>        # 本 Release 的单文件二进制（无 DLL/so 伴生）
-          └── models/qwen3-asr-s2tt/
-              ├── s2tt-Q4_K_M.gguf           # LM（下载后放这里，文件名保持不变即可被自动识别）
-              └── mmproj-s2tt-q8.gguf        # 音频编码器（mmproj 前缀自动识别）
+          ├── Qwen3-subtitle-assistant-<平台>  # 本 Release 的单文件二进制（无 DLL/so 伴生）
+          └── models/                          # 差一级 models/（也支持与 exe 同级摆放）
+              ├── s2tt-Q4_K_M.gguf             # LM（文件名任意，非 mmproj 前缀 .gguf 自动识别）
+              └── mmproj-s2tt-q8.gguf          # 音频编码器（mmproj 前缀自动识别）
           \`\`\`
 
           | 平台 | 资产 | 推理设备 |
@@ -835,10 +832,10 @@ jobs:
 
           注：Windows/Linux-x64 版内嵌 Vulkan 后端，**启动依赖系统 Vulkan loader**（vulkan-1.dll / libvulkan.so.1，GPU 驱动/桌面发行版必有）；完全无驱动的 VM/容器环境请自行源码构建纯 CPU 版（\`cargo build --release\`，不加 vulkan 特性）。
 
-          用法：把视频/音频拖到可执行文件上，或 \`subtitle-assistant 视频.mp4\`；
+          用法：把视频/音频拖到可执行文件上，或 \`Qwen3-subtitle-assistant-<平台> 视频.mp4\`；
           同目录得到排版好的 \`视频.srt\`（默认直出中文；\`--context ""\` 转写源语言）。
 
-          ### v0.5.x 相对 v0.4 的行为变化
+          ### v0.5.x / v0.6 相对 v0.4 的行为变化
           * **单一可执行文件**：llama.cpp/mtmd 静态链接进二进制。Windows/Linux-x64
             内嵌 **Vulkan**（自动发现 N卡/A卡/Intel 核显，无 GPU 设备自动回退 CPU；
             启动依赖系统 Vulkan loader——GPU 驱动/桌面发行版必有）；macOS 内嵌
@@ -852,6 +849,13 @@ jobs:
           * **单输出文件**：默认只产出 \`.srt\`；排版前对照 \`.raw.srt\` 需 \`--raw-srt\`。
           * **碎片过滤默认关闭**：lang=None 短碎片的启发式丢弃需显式 \`--filter-fragments\`
             （空文本段始终跳过——无内容可写）。
+          * **v0.6 新增**：① 默认温度采样（temp=0.7/top_p=0.8/top_k=20，基座 Qwen3-1.7B
+            官方推荐值；\`--greedy\` 回到旧贪心），缓解贪心复读/幻觉循环；
+            ② 丢弃规则升级：判重先去标点；「上一条与本次都是纯语气词（哎/啊/嗯/哼…）」
+            的连续语气词段丢弃；③ 模型目录拍平：exe 同级或差一级 models/ 均可，
+            不再需要 qwen3-asr-s2tt 目录（旧布局仍兼容）；④ 产物更名
+            Qwen3-subtitle-assistant；⑤ VAD→ASR 队列改滞回流控（满 8 段暂停生产、
+            消费到 4 段恢复）。
           NOTES
           # 去缩进（heredoc 里的前导空格）
           sed -i 's/^          //' RELEASE_BODY.md

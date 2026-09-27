@@ -17,10 +17,12 @@ pub struct Args {
     pub files: Vec<PathBuf>,
 
     // ---------------- 模型 ----------------
-    /// S2TT 模型目录（内含 LM GGUF 与 mmproj GGUF；默认名下 model.gguf/mmproj.gguf，
-    /// 也自动识别 *.gguf 与 mmproj*.gguf）。相对路径找不到时回退 exe 同目录。
-    #[arg(long, default_value = "./models/qwen3-asr-s2tt")]
-    pub asr_model_dir: PathBuf,
+    /// S2TT 模型目录（内含 LM GGUF 与 mmproj GGUF）。不指定时按序自动探测：
+    /// exe目录/models → exe目录 → ./models → ./models/qwen3-asr-s2tt（旧版布局）
+    /// → exe目录/models/qwen3-asr-s2tt（旧版布局）。目录内识别规则：
+    /// mmproj 前缀的 .gguf = 音频编码器，其余 .gguf = LM。
+    #[arg(long, value_name = "DIR")]
+    pub asr_model_dir: Option<PathBuf>,
 
     /// 显式指定 LM GGUF 文件（覆盖目录探测）
     #[arg(long, value_name = "GGUF")]
@@ -55,6 +57,29 @@ pub struct Args {
     /// 单段最多生成 token 数
     #[arg(long, default_value_t = 256)]
     pub asr_max_new_tokens: i32,
+
+    // ---------------- 采样（v0.6 起默认温度采样，替代旧的恒 greedy） ----------------
+    /// 采样温度（基座 Qwen3-1.7B 官方非思考模式推荐 0.7）。`--greedy` 时忽略。
+    #[arg(long, default_value_t = 0.7)]
+    pub temperature: f32,
+
+    /// top-p 核采样（Qwen3 官方推荐 0.8；≥1 视为关闭）。`--greedy` 时忽略。
+    #[arg(long, default_value_t = 0.8)]
+    pub top_p: f32,
+
+    /// top-k 采样（Qwen3 官方推荐 20；≤0 视为关闭）。`--greedy` 时忽略。
+    #[arg(long, default_value_t = 20)]
+    pub top_k: i32,
+
+    /// 采样随机种子。默认固定值保证同输入同输出（CI/复现友好）；
+    /// 传 0 则每次运行随机取种。`--greedy` 时忽略。
+    #[arg(long, default_value_t = 42)]
+    pub seed: u32,
+
+    /// 强制贪心解码（v0.5 及以前的固定行为）：输出完全确定，但更易陷入
+    /// 重复/幻觉循环；默认关闭（走上方温度采样参数）。
+    #[arg(long)]
+    pub greedy: bool,
 
     // ---------------- VAD（内嵌 silero v4，纯 Rust） ----------------
     /// VAD 语音概率阈值

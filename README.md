@@ -1,4 +1,4 @@
-# Qwen3 Subtitle Assistant（单文件直出版）
+# Qwen3 Subtitle Assistant（单文件直出版，产物名 `Qwen3-subtitle-assistant`）
 
 **完全本地离线**的视频/音频字幕工具：媒体文件拖上去，排版好的**中文字幕 SRT** 出来。
 
@@ -6,6 +6,20 @@
 GGUF Q4_K_M）在 llama.cpp 运行时上直出目标语言字幕——**没有 LLM 后处理段**，
 VAD 是内嵌权重的纯 Rust silero v4，**无任何 ONNX Runtime 依赖**。
 
+> **v0.6 相对 v0.5 的变化**
+> 1. **默认温度采样**：ASR 解码从恒贪心改为基座 Qwen3-1.7B 官方推荐参数
+>    （temperature=0.7 / top_p=0.8 / top_k=20，固定种子可复现）；`--greedy`
+>    回到旧贪心行为。贪心在长静音/重复背景音处更易复读与幻觉，采样可打散循环。
+> 2. **丢弃规则升级**：判重**先去标点**（"你好。"="你好，"）；新增「上一条与
+>    本次都是纯语气词（哎/啊/嗯/哼…闭集）」的连续语气词丢弃——首条语气词保留，
+>    不误伤真实应答。
+> 3. **模型目录拍平**：exe 同级或差一级 `models/` 直接放两个 GGUF 即可，
+>    不再需要 `qwen3-asr-s2tt` 目录（旧布局仍兼容探测）；探测序见 `--asr-model-dir` 帮助。
+> 4. **产物更名** `Qwen3-subtitle-assistant-<平台>`；Release 文件名不再带版本号
+>    （版本由 tag 承载）。
+> 5. **VAD→ASR 队列改滞回流控**：满 8 段暂停 VAD 生产、消费到半容量（4 段）恢复，
+>    减少阻塞/唤醒抖动（两线程本就并行，此为流控策略细化）。
+>
 > **v0.5 相对 v0.4 的变化**
 > 1. **单一可执行文件发行**：llama.cpp（含 mtmd）从源码**静态链接**进可执行文件，
 >    发布物是各平台的裸二进制，**没有任何伴生 DLL/so/dylib**；不再打 1.5GiB 大
@@ -64,14 +78,16 @@ VAD 是内嵌权重的纯 Rust silero v4，**无任何 ONNX Runtime 依赖**。
    * 你平台的单文件二进制：`subtitle-assistant-<ver>-<平台>`（8~50MB）；
    * 模型：`s2tt-Q4_K_M.gguf`（LM，≈1.0GiB）+ `mmproj-s2tt-q8.gguf`（音频编码器，≈0.3GiB）；
 2. 按下面结构摆放（模型文件名保持下载原样即可被自动识别：`mmproj` 前缀=编码器，
-   其余 `.gguf`=LM）：
+   其余 `.gguf`=LM；两种摆法都支持）：
    ```
    任意目录/
-   ├── subtitle-assistant.exe          # 或 subtitle-assistant-linux-x64 等
-   └── models/qwen3-asr-s2tt/
+   ├── Qwen3-subtitle-assistant-windows-x64.exe   # 或对应平台产物
+   └── models/                                    # 差一级 models/（推荐）
        ├── s2tt-Q4_K_M.gguf
        └── mmproj-s2tt-q8.gguf
    ```
+   或直接把两个 GGUF 与 exe 放同一目录（同级摆放）。旧的
+   `models/qwen3-asr-s2tt/` 布局也仍被探测（v0.5 用户无需挪文件）。
 3. 确保系统 PATH 里有 **ffmpeg / ffprobe**（音视频解码，各平台包管理器均有）；
 4. 把视频/音频拖到可执行文件上（或命令行传入，支持多文件批处理）；
 5. 同目录得到 `<视频名>.srt`，终端逐条打印识别出的字幕内容。
@@ -94,7 +110,7 @@ Linux ldd 含 libvulkan、mac 自检选定 MTL 设备并全量入显存），不
 `cargo build --release --features static-libs`（Linux，不加 vulkan 特性）即得纯
 CPU 单文件。
 
-环境自检：`subtitle-assistant --gguf-selftest models\qwen3-asr-s2tt\s2tt-Q4_K_M.gguf models\qwen3-asr-s2tt\mmproj-s2tt-q8.gguf`
+环境自检：`Qwen3-subtitle-assistant-windows-x64.exe --gguf-selftest models\s2tt-Q4_K_M.gguf models\mmproj-s2tt-q8.gguf`
 （打印后端设备、加载耗时、进程内存；GPU 下内存应远小于模型体积=权重已入显存）。
 
 ## 🛠 常用参数
@@ -102,8 +118,11 @@ CPU 单文件。
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--context` | `translate to Chinese` | 任务开关；空串=转写源语言 |
-| `--asr-model-dir` | `./models/qwen3-asr-s2tt` | 模型目录（找不到时回退 exe 同目录） |
+| `--asr-model-dir` | 自动探测 | 模型目录；不传时按序探测 exe目录/models → exe目录 → ./models → 旧版 qwen3-asr-s2tt 布局 |
 | `--model` / `--mmproj` | 自动探测 | 显式指定 LM / 音频编码器 GGUF |
+| `--temperature` / `--top-p` / `--top-k` | 0.7 / 0.8 / 20 | 采样参数（基座 Qwen3-1.7B 官方非思考模式推荐值） |
+| `--seed` | 42（固定可复现） | 采样种子；传 0 = 每次运行随机 |
+| `--greedy` | 关 | 强制贪心解码（v0.5 及以前的固定行为） |
 | `--verbose` / `-v` | 关 | 终端输出全部诊断明细（等价 `RUST_LOG=debug`） |
 | `--log-file PATH` | 无 | 日志落盘，**文件内恒为全量诊断**（终端不受影响） |
 | `--raw-srt` | 关 | 另存排版前 `<名>.raw.srt`（默认只出一个 `.srt`） |
@@ -138,8 +157,10 @@ Q4_K_M + mmproj（`finetune.yml` mode=gguf-e2，产物存跨 OS 缓存供产品 
 ## 🧯 开发
 
 ```
-cargo build --release        # 静态单文件（默认）：只需 CMake + LLVM(libclang)，无 CUDA/Vulkan SDK
-cargo test --release         # VAD 黄金向量 / 流式段状态机↔批量参照等价性 / 排版 / SRT / 输出解析
+cargo build --release        # 静态单文件（默认，产物 target/release/Qwen3-subtitle-assistant）：
+                             # 只需 CMake + LLVM(libclang)，无 CUDA/Vulkan SDK
+cargo test --release         # VAD 黄金向量 / 流式段状态机↔批量参照等价性 / 滞回队列 /
+                             # 判重与语气词规则 / 模型目录拍平发现 / 排版 / SRT / 输出解析
 ```
 
 * **静态单文件形态（发布默认）**：llama.cpp/mtmd 静态编入；Linux 加

@@ -161,6 +161,28 @@ fn pick_device(want_cuda: bool) -> Option<sys::ggml_backend_dev_t> {
     }
 }
 
+/// 采样配置（v0.6：默认温度采样；`--greedy` 回到确定性贪心）。
+///
+/// 默认值取基座 Qwen3-1.7B 官方非思考模式推荐（模型卡）：
+/// temperature=0.7 / top_p=0.8 / top_k=20。微调虽以 greedy(do_sample=false)
+/// 验证过确定性，但产品实测贪心在长静音/重复背景音处更易陷入复读与幻觉
+/// 循环——温度采样 + top_k/top_p 截断能显著打散这类循环（配套还有
+/// 「相邻重复句丢弃」「连续语气词丢弃」两道后处理，见 asr.rs）。
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerCfg {
+    pub greedy: bool,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+impl Default for SamplerCfg {
+    fn default() -> Self {
+        Self { greedy: false, temperature: 0.7, top_p: 0.8, top_k: 20, seed: 42 }
+    }
+}
+
 /// GGUF 版 Qwen3-ASR（S2TT）推理引擎：LM + mmproj 音频编码器 + mtmd 上下文。
 pub struct GgufAsr {
     model: *mut sys::llama_model,
@@ -169,6 +191,7 @@ pub struct GgufAsr {
     sample_rate: i32,
     n_batch: i32,
     max_new_tokens: i32,
+    sampler: SamplerCfg,
 }
 
 // llama/mtmd 句柄在单引擎内串行使用；产品批处理线程模型与 sherpa 后端一致。
@@ -180,7 +203,8 @@ impl GgufAsr {
     /// `ngl`：offload 到 GPU 的层数（999=全量，llama 按模型实际层数截断；无 GPU 时
     /// 自动留在 CPU）。权重迁移显存后 ggml 会释放主机侧副本（用户需求之一）。
     pub fn open(lm: &Path, mmproj: &Path, threads: i32, ngl: i32,
-                max_new_tokens: i32, cuda_libs: Option<&Path>, force_cpu: bool) -> Result<Self> {
+                max_new_tokens: i32, cuda_libs: Option<&Path>, force_cpu: bool,
+                sampler: SamplerCfg) -> Result<Self> {
         init_backends(cuda_libs);
 
         // 设备选择（用户要求的优先级）：
@@ -244,7 +268,7 @@ impl GgufAsr {
             let sample_rate = sys::mtmd_get_audio_sample_rate(mtmd);
 
             Ok(Self { model, ctx, mtmd, sample_rate, n_batch: cparams.n_batch as i32,
-                        max_new_tokens: max_new_tokens.max(16) })
+                        max_new_tokens: max_new_tokens.max(16), sampler })
         }
     }
 
@@ -329,11 +353,23 @@ impl GgufAsr {
                 bail!("mtmd_helper_eval_chunks 失败 (rc={rc})");
             }
 
-            // 5) greedy 采样（与产品 sherpa 后端 greedy_search、模型 generation_config
-            //    do_sample=false 语义一致；Qwen3-ASR 输出确定性强，无需温度采样）
+            // 5) 采样链（v0.6）：默认 top_k → top_p → temp → dist(固定种子，可复现)；
+            //    --greedy 时退回纯贪心（v0.5 及以前的固定行为）。
+            //    链路顺序与 llama.cpp common 采样链一致：截断在前、温度次之、分布抽样最后。
             let vocab = sys::llama_model_get_vocab(self.model);
             let smpl = sys::llama_sampler_chain_init(sys::llama_sampler_chain_default_params());
-            sys::llama_sampler_chain_add(smpl, sys::llama_sampler_init_greedy());
+            if self.sampler.greedy {
+                sys::llama_sampler_chain_add(smpl, sys::llama_sampler_init_greedy());
+            } else {
+                if self.sampler.top_k > 0 {
+                    sys::llama_sampler_chain_add(smpl, sys::llama_sampler_init_top_k(self.sampler.top_k));
+                }
+                if self.sampler.top_p < 1.0 {
+                    sys::llama_sampler_chain_add(smpl, sys::llama_sampler_init_top_p(self.sampler.top_p, 1));
+                }
+                sys::llama_sampler_chain_add(smpl, sys::llama_sampler_init_temp(self.sampler.temperature));
+                sys::llama_sampler_chain_add(smpl, sys::llama_sampler_init_dist(self.sampler.seed));
+            }
 
             let mut out = Vec::<u8>::new();
             let mut piece = vec![0i8; 1024];
@@ -424,7 +460,8 @@ mod tests {
 pub fn selftest(lm: &Path, mmproj: &Path, threads: i32, ngl: i32,
                 cuda_libs: Option<&Path>, force_cpu: bool) -> Result<String> {
     let t0 = std::time::Instant::now();
-    let asr = GgufAsr::open(lm, mmproj, threads, ngl, 128, cuda_libs, force_cpu)?;
+    let asr = GgufAsr::open(lm, mmproj, threads, ngl, 128, cuda_libs, force_cpu,
+                            SamplerCfg::default())?;
     let load = t0.elapsed().as_secs_f64();
 
     // 进程内存（Windows：GetProcessMemoryInfo；其他平台退化为不可用）

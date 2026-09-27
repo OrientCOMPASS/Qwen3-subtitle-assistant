@@ -88,9 +88,14 @@ fn run(args: cli::Args) -> Result<usize> {
     let cfg = Config::from_args(&args, &probe)?;
 
     info!(
-        "模式: S2TT 单模型直出｜context={:?}｜设备: {}｜线程: {}｜VAD: thr={} min_silence={}s｜碎片过滤: {}",
+        "模式: S2TT 单模型直出｜context={:?}｜设备: {}｜线程: {}｜VAD: thr={} min_silence={}s｜碎片过滤: {}｜采样: {}",
         cfg.context, cfg.device, cfg.threads, cfg.vad_threshold, cfg.vad_min_silence,
-        if cfg.filter_fragments { "开" } else { "关" }
+        if cfg.filter_fragments { "开" } else { "关" },
+        if cfg.greedy {
+            "greedy".to_string()
+        } else {
+            format!("temp={} top_p={} top_k={} seed={}", cfg.temperature, cfg.top_p, cfg.top_k, cfg.seed)
+        }
     );
 
     // 模型只加载一次，跨文件复用（权重入显存后主机副本即释放）
@@ -103,6 +108,13 @@ fn run(args: cli::Args) -> Result<usize> {
         cfg.max_new_tokens,
         cfg.cuda_libs.as_deref(),
         cfg.device == DevicePref::Cpu,
+        gguf_asr::SamplerCfg {
+            greedy: cfg.greedy,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+            top_k: cfg.top_k,
+            seed: cfg.seed,
+        },
     )
     .context("加载 S2TT GGUF 模型失败")?;
 
