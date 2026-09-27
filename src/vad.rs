@@ -56,7 +56,8 @@ impl SileroVad {
         let mut map = Vec::new();
         for t in layout.as_array().ok_or_else(|| anyhow::anyhow!("layout 格式错误"))? {
             let name = t["name"].as_str().unwrap_or_default().to_string();
-            let off = t["offset"].as_u64().unwrap_or(0) as usize;
+            // layout 里的 offset 单位是字节（打包脚本按 f32 平面拼接），len 是元素数
+            let off = (t["offset"].as_u64().unwrap_or(0) as usize) / 4;
             let len = t["len"].as_u64().unwrap_or(0) as usize;
             if off + len > data.len() {
                 bail!("layout 越界: {name} {off}+{len} > {}", data.len());
