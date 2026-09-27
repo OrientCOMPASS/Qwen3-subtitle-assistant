@@ -299,10 +299,10 @@ impl GgufAsr {
                 if sys::llama_vocab_is_eog(vocab, tok) {
                     break;
                 }
-                // 当前 llama.h 签名多一个 pos 参数（BPE 再分词位置），单 token 解码传 0
+                // pin 版本签名：(vocab, token, buf, length, lstrip, special)
                 let n = sys::llama_token_to_piece(
-                    vocab, piece.as_mut_ptr() as *mut c_char,
-                    piece.len() as c_int, 0, tok, true,
+                    vocab, tok, piece.as_mut_ptr() as *mut c_char,
+                    piece.len() as c_int, 0, true,
                 );
                 if n > 0 {
                     out.extend_from_slice(std::slice::from_raw_parts(
