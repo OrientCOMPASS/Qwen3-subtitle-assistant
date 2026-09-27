@@ -1,6 +1,6 @@
 [package]
 name = "subtitle-assistant"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "本地离线字幕助手（S2TT 微调 Qwen3-ASR 单模型直出 · llama.cpp/GGUF 静态单文件 · 流式 VAD→ASR · 纯 Rust silero VAD · 字幕排版）"
 license = "Unlicense"
@@ -22,9 +22,11 @@ indicatif = "0.17"
 # - 不再随包 llama.dll / ggml*.dll / ggml-vulkan.dll；
 # - CPU 后端静态编入；macOS 上 llama.cpp 默认启用 Metal 后端（框架系统自带、
 #   shader 内嵌），Apple Silicon GPU 加速开箱即用；
-# - CUDA / Vulkan 后端无法在静态单文件里动态注入（官方预编译后端 DLL 依赖
-#   共享 ggml），单文件版 Windows/Linux 为纯 CPU 推理。需要 GPU 时可自行
-#   cargo build --features dynamic-link 走动态链接形态（见 README「开发」）。
+# - Windows/Linux 各发两种单文件：**GPU 版**（`--features vulkan`，Vulkan 后端
+#   静态编入，自动发现 NVIDIA/AMD/Intel GPU；硬依赖系统 Vulkan loader——GPU
+#   驱动必带）与**兼容版**（纯 CPU，任何机器可启动）。CUDA 后端（需 Toolkit
+#   构建 + 用户 --cuda-libs 运行库目录）仅在动态链接形态下可用：
+#   `cargo build --release --features dynamic-link`（见 README「开发」）。
 #
 # 版本用 "=" 精确锁定：该 crate 内嵌 llama.cpp 源码构建，ABI 与 mtmd 头文件
 # 强绑定，升级需同步回归 e2e。
@@ -36,6 +38,12 @@ llama-cpp-sys-2 = { version = "=0.1.157", default-features = false, features = [
 
 [features]
 default = []
+# GPU 版单文件（Windows/Linux）：Vulkan 后端静态编入 exe——仍然是单一可执行
+# 文件，但**硬依赖系统的 Vulkan loader**（Windows vulkan-1.dll / Linux
+# libvulkan.so.1；凡装了 NVIDIA/AMD/Intel GPU 驱动的机器都有）。无 loader 的
+# 环境（VM/精简服务器）请改用不带本特性的兼容版（纯 CPU）。
+# ggml-vulkan 在编译期需要 Vulkan SDK/glslc（CI 腿已自动化，见 ci.yml）。
+vulkan = ["llama-cpp-sys-2/vulkan"]
 # Linux 发布构建：libstdc++ / libgomp 静态链接（配合 CI，产出真正单文件的
 # ELF，仅依赖 glibc）。对其他平台是无害 no-op（build.rs 按 target 判定）。
 static-libs = ["llama-cpp-sys-2/static-openmp", "llama-cpp-sys-2/static-stdcxx"]

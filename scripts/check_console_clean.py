@@ -2,8 +2,9 @@
 """e2e 断言：终端输出清洁度 + 日志文件全量诊断（v0.5「默认不刷屏」行为的回归闸门）。
 
 背景：v0.4 及以前，llama.cpp 原生加载日志（llama_model_loader/load_tensors/
-control token 等数百行）与逐段 [ASR✔]/[VAD✂] 明细全部直写终端，用户抱怨
-"终端特别乱"。v0.5 起：终端默认只有进度/结果级 info；诊断明细进 debug 级
+control token 等数百行）与逐段跳过/丢弃明细全部直写终端，用户抱怨
+"终端特别乱"。v0.5 起：终端默认只有进度/结果级 info（含逐条识别出的字幕
+内容 [ASR✔]——这是用户关心的产出，不算刷屏）；诊断明细进 debug 级
 （--verbose 放开到终端；--log-file 的文件通道恒 debug 全量）；llama/ggml
 原生日志经 llama_log_set/ggml_log_set 桥接进同一门面。
 
@@ -34,15 +35,17 @@ NOISE_MARKERS = (
     "decoding audio batch",
     "audio decoded",
     "ggml 后端设备",         # 应用侧后端枚举（debug 级）
-    "[ASR✔",                # 逐段转录明细（debug 级）
-    "[ASR∅",
-    "[VAD✂",
+    "[ASR∅",                # 空输出跳过明细（debug 级）
+    "[ASR↻",                # 重复丢弃明细（debug 级）
+    "[VAD✂",                # 碎片过滤明细（debug 级）
     "排版完成",              # debug 级
     "exe 目录",              # debug 级
 )
 
-# 结果级信息：默认级终端上必须出现（每个文件一组）
-RESULT_MARKERS = ("已写出字幕", "转录完成")
+# 结果级信息：默认级终端上必须出现。
+# [ASR✔ = 逐条识别出的字幕内容（v0.5.1 起回到 info 级——用户关心识别结果，
+# 这不算刷屏；被收敛的是模型加载噪声与跳过/丢弃类诊断明细）。
+RESULT_MARKERS = ("已写出字幕", "转录完成", "[ASR✔")
 
 # 日志文件（--log-file 通道恒 debug）必须含有的诊断内容
 LOGFILE_MARKERS = ("llama_model_loader", "[ASR✔", "转录完成")
@@ -73,11 +76,17 @@ def check_default_run(console_txt: str, log_txt: str) -> int:
             print(f"✘ 终端缺少结果信息 {m!r}")
             bad += 1
 
-    # 3) 终端行数上限：结果级最小集合 ≈ 每文件 3 行 + 全局 ~6 行，放宽到 5n+12
+    # 3) 终端行数上限：每条保留字幕 1 行 [ASR✔] + 每文件 ~4 行结果信息 + 全局 ~6 行。
+    #    字幕条数从「转录完成：N 段语音 → M 条字幕」解析，上限随之收紧。
+    import re
+    kept = [int(m) for m in re.findall(r"转录完成：\d+ 段语音 → (\d+) 条字幕", console_txt)]
     n_files = max(1, console_txt.count("已写出字幕"))
-    cap = 5 * n_files + 12
+    if kept:
+        cap = sum(kept) + 4 * n_files + 8
+    else:
+        cap = 30 * n_files + 12  # 解析失败时的宽松兜底
     if len(lines) <= cap:
-        print(f"✔ 终端行数 {len(lines)} <= 上限 {cap}（按 {n_files} 个文件计）")
+        print(f"✔ 终端行数 {len(lines)} <= 上限 {cap}（{n_files} 文件 / 保留字幕 {kept}）")
     else:
         print(f"✘ 终端行数 {len(lines)} 超过上限 {cap} —— 仍有刷屏")
         bad += 1

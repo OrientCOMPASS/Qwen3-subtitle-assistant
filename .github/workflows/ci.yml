@@ -5,21 +5,26 @@
 #   workflow_dispatch  -> 上述全部，外加「收集 4 平台二进制 + 模型 → GitHub Release」
 #
 # 三个 job：
-#   build    矩阵构建单一可执行文件（llama.cpp 静态编入，无任何伴生 DLL/so/dylib）：
-#            windows-x64（静态 CRT）/ linux-x64 / linux-arm64（libstdc++/libgomp 静态）
-#            / macos-arm64（Metal GPU 后端默认编入）。cargo test + 冒烟 + 依赖闭包检查；
-#            linux/mac 腿顺带跑真实模型 --gguf-selftest（GGUF 跨 OS 缓存命中时）。
+#   build    矩阵构建单一可执行文件（llama.cpp 静态编入，无任何伴生 DLL/so/dylib），
+#            6 腿：windows-x64（CPU 兼容版）/ windows-x64-vulkan（GPU 版，Vulkan
+#            静态编入）/ linux-x64 / linux-x64-vulkan / linux-arm64（libstdc++/
+#            libgomp 静态）/ macos-arm64（Metal GPU 后端默认编入）。
+#            cargo test + 冒烟 + 依赖闭包检查（PE 导入表 / ldd / otool）；
+#            可运行的腿顺带真实模型 --gguf-selftest（GGUF 跨 OS 缓存命中时）。
 #   e2e      needs build：windows 真实日语视频全流程（T1 默认参数 / T1b 任务开关 /
 #            T1c verbose+过滤+raw 对照）+ 迁移目录回归 + 终端清洁度断言。
 #   release  needs build,e2e：仅手动 dispatch 且勾选 release 时运行——
-#            发布 4 个平台单文件二进制 + S2TT GGUF 模型 + SHA256SUMS 为一个
+#            发布 6 个平台单文件二进制 + S2TT GGUF 模型 + SHA256SUMS 为一个
 #            GitHub Release（v0.5 起不再打 1.5GiB 大 zip：exe 与模型分离下载）。
 #
 # v0.5 形态说明（与 v0.4 的差异）：
 #   * 发布物 = 单一可执行文件。llama.cpp（含 mtmd）静态链接进 exe；
-#     macOS 默认带 Metal GPU 加速；Windows/Linux 单文件版为纯 CPU
-#     （CUDA/Vulkan 依赖共享 ggml 的动态注入，与静态单文件互斥——需要 GPU 的
-#     开发者自行 `cargo build --release --features dynamic-link`）。
+#     GPU 加速按平台：macOS=Metal（内嵌）；Windows/Linux=**双版本**——
+#     GPU 版静态编入 Vulkan 后端（自动发现 N卡/A卡/Intel 核显；运行硬依赖
+#     系统 Vulkan loader，GPU 驱动必带）+ 兼容版纯 CPU（任何机器可启动）。
+#     Vulkan 不能进"唯一"exe 的原因：本版 ggml-vulkan 硬链接 vulkan-1（无
+#     dlopen 机制），无 loader 的机器（VM/精简系统/CI runner）exe 直接起不来。
+#     CUDA 仍需动态链接形态（`--features dynamic-link` + 用户 --cuda-libs）。
 #   * Windows CRT：双侧动态 CRT（/MD）——exe 依赖 VC++ 2015-2022 发行版的
 #     vcruntime140/ucrtbase/vcomp140（OpenMP 运行库无静态版，静态 CRT 无收益；
 #     实测强行静态会 LNK2001）。冒烟步骤显式校验 PE 导入闭包。
@@ -99,24 +104,48 @@ jobs:
             exe_suffix: ".exe"
             features: ""
             selftest: true
+            vulkan: false
+          # GPU 版：Vulkan 后端静态编入（仍是单文件；运行硬依赖系统 vulkan-1.dll，
+          # GPU 驱动必带）。runner 无 GPU/多数无 loader：自检跳过，改做
+          # 「loader 布阵 + --version 启动冒烟 + PE 导入表含 vulkan-1」验证。
+          - name: windows-x64-vulkan
+            os: windows-latest
+            bin: subtitle-assistant-windows-x64-vulkan.exe
+            exe_suffix: ".exe"
+            features: "--features vulkan"
+            selftest: false
+            vulkan: true
           - name: linux-x64
             os: ubuntu-24.04
             bin: subtitle-assistant-linux-x64
             exe_suffix: ""
             features: "--features static-libs"
             selftest: true
+            vulkan: false
+          # GPU 版（Linux）：apt 装 libvulkan1（loader，无 ICD）后可直接跑
+          # 启动/自检冒烟——ggml 对「loader 在、0 设备」的路径优雅回退 CPU，
+          # 这正好覆盖用户机器上"驱动残缺/VM"的降级行为。
+          - name: linux-x64-vulkan
+            os: ubuntu-24.04
+            bin: subtitle-assistant-linux-x64-vulkan
+            exe_suffix: ""
+            features: "--features vulkan,static-libs"
+            selftest: true
+            vulkan: true
           - name: linux-arm64
             os: ubuntu-24.04-arm
             bin: subtitle-assistant-linux-arm64
             exe_suffix: ""
             features: "--features static-libs"
             selftest: true
+            vulkan: false
           - name: macos-arm64
             os: macos-14
             bin: subtitle-assistant-macos-arm64
             exe_suffix: ""
             features: ""
             selftest: true
+            vulkan: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
@@ -157,24 +186,50 @@ jobs:
           Write-Host "Using LIBCLANG_PATH=$found"
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$found"
 
-      - name: Prepare (Linux) — libclang + 静态 libstdc++/libgomp 可用性
+      - name: Prepare (Windows Vulkan 腿) — Vulkan SDK（编译期：头文件/vulkan-1.lib/glslc）
+        if: runner.os == 'Windows' && matrix.vulkan
+        shell: pwsh
+        run: |
+          # build.rs 的 vulkan 路径硬性要求 VULKAN_SDK（没有会 panic），
+          # llama.cpp 的 find_package(Vulkan COMPONENTS glslc) 也需要 SDK 里的 glslc。
+          choco install vulkan-sdk --no-progress -y | Out-Null
+          $sdk = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+          if (-not $sdk) {
+            $sdk = (Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending | Select-Object -First 1).FullName
+          }
+          if (-not $sdk -or -not (Test-Path (Join-Path $sdk 'Lib\vulkan-1.lib'))) {
+            throw "Vulkan SDK 安装失败（VULKAN_SDK=$sdk）"
+          }
+          Write-Host "VULKAN_SDK=$sdk"
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdk"
+          & (Join-Path $sdk 'Bin\glslc.exe') --version | Select-Object -First 1
+
+      - name: Prepare (Linux) — libclang + 静态 libstdc++/libgomp 可用性 (+ Vulkan 腿依赖)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -e
+          sudo apt-get update -qq
           if ! ldconfig -p | grep -q libclang; then
-            sudo apt-get update -qq
             sudo apt-get install -y -qq libclang-dev clang >/dev/null
           fi
           LIBCLANG=$(dirname "$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)")
           echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$LIBCLANG"
+          if [ "${{ matrix.vulkan }}" = "true" ]; then
+            # 编译期：Vulkan 头/loader 桩（libvulkan-dev）+ glslc（glslang-tools）；
+            # 运行期冒烟：libvulkan1（真 loader；runner 无 ICD，正好覆盖
+            # 「loader 在、0 设备 → 优雅回退 CPU」路径）
+            sudo apt-get install -y -qq libvulkan-dev glslang-tools libvulkan1 >/dev/null
+            glslc --version | head -1
+          fi
           # static-libs feature 需要编译器自带静态库（g++/gcc 包内）
           for a in libstdc++.a libgomp.a; do
             p=$(g++ --print-file-name=$a)
             if [ "$p" = "$a" ] || [ ! -f "$p" ]; then
               echo "!! 缺 $a，安装 g++ ..."
-              sudo apt-get update -qq && sudo apt-get install -y -qq g++ >/dev/null
+              sudo apt-get install -y -qq g++ >/dev/null
               p=$(g++ --print-file-name=$a)
             fi
             echo "$a -> $p"
@@ -202,13 +257,20 @@ jobs:
         run: cargo build --release ${{ matrix.features }}
 
       # 单元测试：VAD 黄金向量回放、流式 SegTracker↔批量参照 600 组等价性对拍、
-      # 硬拆/合并/pad 语义、ASR 输出解析、折行/长 cue 拆分、SRT、模型路径解析。
-      # 静态链接后测试二进制不再需要任何 DLL/so 布阵。
+      # 硬拆/合并/pad 语义、ASR 输出解析（含去重/碎片判定）、折行/长 cue 拆分、
+      # SRT、模型路径解析。静态链接后测试二进制不再需要任何 DLL/so 布阵。
+      # windows-vulkan 腿例外：测试二进制同样静态链接 Vulkan（导入 vulkan-1.dll），
+      # runner 无 loader 时起不来；Rust 侧代码与 windows-x64 腿完全一致（vulkan
+      # feature 只改 C 构建），测试由其余 5 腿全量覆盖，此腿跳过。
       - name: Unit tests (cargo test)
+        if: ${{ !(runner.os == 'Windows' && matrix.vulkan) }}
         shell: bash
         run: cargo test --release -- --test-threads 1
 
       - name: Smoke — version/help/新 flag 存在性
+        # windows-vulkan 腿例外：runner 通常无 vulkan-1.dll，exe 无法启动——
+        # 该腿的启动/flag 冒烟并入下方「loader 布阵」步骤（找到 loader 才跑）。
+        if: ${{ !(runner.os == 'Windows' && matrix.vulkan) }}
         shell: bash
         run: |
           set -e
@@ -227,27 +289,66 @@ jobs:
         shell: pwsh
         run: |
           pip install --quiet pefile
+          $env:QSA_VULKAN = "${{ matrix.vulkan }}"
           python -c @"
-          import pefile, sys
+          import os, pefile, sys
           pe = pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True)
           pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
           imports = sorted(e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT)
           print('imports:', imports)
-          # 允许：Windows 系统 DLL（含静态 CRT 残余的 api-ms-win-*、OpenMP 的 vcomp140）
+          # 允许：Windows 系统 DLL + VC++ 发行版组件（vcruntime/msvcp/vcomp/api-ms-*）
           SYS = ('api-ms-', 'ext-ms-', 'kernel', 'ntdll', 'bcrypt', 'ucrtbase', 'vcruntime',
                  'msvcp', 'ws2_32', 'advapi32', 'user32', 'ole32', 'shell32', 'sechost',
                  'rpcrt4', 'crypt32', 'winmm', 'version', 'shlwapi', 'userenv', 'psapi',
                  'iphlpapi', 'wldap32', 'normaliz', 'dbghelp', 'gdi32', 'msvcrt', 'vcomp',
                  'userenv', 'setupapi', 'cfgmgr32', 'winspool', 'comdlg32', 'comctl32')
-          bad = [d for d in imports if not d.lower().startswith(SYS)]
+          vk = os.environ.get('QSA_VULKAN') == 'true'
+          allowed = SYS + (('vulkan-1',) if vk else ())
+          bad = [d for d in imports if not d.lower().startswith(allowed)]
           # 明确断言：不得再依赖 llama/ggml 伴生 DLL（v0.4 形态的残留）
           llama = [d for d in imports if 'llama' in d.lower() or 'ggml' in d.lower() or 'mtmd' in d.lower()]
-          print('non-system:', bad or 'none', '| llama/ggml imports:', llama or 'none')
+          has_vk = any(d.lower().startswith('vulkan') for d in imports)
+          print('non-system:', bad or 'none', '| llama/ggml imports:', llama or 'none', '| vulkan-1:', has_vk)
+          if vk and not has_vk:
+              print('!! vulkan 腿的导入表里没有 vulkan-1.dll —— 后端没链进去'); sys.exit(1)
           sys.exit(1 if (bad or llama) else 0)
           "@
           if ($LASTEXITCODE -ne 0) { throw "PE 导入闭包检查失败（单文件形态被破坏或出现未知系统 DLL）" }
 
-      - name: Smoke (Linux) — ldd 无 libstdc++/libgomp/llama/ggml
+      # Windows Vulkan 腿：runner 通常没有 GPU 驱动（无 vulkan-1.dll），exe 会
+      # 起不来——从 SDK/系统里找到 loader 布阵到 exe 旁再跑 --version，验证
+      # 「静态 Vulkan 版可启动、无 ICD 时优雅回退」。找不到 loader 则降级跳过。
+      - name: Smoke (Windows Vulkan 腿) — loader 布阵 + 启动冒烟
+        if: runner.os == 'Windows' && matrix.vulkan
+        shell: pwsh
+        run: |
+          $skip = $false
+          $sys = "C:\Windows\System32\vulkan-1.dll"
+          if (Test-Path $sys) {
+            Write-Host "系统已有 vulkan-1.dll"
+          } else {
+            $found = Get-ChildItem "$env:VULKAN_SDK" -Recurse -Filter vulkan-1.dll -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if ($found) {
+              Copy-Item $found.FullName target/release/vulkan-1.dll
+              Write-Host "已从 SDK 布阵 loader: $($found.FullName)"
+            } else {
+              Write-Warning "runner 上找不到 vulkan-1.dll，跳过启动冒烟（PE 静态检查已通过）"
+              $skip = $true
+            }
+          }
+          if (-not $skip) {
+            & ./target/release/subtitle-assistant.exe --version
+            if ($LASTEXITCODE -ne 0) { throw "vulkan 版 --version 退出码 $LASTEXITCODE" }
+            $help = & ./target/release/subtitle-assistant.exe --help 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "vulkan 版 --help 退出码 $LASTEXITCODE" }
+            foreach ($f in @("--raw-srt", "--verbose", "--filter-fragments")) {
+              if (-not ($help -match [regex]::Escape($f))) { throw "vulkan 版 --help 缺少 $f" }
+            }
+            Write-Host "VK_LAUNCH_OK + SMOKE_OK"
+          }
+
+      - name: Smoke (Linux) — ldd 无 libstdc++/libgomp/llama/ggml（vulkan 腿须含 libvulkan）
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -257,7 +358,11 @@ jobs:
           if grep -E 'libstdc\+\+|libgomp|llama|ggml|mtmd' /tmp/ldd.txt; then
             echo "!! 单文件形态被破坏：存在 C++/OpenMP/llama 动态依赖"; exit 1
           fi
-          echo "LDD_OK（仅 glibc 家族系统库）"
+          if [ "${{ matrix.vulkan }}" = "true" ]; then
+            grep -q 'libvulkan\.so' /tmp/ldd.txt || { echo "!! vulkan 腿未链接 libvulkan"; exit 1; }
+            echo "VULKAN_LINK_OK"
+          fi
+          echo "LDD_OK（仅 glibc 家族系统库$([ "${{ matrix.vulkan }}" = "true" ] && echo ' + libvulkan')）"
 
       - name: Smoke (macOS) — otool 仅系统库/框架
         if: runner.os == 'macOS'
@@ -640,10 +745,12 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
           mkdir -p dist
           ls -lh bins/
-          # 4 平台二进制：统一命名 subtitle-assistant-<ver>-<platform>
+          # 6 平台二进制：统一命名 subtitle-assistant-<ver>-<platform>
           declare -A MAP=(
             [subtitle-assistant-windows-x64.exe]="subtitle-assistant-$VER-windows-x64.exe"
+            [subtitle-assistant-windows-x64-vulkan.exe]="subtitle-assistant-$VER-windows-x64-vulkan.exe"
             [subtitle-assistant-linux-x64]="subtitle-assistant-$VER-linux-x64"
+            [subtitle-assistant-linux-x64-vulkan]="subtitle-assistant-$VER-linux-x64-vulkan"
             [subtitle-assistant-linux-arm64]="subtitle-assistant-$VER-linux-arm64"
             [subtitle-assistant-macos-arm64]="subtitle-assistant-$VER-macos-arm64"
           )
@@ -682,22 +789,29 @@ jobs:
 
           | 平台 | 资产 | 推理设备 |
           |---|---|---|
-          | Windows x64 | \`*-windows-x64.exe\` | CPU（OpenMP 多线程；需 VC++ 2015-2022 运行库的 vcruntime140/vcomp140——绝大多数机器已随常见软件安装，缺失时装 https://aka.ms/vs/17/release/vc_redist.x64.exe ；CPU 需支持 AVX2，2013 年后的 x64 均可） |
-          | Linux x64 | \`*-linux-x64\` | CPU（glibc ≥ 2.39，Ubuntu 24.04 工具链构建；AVX2 同上） |
-          | Linux arm64 | \`*-linux-arm64\` | CPU（armv8-a 基线，树莓派 4 及以上均可） |
+          | Windows x64（**GPU 版，推荐**） | \`*-windows-x64-vulkan.exe\` | **Vulkan：自动发现 NVIDIA/AMD/Intel GPU**（需已装 GPU 驱动——驱动自带 vulkan-1.dll）；无 GPU 时自动回退 CPU |
+          | Windows x64（兼容版） | \`*-windows-x64.exe\` | 纯 CPU（OpenMP 多线程；任何机器可启动，无 GPU 驱动也行） |
+          | Linux x64（GPU 版） | \`*-linux-x64-vulkan\` | Vulkan（需系统 libvulkan.so.1，桌面发行版标配） |
+          | Linux x64（兼容版） | \`*-linux-x64\` | 纯 CPU（glibc ≥ 2.39，Ubuntu 24.04 工具链构建） |
+          | Linux arm64 | \`*-linux-arm64\` | 纯 CPU（armv8-a 基线，树莓派 4 及以上均可） |
           | macOS Apple Silicon | \`*-macos-arm64\` | **Metal GPU 加速默认开启**，CPU 兜底 |
+
+          Windows 两版均需 VC++ 2015-2022 运行库（vcruntime140/vcomp140，绝大多数机器已随常见软件安装；缺失时装 https://aka.ms/vs/17/release/vc_redist.x64.exe ）；x64 需 CPU 支持 AVX2（2013 年后的 x64 均可）。
 
           用法：把视频/音频拖到可执行文件上，或 \`subtitle-assistant 视频.mp4\`；
           同目录得到排版好的 \`视频.srt\`（默认直出中文；\`--context ""\` 转写源语言）。
 
-          ### v0.5 相对 v0.4 的行为变化
-          * **单一可执行文件**：llama.cpp/mtmd 静态链接进二进制；macOS 带 Metal GPU 加速；
-            Windows/Linux 单文件版为纯 CPU（CUDA/Vulkan 需要动态链接形态，自行源码构建
-            \`--features dynamic-link\`，见 README）。
+          ### v0.5.x 相对 v0.4 的行为变化
+          * **单一可执行文件**：llama.cpp/mtmd 静态链接进二进制，按平台提供
+            **GPU 版（Vulkan 静态编入，自动发现 N卡/A卡/Intel 核显）**、
+            兼容版（纯 CPU）、macOS 版（Metal GPU 默认开启）；
+            CUDA 仍需动态链接形态源码构建（\`--features dynamic-link\`，见 README）。
           * **流式管线**：VAD 切出一段立即送 ASR（不再全片切完再整批转录），首条字幕
-            等待时间 ≈ 第一句话时长；内存有界。
-          * **终端默认干净**：模型加载/逐段诊断全部转入 \`--log-file\`（恒全量）或
-            \`--verbose\`；默认只显示进度与结果。
+            等待时间 ≈ 第一句话时长；内存有界。实测同素材全流程提速 ~40%。
+          * **终端默认干净但保留产出**：逐条识别出的字幕内容（[ASR✔] 时间戳+文本）
+            照常打印；模型加载/跳过明细等诊断转入 \`--log-file\`（恒全量）或 \`--verbose\`。
+          * **相邻重复句自动丢弃**：与上一条字幕完全相同的识别结果（重复音频/
+            幻觉循环）不再进字幕（v0.5.1）。
           * **单输出文件**：默认只产出 \`.srt\`；排版前对照 \`.raw.srt\` 需 \`--raw-srt\`。
           * **碎片过滤默认关闭**：lang=None 短碎片的启发式丢弃需显式 \`--filter-fragments\`
             （空文本段始终跳过——无内容可写）。
