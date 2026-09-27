@@ -257,11 +257,15 @@ jobs:
 
       # ---------------- S2TT GGUF 模型（跨 OS 缓存，由 finetune.yml gguf-e2 产线在
       # ubuntu 上构建后 enableCrossOsArchive 保存；这里 windows 直接还原） ----------------
+      # 注意：actions/cache 的 version 哈希包含 path 列表——restore 的 path 必须与
+      # finetune.yml gguf-e2 save 时完全一致（两个根级文件名），否则查不到。
       - name: Restore s2tt GGUF (1.7B Q4_K_M + mmproj)
         id: gguf-cache
         uses: actions/cache/restore@v4
         with:
-          path: gguf-model
+          path: |
+            s2tt-Q4_K_M.gguf
+            mmproj-s2tt-q8.gguf
           key: qwen3-s2tt-gguf-1.7B-v1
           enableCrossOsArchive: true
 
@@ -269,12 +273,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          if (-not (Test-Path gguf-model/s2tt-Q4_K_M.gguf)) {
+          if (-not (Test-Path s2tt-Q4_K_M.gguf)) {
             throw "s2tt GGUF 缓存缺失——请先手动触发 finetune.yml (mode=gguf-e2, model=1.7B) 构建并保存缓存"
           }
           New-Item -ItemType Directory -Force -Path models/qwen3-asr-s2tt | Out-Null
-          Copy-Item gguf-model/s2tt-Q4_K_M.gguf models/qwen3-asr-s2tt/model.gguf -Force
-          Copy-Item gguf-model/mmproj-s2tt-q8.gguf models/qwen3-asr-s2tt/mmproj.gguf -Force
+          Copy-Item s2tt-Q4_K_M.gguf models/qwen3-asr-s2tt/model.gguf -Force
+          Copy-Item mmproj-s2tt-q8.gguf models/qwen3-asr-s2tt/mmproj.gguf -Force
           Get-ChildItem models/qwen3-asr-s2tt | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
 
       # ---------------- 测试媒体（bilibili 日语视频，缓存） ----------------
@@ -518,10 +522,12 @@ jobs:
           Write-Host "release version: $v"
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8
 
-      - name: Restore s2tt GGUF（跨 OS 缓存）
+      - name: Restore s2tt GGUF（跨 OS 缓存，path 与 save 端一致）
         uses: actions/cache/restore@v4
         with:
-          path: gguf-model
+          path: |
+            s2tt-Q4_K_M.gguf
+            mmproj-s2tt-q8.gguf
           key: qwen3-s2tt-gguf-1.7B-v1
           enableCrossOsArchive: true
 
@@ -532,7 +538,7 @@ jobs:
           python scripts/package_fast.py `
             --exe target/release/subtitle-assistant.exe `
             --build-dir target/release `
-            --gguf-dir gguf-model `
+            --gguf-dir . `
             --version ${{ steps.ver.outputs.version }} `
             --out dist
 
