@@ -82,13 +82,30 @@ pub struct Args {
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
 
-    /// 日志同时写入该文件
+    /// 除最终 .srt 外，另存排版前的 <名>.raw.srt（调试对照用；默认只输出一个 .srt）
+    #[arg(long)]
+    pub raw_srt: bool,
+
+    /// 日志同时写入该文件（文件内恒为全量诊断明细，含 llama.cpp 原生日志；
+    /// 终端保持精简不受影响）
     #[arg(long)]
     pub log_file: Option<PathBuf>,
+
+    /// 终端输出详细诊断（逐段 ASR/VAD 明细、后端设备枚举、llama.cpp 原生日志等；
+    /// 等价 RUST_LOG=debug。默认隐藏，只保留进度与结果级信息）
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 
     /// 失败时不暂停窗口（拖拽运行默认暂停便于看错误）
     #[arg(long)]
     pub no_pause: bool,
+
+    // ---------------- 质量过滤 ----------------
+    /// 启用「静音/幻觉碎片」过滤：lang=None 的短碎片（<2s 或 <4 字）判为幻觉丢弃。
+    /// 默认**关闭**——凡模型给出文本的段一律保留；空文本段（模型判定纯静音/噪音，
+    /// 无字幕内容可写）无论开关如何都会跳过。
+    #[arg(long)]
+    pub filter_fragments: bool,
 
     /// [自检] GGUF/mtmd 推理链自检：传 <LM_GGUF> <MMPROJ_GGUF>，加载模型并打印
     /// 后端设备/能力/内存信息后退出（不需要媒体文件）

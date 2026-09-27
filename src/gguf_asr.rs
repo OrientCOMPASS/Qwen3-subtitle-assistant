@@ -1,27 +1,55 @@
-//! llama.cpp/GGUF 推理后端（E3「单模型产品」路线）。
+//! llama.cpp/GGUF 推理后端（E3「单模型产品」路线，v0.5 起静态链接单文件形态）。
 //!
 //! 背景（决策与实测证据见 finetune/INTEGRATION.md §8/§9）：
-//! 产品从「sherpa-onnx ASR + 1.7B LLM 四段后处理」收敛为「S2TT 微调模型单段直出」，
-//! 运行时选 llama.cpp/GGUF：
-//!   * 硬件加速：CUDA（ggml-cuda.dll + 用户 `--cuda-libs` 指定的 NVIDIA 运行库目录，
-//!     经 `ggml_backend_load_all_from_path` 加载）→ Vulkan（ggml-vulkan.dll 随包，
-//!     vulkan-1.dll 系统自带，覆盖任意 Windows GPU）→ CPU 兜底；
-//!   * 权重全量上卡（n_gpu_layers=999）后 ggml 释放主机侧副本；
+//! 产品从「sherpa-onnx ASR + 1.7B LLM 四段后处理」收敛为「S2TT 微调模型单段直出」。
+//!
+//! v0.5 形态：llama.cpp（含 mtmd）由 llama-cpp-sys-2 **源码静态编译进可执行文件**，
+//! 发布物是单一可执行文件（无 llama.dll / ggml*.dll 伴生）。硬件加速随之变化：
+//!   * macOS：llama.cpp 默认启用 Metal（shader 内嵌、框架系统自带），Apple GPU 开箱即用；
+//!   * Windows / Linux：单文件版为纯 CPU（OpenMP 多线程）。CUDA/Vulkan 后端依赖
+//!     共享 ggml 的动态注入，无法进静态单文件；需要时自行
+//!     `cargo build --release --features dynamic-link` 编动态形态（`--cuda-libs`
+//!     指向官方 release 的 ggml-cuda.dll 目录仍可工作）。
+//!   * 有 GPU（Metal）时权重全量上卡（n_gpu_layers=999），主机侧副本由 ggml 释放；
 //!   * 模型 = E2 产物：LoRA 合并 → 官方转换器 → LM Q4_K_M(1.03GiB) + mmproj q8_0(0.33GiB)。
 //!
-//! Phase 1a（本文件现状）：后端发现/加载、模型与 mmproj 加载、能力查询、资源统计——
-//! 用于 `--gguf-selftest` 验证「mtmd feature 在产品工具链下可编译可链接、GGUF 可加载」。
-//! Phase 1b：mtmd_helper_eval_chunks + greedy 采样 + `language X<asr_text>` 解析（transcribe）。
+//! 原生日志：llama/ggml 的 C 侧输出经 llama_log_set/ggml_log_set 桥接进 log 门面
+//! （native_log_hook），默认 debug 级不再刷终端；ERROR 仍直出。
 
 use anyhow::{bail, Result};
-use log::info;
+use log::{debug, info};
 use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_void};
 use std::path::Path;
 use std::sync::Once;
 
 use llama_cpp_sys_2 as sys;
 
 static BACKEND_INIT: Once = Once::new();
+
+/// llama.cpp/ggml 原生 C 日志 → log 门面桥接。
+/// 原生日志（模型元数据 dump、control token 提示、后端搜索、逐层 offload 等
+/// 数十~数百行的加载噪声）默认全部收敛为 debug 级：终端干净，`--verbose` /
+/// `--log-file`（文件通道恒 debug）可看全量。仅 ERROR 保持 error 级——
+/// 真实故障必须在默认终端可见。
+unsafe extern "C" fn native_log_hook(level: sys::ggml_log_level, text: *const c_char,
+                                     _user_data: *mut c_void) {
+    if text.is_null() {
+        return;
+    }
+    let s = CStr::from_ptr(text).to_string_lossy();
+    for line in s.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if level == sys::GGML_LOG_LEVEL_ERROR {
+            log::error!(target: "llama", "{line}");
+        } else {
+            log::debug!(target: "llama", "{line}");
+        }
+    }
+}
 
 fn to_cstring(p: &Path) -> Result<CString> {
     CString::new(p.to_string_lossy().as_bytes().to_vec())
@@ -36,22 +64,31 @@ fn to_cstring(p: &Path) -> Result<CString> {
 /// 「启动时主动探测并打印后端选择结果」的行为一致）。
 fn init_backends(cuda_libs: Option<&Path>) {
     BACKEND_INIT.call_once(|| {
-        unsafe { sys::llama_backend_init() };
+        unsafe {
+            // 先把原生日志接管进 log 门面（在任何 ggml/llama 输出发生之前），
+            // 否则加载期噪声会直写 stderr 刷屏。
+            sys::llama_log_set(Some(native_log_hook), std::ptr::null_mut());
+            sys::ggml_log_set(Some(native_log_hook), std::ptr::null_mut());
+            sys::llama_backend_init();
+        }
 
         if let Some(dir) = cuda_libs {
             // 依赖链解析：把用户目录加进进程 DLL 搜索路径（复用 runtime 的
             // AddDllDirectory 封装），再让 ggml 从该目录加载后端模块。
+            // 注：仅动态链接形态的构建能真正加载外置后端；CI 发布的静态单文件
+            // 版为 CPU（Windows/Linux）/Metal（macOS），此路径加载不到东西时
+            // 下方 pick_device 会如实回退。
             crate::runtime::dll::add_search_dirs(&[dir.to_path_buf()]);
             match to_cstring(dir) {
                 Ok(c) => unsafe { sys::ggml_backend_load_all_from_path(c.as_ptr()) },
                 Err(e) => log::warn!("--cuda-libs 路径无效: {e}"),
             }
-            info!("已从 {:?} 加载外置推理后端（CUDA）", dir);
+            debug!("已尝试从 {:?} 加载外置推理后端（CUDA）", dir);
         }
 
         unsafe {
             let n = sys::ggml_backend_dev_count();
-            info!("ggml 后端设备 {} 个:", n);
+            debug!("ggml 后端设备 {n} 个:");
             for i in 0..n {
                 let dev = sys::ggml_backend_dev_get(i);
                 if dev.is_null() {
@@ -63,7 +100,7 @@ fn init_backends(cuda_libs: Option<&Path>) {
                 let desc = CStr::from_ptr(sys::ggml_backend_dev_description(dev))
                     .to_string_lossy()
                     .into_owned();
-                info!("  [{}] {} — {}", i, name, desc);
+                debug!("  [{i}] {name} — {desc}");
             }
         }
     });
@@ -153,7 +190,7 @@ impl GgufAsr {
                 ngl_effective = 0;
             }
         } else {
-            info!("--device cpu：强制纯 CPU 推理");
+            debug!("--device cpu：强制纯 CPU 推理");
             ngl_effective = 0;
         }
         let mut devices: Vec<sys::ggml_backend_dev_t> = picked.clone();
@@ -308,7 +345,7 @@ impl GgufAsr {
                     out.extend_from_slice(std::slice::from_raw_parts(
                         piece.as_ptr() as *const u8, n as usize));
                 }
-                let mut batch = sys::llama_batch_get_one(&mut tok as *mut sys::llama_token, 1);
+                let batch = sys::llama_batch_get_one(&mut tok as *mut sys::llama_token, 1);
                 if sys::llama_decode(self.ctx, batch) != 0 {
                     break;
                 }

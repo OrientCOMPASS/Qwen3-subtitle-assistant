@@ -30,6 +30,12 @@ pub struct Config {
     pub max_line_width: usize,
     pub max_cue_secs: f64,
     pub output_dir: Option<PathBuf>,
+    /// 是否另存排版前 .raw.srt（默认否：只交付一个 .srt）
+    pub raw_srt: bool,
+
+    // ---- 质量过滤 ----
+    /// 是否启用「静音/幻觉碎片」过滤（默认否，见 --filter-fragments）
+    pub filter_fragments: bool,
 }
 
 impl Config {
@@ -58,6 +64,8 @@ impl Config {
             max_line_width: args.max_line_width,
             max_cue_secs: args.max_cue_secs,
             output_dir: args.output_dir.clone(),
+            raw_srt: args.raw_srt,
+            filter_fragments: args.filter_fragments,
         })
     }
 
@@ -73,7 +81,7 @@ impl Config {
         self.output_dir_for(input).join(format!("{}.srt", stem_of(input)))
     }
 
-    /// 排版前的原始直出字幕：<output_dir>/<stem>.raw.srt（调试/对照用）
+    /// 排版前的原始直出字幕：<output_dir>/<stem>.raw.srt（仅 `--raw-srt` 时写出）
     pub fn raw_srt_path(&self, input: &Path) -> PathBuf {
         self.output_dir_for(input).join(format!("{}.raw.srt", stem_of(input)))
     }
@@ -215,8 +223,11 @@ mod tests {
             max_line_width: 44,
             max_cue_secs: 15.0,
             output_dir: Some(PathBuf::from("out")),
+            raw_srt: false,
             log_file: None,
+            verbose: false,
             no_pause: true,
+            filter_fragments: false,
             gguf_selftest: vec![],
         };
         let probe = RuntimeProbe::new();
@@ -227,7 +238,8 @@ mod tests {
                 device: DevicePref::Cpu, cuda_libs: None, threads: 1, gpu_layers: 0,
                 max_new_tokens: 128, vad_threshold: 0.5, vad_min_silence: 0.5,
                 vad_buffer_secs: 60.0, max_line_width: 44, max_cue_secs: 15.0,
-                output_dir: Some(PathBuf::from("out")),
+                output_dir: Some(PathBuf::from("out")), raw_srt: false,
+                filter_fragments: false,
             }
         });
         let input = Path::new("media/video.mp4");

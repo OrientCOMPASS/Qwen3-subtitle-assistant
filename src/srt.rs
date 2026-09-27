@@ -6,7 +6,7 @@
 //!    时间按字符占比在原区间内分配（没有词级时间戳时的标准做法）；
 //! 2. **行宽折行**：按显示宽度（CJK 计 2、ASCII 计 1）折行，优先在标点/空格处断。
 //!
-//! 另外提供 `parse_srt`，支撑 `--from-srt`（跳过 ASR，直接翻译已有字幕）。
+//! 另提供 `parse_srt`（测试用参照读取，`--from-srt` 模式已随双模型工作流下线）。
 
 use crate::types::SubtitleSegment;
 use anyhow::{Context, Result};
@@ -51,6 +51,8 @@ pub fn write_srt(path: &Path, segments: &[SubtitleSegment]) -> Result<()> {
 }
 
 /// 解析 SRT 文本（容忍缺序号、`.` 毫秒分隔、CRLF、多余空行）。
+/// 仅测试使用（roundtrip / 容错断言），不进发布构建。
+#[cfg(test)]
 pub fn parse_srt(text: &str) -> Vec<SubtitleSegment> {
     let mut out = Vec::new();
     for block in text.replace("\r\n", "\n").split("\n\n") {
@@ -79,19 +81,14 @@ pub fn parse_srt(text: &str) -> Vec<SubtitleSegment> {
     out
 }
 
-pub fn read_srt(path: &Path) -> Result<Vec<SubtitleSegment>> {
-    let text = fs::read_to_string(path).with_context(|| format!("读取字幕失败: {:?}", path))?;
-    let segs = parse_srt(&text);
-    anyhow::ensure!(!segs.is_empty(), "字幕文件里没有可解析的条目: {:?}", path);
-    Ok(segs)
-}
-
+#[cfg(test)]
 fn parse_timestamps(line: &str) -> Option<(u64, u64)> {
     let (a, b) = line.split_once("-->")?;
     Some((parse_ts(a.trim())?, parse_ts(b.trim())?))
 }
 
 /// 解析 `HH:MM:SS,mmm`（也接受 `HH:MM:SS.mmm` 与省略小时的形式）。
+#[cfg(test)]
 fn parse_ts(s: &str) -> Option<u64> {
     let s = s.split(' ').next().unwrap_or(s).replace('.', ",");
     let (hms, ms) = match s.split_once(',') {
@@ -113,7 +110,8 @@ fn parse_ts(s: &str) -> Option<u64> {
 // 排版
 // ============================================================================
 
-/// 显示宽度：CJK / 全角字符按 2 计，其余按 1 计。
+/// 显示宽度：CJK / 全角字符按 2 计，其余按 1 计。（测试断言用；排版内部走 char_width）
+#[cfg(test)]
 pub fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }

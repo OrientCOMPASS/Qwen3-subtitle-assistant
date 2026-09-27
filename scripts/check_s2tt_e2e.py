@@ -40,14 +40,27 @@ def width(l: str) -> int:
 
 def check_translate(media_list: str) -> int:
     bad = 0
-    for f in media_list.split(";"):
-        if not f.strip():
-            continue
-        srt = pathlib.Path(f).with_suffix(".srt")
-        if not srt.is_file():
-            print(f"✘ {srt} 不存在")
-            bad += 1
-            continue
+    # 支持两种形态：分号分隔的媒体文件列表（检查同名 .srt）；或目录（检查目录下
+    # 所有非 .raw.srt 的 srt —— T1c 的 --output-dir 产物形态）
+    p = pathlib.Path(media_list)
+    if p.is_dir():
+        srts = sorted(x for x in p.glob("*.srt") if not x.name.endswith(".raw.srt"))
+        if not srts:
+            print(f"✘ {p} 下没有 srt")
+            return 1
+        targets = srts
+    else:
+        targets = []
+        for f in media_list.split(";"):
+            if not f.strip():
+                continue
+            srt = pathlib.Path(f).with_suffix(".srt")
+            if not srt.is_file():
+                print(f"✘ {srt} 不存在")
+                bad += 1
+                continue
+            targets.append(srt)
+    for srt in targets:
         cs = parse_cues(srt)
         txt = "".join(t for _, _, t in cs)
         ch = [c for c in txt if not c.isspace()]

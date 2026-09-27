@@ -1,8 +1,8 @@
 [package]
 name = "subtitle-assistant"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "本地离线字幕助手（S2TT 微调 Qwen3-ASR 单模型直出 · llama.cpp/GGUF · CUDA/Vulkan/CPU · 纯 Rust silero VAD · 字幕排版）"
+description = "本地离线字幕助手（S2TT 微调 Qwen3-ASR 单模型直出 · llama.cpp/GGUF 静态单文件 · 流式 VAD→ASR · 纯 Rust silero VAD · 字幕排版）"
 license = "Unlicense"
 
 [dependencies]
@@ -11,40 +11,41 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
-env_logger = "0.11"
 indicatif = "0.17"
 
 # ============================================================================
-# 关键设计：两个原生依赖全部使用【动态链接】。
+# 关键设计：唯一原生依赖 llama.cpp（llama-cpp-sys-2）**从源码静态链接**进本
+# 可执行文件——发布形态是「单一可执行文件」（Windows 无 DLL 伴生文件、Linux /
+# macOS 无 .so/.dylib），解压/下载即用。
 #
-# - 编译机（含 GitHub Actions runner）不需要安装 CUDA Toolkit：CUDA 加速由
-#   ggml 动态后端（ggml-cuda.dll）在进程内加载，NVIDIA 运行库经 --cuda-libs
-#   指定的目录解析；通用 GPU 走 Vulkan（ggml-vulkan.dll 随包，系统自带 loader）。
-# - E3 单模型化后唯一原生依赖是 llama.cpp（llama-cpp-sys-2 源码构建，含 mtmd
-#   多模态库）；sherpa-onnx/ORT 已随双模型工作流一并移除。
+# 与 v0.4 的动态链接差异：
+# - 不再随包 llama.dll / ggml*.dll / ggml-vulkan.dll；
+# - CPU 后端静态编入；macOS 上 llama.cpp 默认启用 Metal 后端（框架系统自带、
+#   shader 内嵌），Apple Silicon GPU 加速开箱即用；
+# - CUDA / Vulkan 后端无法在静态单文件里动态注入（官方预编译后端 DLL 依赖
+#   共享 ggml），单文件版 Windows/Linux 为纯 CPU 推理。需要 GPU 时可自行
+#   cargo build --features dynamic-link 走动态链接形态（见 README「开发」）。
 #
-# 版本用 "=" 精确锁定：这两个 crate 的 ABI 与运行时 DLL 强绑定，
-# 升级时必须同步更新 CI 中下载的 DLL 版本（见 scripts/package_dist.py）。
+# 版本用 "=" 精确锁定：该 crate 内嵌 llama.cpp 源码构建，ABI 与 mtmd 头文件
+# 强绑定，升级需同步回归 e2e。
 # ============================================================================
-llama-cpp-2 = { version = "=0.1.157", default-features = false, features = [
-    "dynamic-link",     # 生成并链接 llama.dll / ggml*.dll（而非静态库）
-    "dynamic-backends", # ggml 后端做成运行时模块，从 exe 目录自动发现 ggml-cuda.dll 等
+llama-cpp-sys-2 = { version = "=0.1.157", default-features = false, features = [
     "openmp",
     "mtmd",             # 多模态（tools/mtmd）：Qwen3-ASR GGUF 的音频编码/拼接推理库
-] }
-# E3 单模型路线需要 mtmd/ggml 的原始 C 符号（llama-cpp-2 未 re-export sys crate）：
-# sys 开 mtmd feature 后 bindgen 会生成 mtmd_* 全量绑定（allowlist "mtmd_.*"）。
-# feature 与上面 llama-cpp-2 的选择由 cargo 统一（同版本自动并集）。
-llama-cpp-sys-2 = { version = "=0.1.157", default-features = false, features = [
-    "dynamic-link", "dynamic-backends", "openmp", "mtmd",
 ] }
 
 [features]
 default = []
-# 本地开发者若装有 CUDA Toolkit，想自己编译 CUDA 版 ggml-cuda.dll，可启用：
-#   cargo build --release --features cuda-build
-# CI 发布包不使用该特性（直接使用 llama.cpp 官方发布的 CUDA DLL）。
-cuda-build = ["llama-cpp-2/cuda"]
+# Linux 发布构建：libstdc++ / libgomp 静态链接（配合 CI，产出真正单文件的
+# ELF，仅依赖 glibc）。对其他平台是无害 no-op（build.rs 按 target 判定）。
+static-libs = ["llama-cpp-sys-2/static-openmp", "llama-cpp-sys-2/static-stdcxx"]
+# 本地开发者想编动态链接形态（llama.dll/ggml*.dll 伴生、可注入官方 CUDA/Vulkan
+# 后端 DLL）时启用；CI 发布包不使用：
+#   cargo build --release --features dynamic-link
+dynamic-link = ["llama-cpp-sys-2/dynamic-link", "llama-cpp-sys-2/dynamic-backends"]
+# 本地开发者若装有 CUDA Toolkit，想自己编译 CUDA 后端（仅动态链接形态有意义）：
+#   cargo build --release --features "dynamic-link,cuda-build"
+cuda-build = ["llama-cpp-sys-2/cuda"]
 
 [profile.release]
 opt-level = 3

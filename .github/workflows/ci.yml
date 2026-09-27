@@ -1,18 +1,32 @@
 # ============================================================================
-# 唯一的 CI 工作流。触发规则（按维护者要求收敛）：
+# 唯一的 CI 工作流。触发规则：
 #
-#   push master / PR   -> 自动构建 + 单元测试 + 冒烟 + 端到端真实测试（S2TT 单模型直出）
-#   workflow_dispatch  -> 上述全部，外加「打包快速直出版单文件发行包 + 创建 GitHub Release」
+#   push master / PR   -> 构建（4 平台静态单文件）+ 单元测试 + 冒烟 + e2e 真实测试
+#   workflow_dispatch  -> 上述全部，外加「收集 4 平台二进制 + 模型 → GitHub Release」
 #
 # 三个 job：
-#   build    编译 exe（纯 CPU 工具链，无需 CUDA Toolkit）+ cargo test + 冒烟
-#   e2e      needs build：真实日语视频（bilibili，缓存）+ 长文本回归 + 迁移目录回归
-#   release  needs build,e2e：仅手动 dispatch 且勾选 release 时运行
+#   build    矩阵构建单一可执行文件（llama.cpp 静态编入，无任何伴生 DLL/so/dylib）：
+#            windows-x64（静态 CRT）/ linux-x64 / linux-arm64（libstdc++/libgomp 静态）
+#            / macos-arm64（Metal GPU 后端默认编入）。cargo test + 冒烟 + 依赖闭包检查；
+#            linux/mac 腿顺带跑真实模型 --gguf-selftest（GGUF 跨 OS 缓存命中时）。
+#   e2e      needs build：windows 真实日语视频全流程（T1 默认参数 / T1b 任务开关 /
+#            T1c verbose+过滤+raw 对照）+ 迁移目录回归 + 终端清洁度断言。
+#   release  needs build,e2e：仅手动 dispatch 且勾选 release 时运行——
+#            发布 4 个平台单文件二进制 + S2TT GGUF 模型 + SHA256SUMS 为一个
+#            GitHub Release（v0.5 起不再打 1.5GiB 大 zip：exe 与模型分离下载）。
 #
-# E3 单模型形态：产品只有 llama.cpp 一个推理运行时（Qwen3-ASR S2TT GGUF，mtmd
-# 多模态路径），VAD 为内嵌权重的纯 Rust silero v4。CUDA 由用户 --cuda-libs 指定
-# 运行库目录后动态加载 ggml-cuda.dll；通用 GPU 走随包 ggml-vulkan.dll；否则 CPU。
-# CI 不需要 CUDA Toolkit / Vulkan SDK。
+# v0.5 形态说明（与 v0.4 的差异）：
+#   * 发布物 = 单一可执行文件。llama.cpp（含 mtmd）静态链接进 exe；
+#     macOS 默认带 Metal GPU 加速；Windows/Linux 单文件版为纯 CPU
+#     （CUDA/Vulkan 依赖共享 ggml 的动态注入，与静态单文件互斥——需要 GPU 的
+#     开发者自行 `cargo build --release --features dynamic-link`）。
+#   * Windows 静态 CRT（LLAMA_STATIC_CRT=1 + RUSTFLAGS=-Ctarget-feature=+crt-static）：
+#     无 vcruntime 依赖；OpenMP 运行库 vcomp140.dll 除外（VC++ 发行版组件，
+#     冒烟步骤会显式校验导入闭包）。
+#   * 默认终端只输出进度/结果级信息；诊断细节进 --log-file（恒 debug 级）或
+#     --verbose。e2e 的 T1 对终端输出做「清洁度断言」（scripts/check_console_clean.py）。
+#   * 默认只产出一个 <名>.srt；.raw.srt 需 --raw-srt。碎片过滤默认关闭，
+#     需 --filter-fragments（T1 断言默认行为，T1c 断言开关行为）。
 # ============================================================================
 name: CI
 
@@ -58,7 +72,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  RUST_LOG: info
+  # 注意：这里刻意【不设 RUST_LOG】——应用默认终端级别是 info（结果级最小集合），
+  # CI 要验证的就是这个出厂默认；T1c 用 --verbose 显式开 debug 对照。
   # runner 控制台默认 cp1252：python 输出中文会抛 UnicodeEncodeError（实测踩过），
   # 统一强制 UTF-8 模式。
   PYTHONUTF8: "1"
@@ -71,28 +86,58 @@ env:
 
 jobs:
   # ------------------------------------------------------------------ 构建
+  # 4 平台矩阵：每腿产出一个自包含单文件二进制（静态链接 llama.cpp/mtmd）。
   build:
-    name: 构建 + 单元测试 + 冒烟
-    runs-on: windows-latest
+    name: 构建+单测+冒烟 (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            bin: subtitle-assistant-windows-x64.exe
+            exe_suffix: ".exe"
+            features: ""
+            selftest: true
+          - name: linux-x64
+            os: ubuntu-24.04
+            bin: subtitle-assistant-linux-x64
+            exe_suffix: ""
+            features: "--features static-libs"
+            selftest: true
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            bin: subtitle-assistant-linux-arm64
+            exe_suffix: ""
+            features: "--features static-libs"
+            selftest: true
+          - name: macos-arm64
+            os: macos-14
+            bin: subtitle-assistant-macos-arm64
+            exe_suffix: ""
+            features: ""
+            selftest: true
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    env:
+      # Windows：静态 CRT（配合 RUSTFLAGS crt-static，产出零 VC 运行库依赖的 exe，
+      # OpenMP 的 vcomp140.dll 除外——冒烟步骤显式校验导入闭包）
+      LLAMA_STATIC_CRT: ${{ matrix.name == 'windows-x64' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # target/ 入缓存 -> 增量构建（llama.cpp 的 CMake 产物与全部依赖 crate 都能复用，
-      # 实测全量 ~9.5 分钟可降到 2~3 分钟）。
-      # 注：旧版这里有一段 sherpa-onnx 预编译库缓存的复杂舞步——E3 单模型化后
-      # sherpa/ORT 依赖已全部移除，llama.cpp 原生构建产物由上面的依赖缓存完整覆盖。
       - name: Full clean build (release)
         if: inputs.release
-        shell: pwsh
+        shell: bash
         run: |
-          Write-Host "release 构建：清空 target 做全量构建"
-          Remove-Item -Recurse -Force target -ErrorAction SilentlyContinue
+          echo "release 构建：清空 target 做全量构建"
+          rm -rf target
 
-      # llama-cpp-sys-2 的 build.rs 使用 bindgen，需要 libclang
-      - name: Ensure libclang (bindgen)
+      # ---------------- 平台准备（libclang for bindgen / 静态库可用性 / CRT） ----
+      - name: Prepare (Windows) — libclang + 静态 CRT RUSTFLAGS
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $candidates = @(
@@ -108,131 +153,187 @@ jobs:
           }
           Write-Host "Using LIBCLANG_PATH=$found"
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$found"
+          # 静态 CRT：Rust 侧 + llama.cpp CMake 侧（LLAMA_STATIC_CRT 已在 job env）
+          Add-Content -Path $env:GITHUB_ENV -Value "RUSTFLAGS=-C target-feature=+crt-static"
 
-      - name: Build release exe (dynamic-link, CPU toolchain only)
-        run: cargo build --release  # 不用 --locked：E3 依赖大手术后 lock 由 cargo 收敛（见 Cargo.lock 头注）
-
-      # 构建脚本本应把 DLL 拷到 target/release，但历史上多次失效（LNK/运行时缺件），
-      # 这里保留兜底收集，并显式校验关键 DLL 存在。
-      # 增量构建的必备兜底：rust-cache 的 cleanProfileTarget 会删掉 target/release 下的
-      # 散落文件（exe 会被重新链接出来，但 DLL 不会），而两套 DLL 的"源头"不同：
-      #   llama/ggml*.dll        <- target/release/build/llama-cpp-sys-2-*/out（rust-cache 保留 build/）
-      #   sherpa-onnx-c-api.dll  <- target/sherpa-onnx-prebuilt/*/lib（只在 build.rs 重跑时才拷贝，
-      #                             增量构建下不重跑；该目录由本工作流单独缓存并在构建前还原）
-      # 少任何一个都会在运行时报"找不到 DLL"，所以这里显式补齐并校验。
-      - name: Collect runtime DLLs
-        shell: pwsh
+      - name: Prepare (Linux) — libclang + 静态 libstdc++/libgomp 可用性
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          # E3 单模型化：只剩 llama.cpp 家族（含 mtmd 多模态库）。
-          # llama-common.dll/mtmd.dll 视 sys crate 构建配置可能存在，收集但不强制。
-          $required = @("llama.dll","ggml.dll","ggml-base.dll")
+          set -e
+          if ! ldconfig -p | grep -q libclang; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libclang-dev clang >/dev/null
+          fi
+          LIBCLANG=$(dirname "$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)")
+          echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$LIBCLANG"
+          # static-libs feature 需要编译器自带静态库（g++/gcc 包内）
+          for a in libstdc++.a libgomp.a; do
+            p=$(g++ --print-file-name=$a)
+            if [ "$p" = "$a" ] || [ ! -f "$p" ]; then
+              echo "!! 缺 $a，安装 g++ ..."
+              sudo apt-get update -qq && sudo apt-get install -y -qq g++ >/dev/null
+              p=$(g++ --print-file-name=$a)
+            fi
+            echo "$a -> $p"
+            [ -f "$p" ] || { echo "静态库 $a 不可用，static-libs 会链接失败"; exit 1; }
+          done
 
-          # 1) llama.cpp / ggml：源头在 target/release/build/llama-cpp-sys-2-*/out（rust-cache 保留 build/）
-          $llamaOuts = Get-ChildItem target/release/build -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue |
-                       ForEach-Object { Join-Path $_.FullName "out" }
-          foreach ($d in $llamaOuts) {
-            if (-not (Test-Path $d)) { continue }
-            Get-ChildItem -Recurse $d -Filter *.dll -File | ForEach-Object {
-              $dest = Join-Path "target/release" $_.Name
-              if (-not (Test-Path $dest)) { Copy-Item $_.FullName $dest -Force; Write-Host "  + llama : $($_.Name)" }
-            }
-          }
+      - name: Prepare (macOS) — libclang（brew llvm，缺则装）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
+          if [ -z "$LLVM_PREFIX" ] || [ ! -f "$LLVM_PREFIX/lib/libclang.dylib" ]; then
+            brew install llvm
+            LLVM_PREFIX="$(brew --prefix llvm)"
+          fi
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib"
+          # Metal 后端由 llama.cpp 在 Apple 平台默认启用（GGML_METAL_EMBED_LIBRARY
+          # 内嵌 shader），无需额外 SDK——Xcode 即全部依赖。
 
-          $missing = @($required | Where-Object { -not (Test-Path "target/release/$_") })
-          if ($missing.Count -gt 0) {
-            Write-Host "target/release 现有 DLL:"
-            Get-ChildItem target/release -Filter *.dll | Select-Object -ExpandProperty Name
-            throw "缺少运行时 DLL: $($missing -join ', ')"
-          }
-          Write-Host "=== target/release DLL 清单 ==="
-          Get-ChildItem target/release -Filter *.dll |
-            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+      # ---------------- 构建 + 测试 ----------------
+      - name: Build release (static single-file)
+        shell: bash
+        run: cargo build --release ${{ matrix.features }}
 
-      # 单元测试：VAD 黄金向量回放（silero v4 纯 Rust 实现 vs ORT 产出）、段切分
-      # 状态机、ASR 原始输出解析、折行/长 cue 拆分、SRT 读写、模型路径解析。
-      # 测试二进制需要能找到原生 DLL。
+      # 单元测试：VAD 黄金向量回放、流式 SegTracker↔批量参照 600 组等价性对拍、
+      # 硬拆/合并/pad 语义、ASR 输出解析、折行/长 cue 拆分、SRT、模型路径解析。
+      # 静态链接后测试二进制不再需要任何 DLL/so 布阵。
       - name: Unit tests (cargo test)
-        shell: pwsh
-        run: |
-          $env:PATH = "$PWD\target\release;$env:PATH"
-          cargo test --release -- --nocapture --test-threads 1
+        shell: bash
+        run: cargo test --release -- --test-threads 1
 
-      - name: Smoke test
+      - name: Smoke — version/help/新 flag 存在性
+        shell: bash
+        run: |
+          set -e
+          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          "$BIN" --version
+          "$BIN" --help | head -12
+          # v0.5 新增行为开关必须出现在 CLI 面上
+          "$BIN" --help | grep -q -- "--raw-srt"
+          "$BIN" --help | grep -q -- "--verbose"
+          "$BIN" --help | grep -q -- "--filter-fragments"
+          echo "SMOKE_OK"
+
+      # ---------------- 依赖闭包检查：证明「单一可执行文件」成立 ----------------
+      - name: Smoke (Windows) — PE 导入表无非系统 DLL
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Write-Host "=== exe 静态导入表 ==="
           pip install --quiet pefile
-          python -c "import pefile; pe=pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True); pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']]); print('\n'.join(sorted(e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT)))"
-
-          Write-Host "=== 逐个 LoadLibrary 验证导入项 ==="
-          # 必须用【exe 同目录的完整路径】加载：LOAD_WITH_ALTERED_SEARCH_PATH(0x8) 会让
-          # 依赖 DLL 也从该目录解析，这才等价于真实启动场景。
-          # 旧版用裸 DLL 名加载（搜索路径是 CWD=仓库根，而 DLL 在 target/release 下），
-          # 于是 llama.dll / sherpa-onnx-c-api.dll 永远 FAIL——但旧脚本只打印不判定，
-          # 这个"验证"其实一直是摆设。
           python -c @"
-          import ctypes, os, pefile
-          d = os.path.join('target', 'release')
-          pe = pefile.PE(os.path.join(d, 'subtitle-assistant.exe'), fast_load=True)
+          import pefile, sys
+          pe = pefile.PE(r'target/release/subtitle-assistant.exe', fast_load=True)
           pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
-          k32 = ctypes.WinDLL('kernel32')
-          SYS = ('api-ms-', 'ext-ms-', 'kernel', 'ntdll', 'bcrypt', 'ucrtbase', 'vcruntime', 'msvcp', 'ws2_32', 'advapi32', 'user32', 'ole32', 'shell32', 'sechost', 'rpcrt4', 'crypt32', 'winmm', 'version', 'shlwapi', 'userenv', 'psapi', 'iphlpapi', 'wldap32', 'normaliz', 'dbghelp', 'gdi32', 'msvcrt')
-          bad = []
-          for e in pe.DIRECTORY_ENTRY_IMPORT:
-              name = e.dll.decode()
-              local = os.path.join(d, name)
-              target = local if os.path.isfile(local) else name
-              ok = bool(k32.LoadLibraryExW(target, None, 0x8))
-              where = 'local' if os.path.isfile(local) else 'system'
-              print(('OK  ' if ok else 'FAIL'), f'{name:<28}', where)
-              if not ok and not name.lower().startswith(SYS):
-                  bad.append(name)
-          print('non-system import load failures:', bad or 'none')
-          raise SystemExit(1 if bad else 0)
+          imports = sorted(e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT)
+          print('imports:', imports)
+          # 允许：Windows 系统 DLL（含静态 CRT 残余的 api-ms-win-*、OpenMP 的 vcomp140）
+          SYS = ('api-ms-', 'ext-ms-', 'kernel', 'ntdll', 'bcrypt', 'ucrtbase', 'vcruntime',
+                 'msvcp', 'ws2_32', 'advapi32', 'user32', 'ole32', 'shell32', 'sechost',
+                 'rpcrt4', 'crypt32', 'winmm', 'version', 'shlwapi', 'userenv', 'psapi',
+                 'iphlpapi', 'wldap32', 'normaliz', 'dbghelp', 'gdi32', 'msvcrt', 'vcomp',
+                 'userenv', 'setupapi', 'cfgmgr32', 'winspool', 'comdlg32', 'comctl32')
+          bad = [d for d in imports if not d.lower().startswith(SYS)]
+          # 明确断言：不得再依赖 llama/ggml 伴生 DLL（v0.4 形态的残留）
+          llama = [d for d in imports if 'llama' in d.lower() or 'ggml' in d.lower() or 'mtmd' in d.lower()]
+          print('non-system:', bad or 'none', '| llama/ggml imports:', llama or 'none')
+          sys.exit(1 if (bad or llama) else 0)
           "@
-          if ($LASTEXITCODE -ne 0) { throw "导入项加载验证失败（见上方 FAIL 行）" }
+          if ($LASTEXITCODE -ne 0) { throw "PE 导入闭包检查失败（单文件形态被破坏或出现未知系统 DLL）" }
 
-          Write-Host "=== --version / --help ==="
-          $ver = & ./target/release/subtitle-assistant.exe --version 2>&1
-          $verExit = $LASTEXITCODE
-          Write-Host $ver
-          if ($verExit -ne 0) { throw "--version 退出码 $verExit" }
-          # 先整体捕获再截取：`--help | Select-Object -First N` 会提前关闭管道，
-          # 让上游原生命令被杀，$LASTEXITCODE 变成非 0（假失败）。
-          $help = & ./target/release/subtitle-assistant.exe --help 2>&1
-          $helpExit = $LASTEXITCODE
-          $help | Select-Object -First 10
-          Write-Host "HELP_EXIT=$helpExit"
-          if ($helpExit -ne 0) { throw "--help 退出码 $helpExit" }
+      - name: Smoke (Linux) — ldd 无 libstdc++/libgomp/llama/ggml
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          ldd "$BIN" | tee /tmp/ldd.txt
+          if grep -E 'libstdc\+\+|libgomp|llama|ggml|mtmd' /tmp/ldd.txt; then
+            echo "!! 单文件形态被破坏：存在 C++/OpenMP/llama 动态依赖"; exit 1
+          fi
+          echo "LDD_OK（仅 glibc 家族系统库）"
 
-      - name: Upload runtime bundle (exe + DLL)
+      - name: Smoke (macOS) — otool 仅系统库/框架
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          otool -L "$BIN" | tee /tmp/otool.txt
+          # 只允许 /usr/lib、/System 前缀（含 Metal/Foundation 等系统框架）
+          if tail -n +2 /tmp/otool.txt | awk '{print $1}' | grep -v -E '^/usr/lib|^/System' ; then
+            echo "!! 单文件形态被破坏：存在非系统动态库依赖"; exit 1
+          fi
+          echo "OTOOL_OK"
+
+      # ---------------- 真实模型自检（GGUF 跨 OS 缓存命中时；验证各架构可推理） --
+      - name: Restore s2tt GGUF (selftest 用，允许 miss)
+        if: matrix.selftest
+        id: gguf-selftest-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            s2tt-Q4_K_M.gguf
+            mmproj-s2tt-q8.gguf
+          key: qwen3-s2tt-gguf-1.7B-v1
+          enableCrossOsArchive: true
+
+      - name: GGUF selftest（真实模型加载 + 后端枚举；mac 腿顺带验证 Metal）
+        if: matrix.selftest && steps.gguf-selftest-cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -e
+          BIN="target/release/subtitle-assistant${{ matrix.exe_suffix }}"
+          "$BIN" --gguf-selftest s2tt-Q4_K_M.gguf mmproj-s2tt-q8.gguf | tee selftest.out
+          grep -q "自检通过" selftest.out
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            grep -qi "metal" selftest.out && echo "Metal 后端已发现 ✓" || echo "::warning::mac 腿未见 Metal 设备（自检仍通过，CPU 兜底）"
+          fi
+
+      # ---------------- 收集产物 ----------------
+      - name: Stage single-file binary
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist-bin
+          cp "target/release/subtitle-assistant${{ matrix.exe_suffix }}" "dist-bin/${{ matrix.bin }}"
+          chmod +x "dist-bin/${{ matrix.bin }}" || true
+          ls -lh dist-bin/
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: win-x64-runtime
-          path: |
-            target/release/subtitle-assistant.exe
-            target/release/*.dll
+          name: bin-${{ matrix.name }}
+          path: dist-bin/*
           if-no-files-found: error
           retention-days: 14
 
   # ------------------------------------------------------------- 端到端测试
   e2e:
-    name: e2e（真实日语视频 + 长文本回归 + 迁移目录回归）
+    name: e2e（真实日语视频 + 终端清洁度 + 输出形态回归 + 迁移目录回归）
     needs: build
     runs-on: windows-latest
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download runtime bundle
+      - name: Download windows binary
         uses: actions/download-artifact@v4
         with:
-          name: win-x64-runtime
-          # upload-artifact 会以多个 path 的**最小公共祖先**作为压缩包根，
-          # 因此包内是 subtitle-assistant.exe / *.dll（不含 target/release 前缀），
-          # 必须显式下载到 target/release，否则 exe 会落在仓库根、后续步骤找不到。
-          path: target/release
+          name: bin-windows-x64
+          path: dist-bin
+
+      - name: 布阵 exe（后续步骤沿用 target/release/subtitle-assistant.exe 路径）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target/release | Out-Null
+          Copy-Item dist-bin/subtitle-assistant-windows-x64.exe target/release/subtitle-assistant.exe -Force
+          & ./target/release/subtitle-assistant.exe --version
 
       - name: Console UTF-8
         shell: pwsh
@@ -249,10 +350,10 @@ jobs:
           ffmpeg -version | Select-Object -First 1
           ffprobe -version | Select-Object -First 1
 
-      - name: Install python deps (yt-dlp / pefile)
+      - name: Install python deps (yt-dlp)
         shell: pwsh
         run: |
-          pip install --quiet --upgrade yt-dlp pefile
+          pip install --quiet --upgrade yt-dlp
           yt-dlp --version
 
       # ---------------- S2TT GGUF 模型（跨 OS 缓存，由 finetune.yml gguf-e2 产线在
@@ -260,8 +361,7 @@ jobs:
       # 注意两个 actions/cache 的坑（都实际踩过）：
       # 1) version 哈希包含 path 列表——restore 的 path 必须与 finetune.yml gguf-e2
       #    save 时完全一致（两个根级文件名），否则报 "Cache not found"；
-      # 2) 缓存按分支作用域隔离——gguf-e2 必须曾在**本分支**跑过，master 的 CI 才
-      #    能看到它存的缓存（换分支开发时先在新分支 dispatch 一次 gguf-e2）。
+      # 2) 缓存按分支作用域隔离——PR 分支可还原 default 分支（master）的缓存。
       - name: Restore s2tt GGUF (1.7B Q4_K_M + mmproj)
         id: gguf-cache
         uses: actions/cache/restore@v4
@@ -361,20 +461,16 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "MEDIA_LIST=$($staged -join ';')"
 
       # ============ 回归用例（不依赖网络，先跑，最快拿到关键反馈） ============
-      # T3：迁移目录回归（拖拽/快捷方式启动路径）。exe+DLL+prompts 拷到 TEMP，
-      #      models 用 junction 指过去，再从非仓库 CWD 启动。
-      #      v0.2 把资源路径写死成 CWD 相对路径，这种启动方式必然报"提示词目录不存在"。
-      # T3：迁移目录回归（拖拽/快捷方式启动路径）。exe+DLL+模型拷到 TEMP，
-      #      从非仓库 CWD 启动 --gguf-selftest：验证 DLL 依赖闭包、模型加载、
-      #      exe 目录回退在"绿色便携包"形态下成立。
-      - name: T3 迁移目录 + 非仓库 CWD 启动
+      # T3：迁移目录回归（拖拽/快捷方式启动路径）。exe+模型拷到 TEMP，从非仓库
+      #      CWD 启动 --gguf-selftest：v0.5 起 exe 是静态单文件，无 DLL 布阵步骤，
+      #      这个用例现在同时证明「单文件绿色便携」形态成立。
+      - name: T3 迁移目录 + 非仓库 CWD 启动（单文件形态）
         shell: pwsh
         run: |
           $repo = $PWD.Path
           $pkg = Join-Path $env:TEMP "qsa-pkg"
           Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path "$pkg\models\qwen3-asr-s2tt" | Out-Null
-          Copy-Item target/release/*.dll $pkg/
           Copy-Item target/release/subtitle-assistant.exe $pkg/
           Copy-Item models/qwen3-asr-s2tt/*.gguf "$pkg\models\qwen3-asr-s2tt\"
           Write-Host "从 CWD=$env:TEMP 启动 $pkg\subtitle-assistant.exe --gguf-selftest"
@@ -396,9 +492,11 @@ jobs:
           python -c "import pathlib,sys; t=pathlib.Path('media/t3.log').read_text(encoding='utf-8',errors='replace'); ok='自检通过' in t; print('T3 日志含自检通过:', ok); sys.exit(0 if ok else 1)"
           if ($LASTEXITCODE -ne 0) { throw "T3 断言失败" }
 
-      # ============ T1：真实 bilibili 日语视频全流程（放最后，媒体拉取有不确定性） ============
-      # 一次调用喂多个文件：顺带验证"模型跨文件复用"（QC 模式下 ASR+LLM 只加载一次）。
-      - name: T1 真实日语视频全流程（S2TT 直出中文）
+      # ============ T1：真实日语视频全流程（默认参数 = 用户开箱体验） ============
+      # 一次调用喂多个文件：顺带验证"模型跨文件复用"。默认参数下同时回归三个
+      # v0.5 用户可见行为：终端清洁（诊断进日志文件）、单 .srt 输出（无 .raw.srt）、
+      # 碎片过滤默认关闭。
+      - name: T1 真实日语视频全流程（默认参数，捕获终端输出）
         shell: pwsh
         run: |
           if (-not $env:MEDIA_LIST) {
@@ -407,23 +505,32 @@ jobs:
             exit 0
           }
           $files = $env:MEDIA_LIST -split ';'
-          Write-Host "=== 待处理 $($files.Count) 个视频（单模型直出，无任何 LLM 段） ==="
+          Write-Host "=== 待处理 $($files.Count) 个视频（单模型直出，流式 VAD→ASR） ==="
           $sw = [Diagnostics.Stopwatch]::StartNew()
           & ./target/release/subtitle-assistant.exe --no-pause `
               --asr-model-dir models/qwen3-asr-s2tt `
-              --log-file media/t1.log @files
+              --log-file media/t1.log @files *> media/t1_console.txt
           $code = $LASTEXITCODE
           $sw.Stop()
           Write-Host "T1 退出码=$code 耗时=$([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟"
+          Write-Host "--- 终端输出（应为精简的进度/结果级信息） ---"
+          Get-Content media/t1_console.txt
+          Write-Host "--- media 目录 ---"
           Get-ChildItem media | Select-Object Name, Length | Format-Table -AutoSize
           if ($code -ne 0) { throw "T1 退出码非 0（详见 media/t1.log 末尾）" }
 
-      - name: T1 断言（直出必须是中文、密度达标、排版合规）
+      - name: T1 断言（直出中文、密度、排版 + 终端清洁 + 单 srt 输出）
         shell: pwsh
         run: |
           if ($env:T1_SKIPPED) { Write-Warning "T1 已跳过"; exit 0 }
           python scripts/check_s2tt_e2e.py translate $env:MEDIA_LIST
-          if ($LASTEXITCODE -ne 0) { throw "T1 断言失败" }
+          if ($LASTEXITCODE -ne 0) { throw "T1 质量断言失败" }
+          # 终端清洁度 + 日志文件全量诊断 + 默认无 .raw.srt
+          python scripts/check_console_clean.py media/t1_console.txt media/t1.log
+          if ($LASTEXITCODE -ne 0) { throw "T1 终端清洁度断言失败" }
+          $raw = @(Get-ChildItem media -Filter *.raw.srt -ErrorAction SilentlyContinue)
+          if ($raw.Count -gt 0) { throw "默认不应产出 .raw.srt，实际: $($raw.Name -join ', ')" }
+          Write-Host "T1 全部断言通过（质量 + 终端清洁 + 单 srt 输出）"
 
       # T1b：任务开关对照——同一模型不带 context 必须仍是日语转写（证明直出中文
       #      是微调+开关的行为，而不是模型被训成"只会中文"）
@@ -439,6 +546,34 @@ jobs:
           python scripts/check_s2tt_e2e.py transcribe media/t1b
           if ($LASTEXITCODE -ne 0) { throw "T1b 断言失败：不带 context 不再是日语（任务开关失效）" }
 
+      # T1c：v0.5 三个新开关的对照回归——
+      #   --verbose      终端应出现 debug 级明细（逐段 ASR、llama 原生日志）
+      #   --filter-fragments  总结行应报告碎片过滤统计
+      #   --raw-srt      应额外产出 .raw.srt（且仅在此 flag 下）
+      - name: T1c 对照（--verbose --filter-fragments --raw-srt）
+        shell: pwsh
+        run: |
+          if ($env:T1_SKIPPED) { exit 0 }
+          $one = ($env:MEDIA_LIST -split ';')[0]
+          & ./target/release/subtitle-assistant.exe --no-pause `
+              --verbose --filter-fragments --raw-srt `
+              --asr-model-dir models/qwen3-asr-s2tt --output-dir media/t1c `
+              --log-file media/t1c.log $one *> media/t1c_console.txt
+          if ($LASTEXITCODE -ne 0) { throw "T1c 退出码非 0" }
+          Get-Content media/t1c_console.txt | Select-Object -First 30
+          python scripts/check_console_clean.py media/t1c_console.txt media/t1c.log --verbose-run
+          if ($LASTEXITCODE -ne 0) { throw "T1c verbose 断言失败：--verbose 未放开诊断输出" }
+          $raw = @(Get-ChildItem media/t1c -Filter *.raw.srt -ErrorAction SilentlyContinue)
+          if ($raw.Count -eq 0) { throw "T1c 断言失败：--raw-srt 未产出 .raw.srt" }
+          $srt = @(Get-ChildItem media/t1c -Filter *.srt | Where-Object { $_.Name -notlike '*.raw.srt' })
+          if ($srt.Count -ne 1) { throw "T1c 断言失败：应有且仅有 1 个最终 srt，实际 $($srt.Count)" }
+          # 过滤开启时总结行应带过滤统计
+          python -c "import pathlib,sys; t=pathlib.Path('media/t1c.log').read_text(encoding='utf-8',errors='replace'); ok=('碎片过滤' in t) or ('丢弃' in t); print('T1c 日志含过滤统计:', ok); sys.exit(0 if ok else 1)"
+          if ($LASTEXITCODE -ne 0) { throw "T1c 断言失败：--filter-fragments 未生效" }
+          # 质量断言（目录形态）：过滤开启后的产出仍须是合规中文字幕
+          python scripts/check_s2tt_e2e.py translate media/t1c
+          if ($LASTEXITCODE -ne 0) { throw "T1c 质量断言失败" }
+
       - name: Upload e2e results
         if: always()
         uses: actions/upload-artifact@v4
@@ -447,40 +582,44 @@ jobs:
           path: |
             media/*.srt
             media/*.log
-            media/t4/*.srt
+            media/*.txt
+            media/t1b/*.srt
+            media/t1c/*
           if-no-files-found: warn
           retention-days: 30
 
   # ----------------------------------------------------------------- 发布
+  # v0.5 发布物：4 平台单文件二进制 + S2TT GGUF 模型 + SHA256SUMS（不再打大 zip）。
   release:
-    name: 打包发行包 + 创建 GitHub Release
+    name: 收集 4 平台单文件二进制 + 模型 → GitHub Release
     needs: [build, e2e]
     if: github.event_name == 'workflow_dispatch' && inputs.release
-    runs-on: windows-latest
-    timeout-minutes: 180
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download runtime bundle
+      - name: Download all platform binaries
         uses: actions/download-artifact@v4
         with:
-          name: win-x64-runtime
-          path: target/release   # 见 e2e job 中的说明：包内不含 target/release 前缀
+          pattern: bin-*
+          path: bins
+          merge-multiple: true
 
       - name: Resolve version
         id: ver
-        shell: pwsh
+        shell: bash
         run: |
-          $v = "${{ inputs.version }}"
-          if (-not $v) {
-            $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
-            $v = "v" + $m.Matches[0].Groups[1].Value
-          }
-          if ($v -notmatch '^v') { $v = "v$v" }
-          Write-Host "release version: $v"
-          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          V="${{ inputs.version }}"
+          if [ -z "$V" ]; then
+            V="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          case "$V" in v*) ;; *) V="v$V" ;; esac
+          echo "release version: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: Restore s2tt GGUF（跨 OS 缓存，path 与 save 端一致）
+      - name: Restore s2tt GGUF（模型资产，跨 OS 缓存，path 与 save 端一致）
+        id: gguf-rel
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -489,30 +628,88 @@ jobs:
           key: qwen3-s2tt-gguf-1.7B-v1
           enableCrossOsArchive: true
 
-      - name: 打包快速直出版单文件包
-        shell: pwsh
+      - name: Assemble release assets
+        shell: bash
         run: |
-          pip install --quiet pefile
-          python scripts/package_fast.py `
-            --exe target/release/subtitle-assistant.exe `
-            --build-dir target/release `
-            --gguf-dir . `
-            --version ${{ steps.ver.outputs.version }} `
-            --out dist
+          set -e
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          ls -lh bins/
+          # 4 平台二进制：统一命名 subtitle-assistant-<ver>-<platform>
+          declare -A MAP=(
+            [subtitle-assistant-windows-x64.exe]="subtitle-assistant-$VER-windows-x64.exe"
+            [subtitle-assistant-linux-x64]="subtitle-assistant-$VER-linux-x64"
+            [subtitle-assistant-linux-arm64]="subtitle-assistant-$VER-linux-arm64"
+            [subtitle-assistant-macos-arm64]="subtitle-assistant-$VER-macos-arm64"
+          )
+          for src in "${!MAP[@]}"; do
+            [ -f "bins/$src" ] || { echo "缺少平台产物: $src"; exit 1; }
+            cp "bins/$src" "dist/${MAP[$src]}"
+            chmod +x "dist/${MAP[$src]}" || true
+          done
+          # 模型资产（缓存 miss 则中止——没有模型的 Release 对用户无意义）
+          [ "${{ steps.gguf-rel.outputs.cache-hit }}" = "true" ] || {
+            echo "s2tt GGUF 缓存缺失，无法随 Release 发布模型"; exit 1; }
+          cp s2tt-Q4_K_M.gguf "dist/s2tt-Q4_K_M.gguf"
+          cp mmproj-s2tt-q8.gguf "dist/mmproj-s2tt-q8.gguf"
+          # 校验和
+          ( cd dist && sha256sum * > SHA256SUMS.txt )
+          cat dist/SHA256SUMS.txt
+          ls -lh dist/
 
-      - name: Show SHA256SUMS
-        shell: pwsh
-        run: Get-Content dist/SHA256SUMS.txt
+      - name: Write release notes
+        id: notes
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          cat > RELEASE_BODY.md <<NOTES
+          ## $VER —— 单一可执行文件发行
+
+          **下载对应平台的二进制 + 两个模型文件**，按下面目录摆放即可使用（需要系统 PATH 里有 ffmpeg）：
+
+          \`\`\`
+          任意目录/
+          ├── subtitle-assistant-<平台>        # 本 Release 的单文件二进制（无 DLL/so 伴生）
+          └── models/qwen3-asr-s2tt/
+              ├── s2tt-Q4_K_M.gguf           # LM（下载后放这里，文件名保持不变即可被自动识别）
+              └── mmproj-s2tt-q8.gguf        # 音频编码器（mmproj 前缀自动识别）
+          \`\`\`
+
+          | 平台 | 资产 | 推理设备 |
+          |---|---|---|
+          | Windows x64 | \`*-windows-x64.exe\` | CPU（OpenMP 多线程；需 VC++ 运行库的 vcomp140.dll，绝大多数机器已随常见软件安装） |
+          | Linux x64 | \`*-linux-x64\` | CPU（glibc ≥ 2.39，Ubuntu 24.04 工具链构建） |
+          | Linux arm64 | \`*-linux-arm64\` | CPU |
+          | macOS Apple Silicon | \`*-macos-arm64\` | **Metal GPU 加速默认开启**，CPU 兜底 |
+
+          用法：把视频/音频拖到可执行文件上，或 \`subtitle-assistant 视频.mp4\`；
+          同目录得到排版好的 \`视频.srt\`（默认直出中文；\`--context ""\` 转写源语言）。
+
+          ### v0.5 相对 v0.4 的行为变化
+          * **单一可执行文件**：llama.cpp/mtmd 静态链接进二进制；macOS 带 Metal GPU 加速；
+            Windows/Linux 单文件版为纯 CPU（CUDA/Vulkan 需要动态链接形态，自行源码构建
+            \`--features dynamic-link\`，见 README）。
+          * **流式管线**：VAD 切出一段立即送 ASR（不再全片切完再整批转录），首条字幕
+            等待时间 ≈ 第一句话时长；内存有界。
+          * **终端默认干净**：模型加载/逐段诊断全部转入 \`--log-file\`（恒全量）或
+            \`--verbose\`；默认只显示进度与结果。
+          * **单输出文件**：默认只产出 \`.srt\`；排版前对照 \`.raw.srt\` 需 \`--raw-srt\`。
+          * **碎片过滤默认关闭**：lang=None 短碎片的启发式丢弃需显式 \`--filter-fragments\`
+            （空文本段始终跳过——无内容可写）。
+          NOTES
+          # 去缩进（heredoc 里的前导空格）
+          sed -i 's/^          //' RELEASE_BODY.md
+          echo "notes written: $(wc -l < RELEASE_BODY.md) lines"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.version }}
           name: ${{ steps.ver.outputs.version }}
+          body_path: RELEASE_BODY.md
           generate_release_notes: true
           files: |
-            dist/*.zip
-            dist/SHA256SUMS.txt
+            dist/*
 
       - name: Upload checksums artifact
         uses: actions/upload-artifact@v4
