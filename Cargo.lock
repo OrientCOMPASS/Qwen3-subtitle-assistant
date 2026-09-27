@@ -1372,6 +1372,7 @@ dependencies = [
  "env_logger",
  "indicatif",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "log",
  "serde",
  "serde_json",
