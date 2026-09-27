@@ -168,6 +168,11 @@ qwen3-asr-1.7B-int8`），导出器与 k2-fsa 官方包不同——命名可能�
 
 ## 8. 运行时切换决策：llama.cpp/GGUF 取代 ORT 补丁路线（2026-09-26，用户决策）
 
+> **状态注记（E3 完成后）**：本节与 §2–§5 的 ONNX 补丁路线（B2）已按用户决策
+> **归档**——产品运行时定为 llama.cpp/GGUF，双模型工作流已移除，相关工具
+> （inspect/patch/verify_onnx、s2tt_pipeline、probe 系列）已从仓库删除，
+> 结论与实测数据保留在 git 历史（commits ≤ 19124f5）与本文档中。
+
 **决策**：放弃「sherpa-onnx/ONNX 权重补丁」作为最终运行时（B2 仅作已验证的中间成果
 保留在实验线），产品改用 **llama.cpp（GGUF）** 推理 S2TT 模型；同时**移除双模型
 工作流**（ASR→LLM 四段），产品收敛为单模型直出。动机（三条硬需求 ORT 路线都别扭）：

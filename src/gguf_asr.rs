@@ -69,6 +69,52 @@ fn init_backends(cuda_libs: Option<&Path>) {
     });
 }
 
+/// 按优先级挑一个 GPU 设备：want_cuda=true 时优先 CUDA 后端设备；
+/// 否则（及 CUDA 缺席时）取 Vulkan 设备中索引最大者（多显卡机器上索引 0 常是
+/// 显示卡/核显，索引最大的通常是主力独显——用户明确要求的策略）。
+fn pick_device(want_cuda: bool) -> Option<sys::ggml_backend_dev_t> {
+    use sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU as GPU;
+    use sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU as IGPU;
+    unsafe {
+        let n = sys::ggml_backend_dev_count();
+        let mut gpus: Vec<(usize, sys::ggml_backend_dev_t, String)> = Vec::new();
+        for i in 0..n {
+            let dev = sys::ggml_backend_dev_get(i);
+            if dev.is_null() {
+                continue;
+            }
+            let ty = sys::ggml_backend_dev_type(dev);
+            if ty != GPU && ty != IGPU {
+                continue;
+            }
+            let name = CStr::from_ptr(sys::ggml_backend_dev_name(dev))
+                .to_string_lossy().into_owned();
+            gpus.push((i, dev, name));
+        }
+        if gpus.is_empty() {
+            return None;
+        }
+        let pick = if want_cuda {
+            match gpus.iter().rev().find(|(_, _, n)| n.to_lowercase().contains("cuda")) {
+                Some(p) => Some(p),
+                None => {
+                    log::warn!("--cuda-libs 已指定但未发现 CUDA 后端设备（ggml-cuda.dll 加载失败？），回退其他 GPU");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let pick = pick
+            .or_else(|| gpus.iter().rev().find(|(_, _, n)| n.to_lowercase().contains("vulkan")))
+            .or_else(|| gpus.last());
+        pick.map(|(i, dev, name)| {
+            info!("选定推理设备: [{}] {}（权重将全量入显存，主机副本随后释放）", i, name);
+            dev
+        })
+    }
+}
+
 /// GGUF 版 Qwen3-ASR（S2TT）推理引擎：LM + mmproj 音频编码器 + mtmd 上下文。
 pub struct GgufAsr {
     model: *mut sys::llama_model,
@@ -88,13 +134,36 @@ impl GgufAsr {
     /// `ngl`：offload 到 GPU 的层数（999=全量，llama 按模型实际层数截断；无 GPU 时
     /// 自动留在 CPU）。权重迁移显存后 ggml 会释放主机侧副本（用户需求之一）。
     pub fn open(lm: &Path, mmproj: &Path, threads: i32, ngl: i32,
-                max_new_tokens: i32, cuda_libs: Option<&Path>) -> Result<Self> {
+                max_new_tokens: i32, cuda_libs: Option<&Path>, force_cpu: bool) -> Result<Self> {
         init_backends(cuda_libs);
+
+        // 设备选择（用户要求的优先级）：
+        //   --cuda-libs 指定 → CUDA 设备；否则 Vulkan 中**索引最大**的 GPU；都没有 → CPU。
+        // 通过 llama_model_params.devices（NULL 结尾列表）钉住所选设备，
+        // 权重全量 offload 到显存后 ggml 释放主机侧副本。
+        let mut picked: Vec<sys::ggml_backend_dev_t> = Vec::new();
+        let mut ngl_effective = ngl;
+        if !force_cpu {
+            if let Some(dev) = pick_device(cuda_libs.is_some()) {
+                picked.push(dev);
+            } else {
+                info!("未发现可用 GPU 后端设备，权重留在 CPU 内存");
+                ngl_effective = 0;
+            }
+        } else {
+            info!("--device cpu：强制纯 CPU 推理");
+            ngl_effective = 0;
+        }
+        let mut devices: Vec<sys::ggml_backend_dev_t> = picked.clone();
+        devices.push(std::ptr::null_mut());
 
         unsafe {
             let c_lm = to_cstring(lm)?;
             let mut mparams = sys::llama_model_default_params();
-            mparams.n_gpu_layers = ngl;
+            mparams.n_gpu_layers = ngl_effective;
+            if !picked.is_empty() {
+                mparams.devices = devices.as_mut_ptr();
+            }
             let model = sys::llama_model_load_from_file(c_lm.as_ptr(), mparams);
             if model.is_null() {
                 bail!("GGUF 模型加载失败: {:?}（确认文件完整且为 llama.cpp 格式）", lm);
@@ -224,7 +293,7 @@ impl GgufAsr {
             let mut piece = vec![0i8; 1024];
             let mut n_tok = 0;
             while n_tok < self.max_new_tokens {
-                let tok = sys::llama_sampler_sample(smpl, self.ctx, -1);
+                let mut tok = sys::llama_sampler_sample(smpl, self.ctx, -1);
                 if sys::llama_vocab_is_eog(vocab, tok) {
                     break;
                 }
@@ -305,10 +374,10 @@ mod tests {
 
 /// `--gguf-selftest` 入口：加载模型 + 打印后端/能力/资源信息。
 /// 在用户机器上用于验证「CUDA 目录加载 / Vulkan 设备发现 / 显存迁移后内存释放」。
-pub fn selftest(lm: &Path, mmproj: &Path, threads: i32,
-                cuda_libs: Option<&Path>) -> Result<String> {
+pub fn selftest(lm: &Path, mmproj: &Path, threads: i32, ngl: i32,
+                cuda_libs: Option<&Path>, force_cpu: bool) -> Result<String> {
     let t0 = std::time::Instant::now();
-    let asr = GgufAsr::open(lm, mmproj, threads, 999, 128, cuda_libs)?;
+    let asr = GgufAsr::open(lm, mmproj, threads, ngl, 128, cuda_libs, force_cpu)?;
     let load = t0.elapsed().as_secs_f64();
 
     // 进程内存（Windows：GetProcessMemoryInfo；其他平台退化为不可用）

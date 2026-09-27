@@ -21,10 +21,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调；gpu-train=GPU 训练；onnx-inspect=Gate1 探针；onnx-patch=Gate2 补丁+sherpa-onnx 验证；gguf-e1=GGUF 运行时探针；gguf-e2=GGUF 全链路(合并→转换→量化→直出中文)"
+        description: "运行模式：cpu-smoke=管线冒烟(stub)；real-mini=CPU 真实微调；gpu-train=GPU 训练；gguf-e2=产品模型产线(合并→GGUF→量化→直出中文断言→存跨OS缓存)"
         type: choice
         default: "cpu-smoke"
-        options: [cpu-smoke, real-mini, gpu-train, onnx-inspect, onnx-patch, gguf-e1, gguf-e2]
+        options: [cpu-smoke, real-mini, gpu-train, gguf-e2]
       model:
         description: "基座模型"
         type: choice
@@ -411,306 +411,6 @@ jobs:
   # projector/tokenizer 原样复用）。本 job 是动手术前的全部前置事实核查：
   # 张量地图（命名/dtype/量化 axis/scale-zp）、HF↔ONNX 同源抽样、ΔW 幅度、
   # 按原 scale 重量化的削顶率。详见 finetune/INTEGRATION.md 与脚本 docstring。
-  onnx-inspect:
-    name: ONNX 权重补丁可行性探针（LoRA→decoder.int8）
-    if: ${{ inputs.mode == 'onnx-inspect' }}
-    runs-on: windows-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Console UTF-8
-        shell: pwsh
-        run: |
-          chcp 65001 | Out-Null
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 还原产品模型缓存（0.6B，master CI 建好）
-        if: env.MODEL_TAG == '0.6B'
-        uses: actions/cache/restore@v4
-        with:
-          path: models
-          key: qwen3-models-v4-0.6B
-          fail-on-cache-miss: true
-
-      # 1.7B 是社区导出包（thieunv-asilla），不在产品缓存里：HF 逐文件下载 + 独立缓存。
-      # 文件布局与 0.6B 官方包一致（conv_frontend/encoder.int8/decoder.int8/tokenizer）。
-      - name: 缓存 1.7B 社区 ONNX 包
-        if: env.MODEL_TAG == '1.7B'
-        uses: actions/cache@v4
-        with:
-          path: models/sherpa-onnx-qwen3-asr-1.7B-int8
-          key: qwen3-asr-1.7B-onnx-v1
-
-      - name: 下载 1.7B ONNX（缓存 miss 时，~2.3GB）
-        if: env.MODEL_TAG == '1.7B'
-        shell: bash
-        run: |
-          set -e
-          d=models/sherpa-onnx-qwen3-asr-1.7B-int8
-          if [ -f "$d/decoder.int8.onnx" ]; then echo "已缓存，跳过下载"; ls -la "$d"; exit 0; fi
-          mkdir -p "$d/tokenizer"
-          base="https://huggingface.co/thieunv-asilla/sherpa-onnx-qwen3-asr-1.7B-int8/resolve/main"
-          for f in conv_frontend.onnx encoder.int8.onnx decoder.int8.onnx tokenizer/vocab.json tokenizer/merges.txt tokenizer/tokenizer_config.json; do
-            curl -sL --fail --retry 3 -o "$d/$f" "$base/$f"
-            echo "  $f $(du -h "$d/$f" | cut -f1)"
-          done
-
-      - name: Cache HuggingFace 基座（windows key 按模型区分）
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: hf-qwen3-asr-${{ env.MODEL_TAG }}-win-v1
-
-      - name: 安装依赖
-        run: |
-          python -m pip install --quiet --upgrade pip
-          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet onnx safetensors huggingface_hub numpy
-
-      - name: 下载 LoRA 适配器（real-mini 产物）
-        uses: actions/download-artifact@v4
-        with:
-          name: s2tt-real-mini
-          run-id: ${{ env.ADAPTER_RUN }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: art
-
-      - name: 运行探针
-        shell: pwsh
-        run: |
-          python finetune/inspect_onnx_lora.py `
-            --model-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-int8 `
-            --hf-model ${{ inputs.model }} `
-            --adapter art/out/real/lora `
-            --out out/inspect/onnx_patch_report.json
-          if ($LASTEXITCODE -ne 0) { throw "探针运行失败" }
-
-      - name: 上传探针报告
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: s2tt-onnx-inspect
-          path: out/inspect/onnx_patch_report.json
-          if-no-files-found: warn
-          retention-days: 60
-
-  # ------------------------------------------------------------------ Gate 2
-  # 补丁器把 LoRA ΔW 写回官方 int8 ONNX（Gate 1 已实证 250/250 可映射、削顶 0.109%），
-  # 然后在**产品同款运行时 sherpa-onnx**（pip 1.13.8，与 Cargo 依赖同版本）上验证
-  # 三项行为：hotwords 直出中文 / 不带仍日语 / 静音空输出，并与原始包对照。
-  # T4 教训：量化运行时会改变行为，PyTorch 侧全绿不代表 sherpa 侧成立，必须实测。
-  onnx-patch:
-    name: Gate 2：ONNX 权重补丁 + sherpa-onnx 验证
-    if: ${{ inputs.mode == 'onnx-patch' }}
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Console UTF-8
-        shell: pwsh
-        run: |
-          chcp 65001 | Out-Null
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 还原产品模型缓存（0.6B，master CI 建好）
-        if: env.MODEL_TAG == '0.6B'
-        uses: actions/cache/restore@v4
-        with:
-          path: models
-          key: qwen3-models-v4-0.6B
-          fail-on-cache-miss: true
-
-      # 1.7B 是社区导出包（thieunv-asilla），不在产品缓存里：HF 逐文件下载 + 独立缓存。
-      # 文件布局与 0.6B 官方包一致（conv_frontend/encoder.int8/decoder.int8/tokenizer）。
-      - name: 缓存 1.7B 社区 ONNX 包
-        if: env.MODEL_TAG == '1.7B'
-        uses: actions/cache@v4
-        with:
-          path: models/sherpa-onnx-qwen3-asr-1.7B-int8
-          key: qwen3-asr-1.7B-onnx-v1
-
-      - name: 下载 1.7B ONNX（缓存 miss 时，~2.3GB）
-        if: env.MODEL_TAG == '1.7B'
-        shell: bash
-        run: |
-          set -e
-          d=models/sherpa-onnx-qwen3-asr-1.7B-int8
-          if [ -f "$d/decoder.int8.onnx" ]; then echo "已缓存，跳过下载"; ls -la "$d"; exit 0; fi
-          mkdir -p "$d/tokenizer"
-          base="https://huggingface.co/thieunv-asilla/sherpa-onnx-qwen3-asr-1.7B-int8/resolve/main"
-          for f in conv_frontend.onnx encoder.int8.onnx decoder.int8.onnx tokenizer/vocab.json tokenizer/merges.txt tokenizer/tokenizer_config.json; do
-            curl -sL --fail --retry 3 -o "$d/$f" "$base/$f"
-            echo "  $f $(du -h "$d/$f" | cut -f1)"
-          done
-
-      - name: Cache HuggingFace 基座（windows key 按模型区分）
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: hf-qwen3-asr-${{ env.MODEL_TAG }}-win-v1
-
-      - name: 安装依赖
-        run: |
-          python -m pip install --quiet --upgrade pip
-          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet onnx safetensors huggingface_hub numpy soundfile librosa
-          pip install --quiet "sherpa-onnx==1.13.8"
-          python -c "import sherpa_onnx; print('sherpa-onnx', sherpa_onnx.__version__ if hasattr(sherpa_onnx,'__version__') else 'ok')"
-
-      - name: 下载 LoRA 适配器
-        uses: actions/download-artifact@v4
-        with:
-          name: s2tt-real-mini
-          run-id: ${{ env.ADAPTER_RUN }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: art
-
-      - name: 运行补丁器（值匹配 -> ΔW 写回 -> 数值自检）
-        shell: pwsh
-        run: |
-          python finetune/patch_onnx_lora.py `
-            --model-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-int8 `
-            --hf-model ${{ inputs.model }} `
-            --adapter art/out/real/lora `
-            --out-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-s2tt-int8 `
-            --report out/patch/patch_report.json
-          if ($LASTEXITCODE -ne 0) { throw "补丁器失败（未映射/削顶超标/自检失败，详见 out/patch/patch_report.json）" }
-
-      - name: sherpa-onnx 运行时三项验证（补丁 vs 原始对照）
-        shell: pwsh
-        run: |
-          python finetune/verify_s2tt_onnx.py `
-            --model-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-s2tt-int8 `
-            --baseline-dir models/sherpa-onnx-qwen3-asr-${{ env.MODEL_TAG }}-int8 `
-            --threads 4 --out out/patch/verify_report.json
-          if ($LASTEXITCODE -ne 0) { throw "Gate 2 验证未通过（详见 out/patch/verify_report.json）" }
-
-      - name: 上传 Gate 2 报告
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: s2tt-onnx-patch
-          path: |
-            out/patch/patch_report.json
-            out/patch/verify_report.json
-          if-no-files-found: warn
-          retention-days: 60
-
-  # ------------------------------------------------------------------ GGUF E1
-  # 运行时切换验证（用户决策：弃 ORT/ sherpa-onnx 补丁路线，改用最适合本模型的
-  # llama.cpp/GGUF——CUDA/Vulkan 硬件加速、权重入显存即释放主机内存、可静态链接
-  # 进单 exe）。E1 用 ggml-org 官方 0.6B GGUF + llama-server 证明：
-  #   1. llama.cpp（tools/mtmd/models/qwen3a.cpp 路径）能转录 Qwen3-ASR；
-  #   2. system 段 context 通道可用（S2TT 任务开关在新运行时的等价物）；
-  #   3. CPU 计时基线。E2 才换上「合并 LoRA 后的自产 GGUF」断言直出中文。
-  gguf-e1:
-    name: GGUF 运行时 E1：官方 GGUF + llama-server 探针
-    if: ${{ inputs.mode == 'gguf-e1' }}
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Console UTF-8
-        shell: pwsh
-        run: |
-          chcp 65001 | Out-Null
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # 测试音频不依赖产品模型缓存（qwen3-models 缓存已被仓库 10GB 配额 LRU 逐出，
-      # 实测教训）：改用 k2-fsa 维护的 SenseVoice 日语测试 wav（0.23MB，URL 稳定）。
-      - name: 下载日语测试音频（SenseVoice test_wavs/ja.wav）
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          curl.exe -sL --fail --retry 3 -o ja.wav "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/test_wavs/ja.wav"
-          Get-Item ja.wav | Select-Object Name, Length
-
-      - name: 下载 llama.cpp 预编译（win-cpu-x64，pin b11201）
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $tag = "b11201"
-          curl.exe -sL --fail --retry 3 -o llama.zip "https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-win-cpu-x64.zip"
-          Expand-Archive llama.zip -DestinationPath llama-bin -Force
-          $srv = Get-ChildItem llama-bin -Recurse -Filter llama-server.exe | Select-Object -First 1
-          if (-not $srv) { throw "包里找不到 llama-server.exe" }
-          Write-Host "llama-server: $($srv.FullName)"
-          & $srv.FullName --version
-          "LLAMA_SERVER=$($srv.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: 下载官方 Qwen3-ASR-0.6B GGUF（Q8_0 + mmproj，~1.0GB）
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $base = "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main"
-          curl.exe -sL --fail --retry 3 -o asr.gguf "$base/Qwen3-ASR-0.6B-Q8_0.gguf"
-          curl.exe -sL --fail --retry 3 -o mmproj.gguf "$base/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
-          Get-Item asr.gguf, mmproj.gguf | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
-
-      - name: 音频时长
-        shell: pwsh
-        run: |
-          $secs = python -c "import wave; w=wave.open('ja.wav'); print(w.getnframes()/w.getframerate())"
-          Write-Host "ja.wav = $secs s"
-          "AUDIO_SECS=$secs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: 启动 llama-server 并跑探针
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          $p = Start-Process -FilePath $env:LLAMA_SERVER -ArgumentList @(
-            '-m', 'asr.gguf', '--mmproj', 'mmproj.gguf',
-            '--port', '8080', '--jinja', '-t', '4', '-c', '4096'
-          ) -RedirectStandardOutput server.out.log -RedirectStandardError server.err.log -PassThru -NoNewWindow
-          try {
-            python finetune/gguf_server_probe.py --url http://127.0.0.1:8080 `
-              --audio ja.wav `
-              --expect kana --audio-secs $env:AUDIO_SECS `
-              --out out/gguf/e1_report.json
-            $code = $LASTEXITCODE
-          } finally {
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          }
-          Write-Host "=== server stderr 末尾 ==="
-          Get-Content server.err.log -Tail 25 -ErrorAction SilentlyContinue
-          Get-Content server.out.log -Tail 15 -ErrorAction SilentlyContinue
-          if ($code -ne 0) { throw "GGUF E1 探针失败（退出码 $code）" }
-
-      - name: 上传 E1 报告
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: s2tt-gguf-e1
-          path: |
-            out/gguf/e1_report.json
-            server.out.log
-            server.err.log
-          if-no-files-found: warn
-          retention-days: 30
-
-  # ------------------------------------------------------------------ GGUF E2
-  # 决定性实验：1.7B LoRA 合并回 HF → llama.cpp 官方转换器出 GGUF（LM+mmproj）→
-  # Q4_K_M 量化 → llama-server 直出中文断言（--expect cjk + 静音检查 + 转写对照）。
-  # E1（run 36264747112）已证明运行时与 context 通道；E2 证明「微调进 GGUF」全链路，
-  # 并给出单文件体积账（LM Q4_K_M + mmproj Q8_0 应 ≈1.5GB < 2GiB）。
   gguf-e2:
     name: GGUF E2：LoRA 合并→转换→量化→直出中文
     if: ${{ inputs.mode == 'gguf-e2' }}
@@ -798,6 +498,18 @@ jobs:
           print(f"单文件预算（<=2 GiB，另留 ~0.2 GiB 给 exe/DLL）: {'✔ 可行' if gib <= 1.8 else '✘ 超限，需更低量化'}")
           pathlib.Path("out_size.txt").write_text(f"{gib:.3f}\n")
           PY
+
+      # 产品 CI（ci.yml e2e，windows）直接还原这份缓存跑真实视频回归——
+      # GGUF 与 OS 无关，enableCrossOsArchive 打通 ubuntu(构建)→windows(使用)。
+      - name: 缓存 s2tt GGUF（跨 OS，供产品 CI e2e 还原）
+        continue-on-error: true   # key 已存在（重跑产线）时 save 会报错，不算失败
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            s2tt-Q4_K_M.gguf
+            mmproj-s2tt-q8.gguf
+          key: qwen3-s2tt-gguf-1.7B-v1
+          enableCrossOsArchive: true
 
       - name: 启动 llama-server 并跑 E2 探针（断言直出中文 + 静音 + 转写对照）
         run: |
