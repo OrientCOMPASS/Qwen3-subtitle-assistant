@@ -419,40 +419,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:T1_SKIPPED) { Write-Warning "T1 已跳过"; exit 0 }
-          python - $env:MEDIA_LIST <<'PY'
-          import re, sys, pathlib
-          KANA = re.compile(r"[\u3040-\u30ff]"); CJK = re.compile(r"[\u4e00-\u9fff]")
-          def cues(p):
-              out=[]
-              for b in pathlib.Path(p).read_text(encoding="utf-8").strip().split("\n\n"):
-                  ls=[l for l in b.splitlines() if l.strip()]
-                  if len(ls)>=3 and "-->" in ls[1]:
-                      m=re.match(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)", ls[1])
-                      g=list(map(int,m.groups()))
-                      st=g[0]*3600+g[1]*60+g[2]+g[3]/1000; en=g[4]*3600+g[5]*60+g[6]+g[7]/1000
-                      out.append((st,en,"\n".join(ls[2:])))
-              return out
-          def width(l): return sum(2 if ord(c)>0x2E80 else 1 for c in l)
-          bad=0
-          for f in sys.argv[1].split(";"):
-              srt=str(pathlib.Path(f).with_suffix(""))+".srt"
-              cs=cues(srt)
-              txt="".join(t for _,_,t in cs); ch=[c for c in txt if not c.isspace()]; n=max(1,len(ch))
-              kana=sum(1 for c in ch if KANA.match(c))/n; cjk=sum(1 for c in ch if CJK.match(c))/n
-              end=max((e for _,e,_ in cs), default=0); minutes=max(0.05,end/60)
-              widest=max((max(width(l) for l in t.split("\n")) for _,_,t in cs), default=0)
-              longest=max((e-s for s,e,_ in cs), default=0)
-              checks=[(len(cs)>=minutes*4, f"cues {len(cs)} >= {minutes*4:.0f}"),
-                      (kana<=0.05, f"假名 {kana:.1%} <= 5%"),
-                      (cjk>=0.50, f"汉字 {cjk:.1%} >= 50%"),
-                      (widest<=44, f"最宽行 {widest} <= 44"),
-                      (longest<=16.0, f"最长 cue {longest:.1f}s <= 16s")]
-              print(f"== {srt}")
-              for ok,d in checks:
-                  print(("  ✔ " if ok else "  ✘ ")+d); bad += (not ok)
-              print("  首条:", cs[0][2][:40] if cs else "(空)")
-          sys.exit(1 if bad else 0)
-          PY
+          python scripts/check_s2tt_e2e.py translate $env:MEDIA_LIST
           if ($LASTEXITCODE -ne 0) { throw "T1 断言失败" }
 
       # T1b：任务开关对照——同一模型不带 context 必须仍是日语转写（证明直出中文
@@ -466,19 +433,7 @@ jobs:
               --asr-model-dir models/qwen3-asr-s2tt --output-dir media/t1b `
               --log-file media/t1b.log $one
           if ($LASTEXITCODE -ne 0) { throw "T1b 退出码非 0" }
-          python - <<'PY'
-          import re, sys, pathlib
-          KANA = re.compile(r"[\u3040-\u30ff]")
-          d = pathlib.Path("media/t1b")
-          srt = next(d.glob("*.srt"))
-          txt = "\n".join(l for b in srt.read_text(encoding="utf-8").split("\n\n")
-                           for l in b.splitlines()[2:])
-          ch = [c for c in txt if not c.isspace()]; n = max(1, len(ch))
-          kana = sum(1 for c in ch if KANA.match(c)) / n
-          print(f"T1b 假名占比 {kana:.1%}（应 >= 15%，仍是日语）")
-          print("样例:", txt[:60])
-          sys.exit(0 if kana >= 0.15 else 1)
-          PY
+          python scripts/check_s2tt_e2e.py transcribe media/t1b
           if ($LASTEXITCODE -ne 0) { throw "T1b 断言失败：不带 context 不再是日语（任务开关失效）" }
 
       - name: Upload e2e results
