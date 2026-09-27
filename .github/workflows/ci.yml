@@ -233,6 +233,12 @@ jobs:
             choco install ninja --no-progress -y | Out-Null
           }
           Add-Content -Path $env:GITHUB_ENV -Value "CMAKE_GENERATOR=Ninja"
+          # 双保险：钉死 rustc 的 MSVC 链接器绝对路径，任何 PATH 污染（Git 的
+          # GNU link.exe）都够不着
+          $msvcBin = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $linker = Join-Path $msvcBin.FullName "bin\Hostx64\x64\link.exe"
+          if (-not (Test-Path $linker)) { throw "未找到 MSVC link.exe: $linker" }
+          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker"
           ninja --version
           Write-Host "VULKAN_SDK=$sdk"
           Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdk"
@@ -288,8 +294,13 @@ jobs:
           # 内嵌 shader），无需额外 SDK——Xcode 即全部依赖。
 
       # ---------------- 构建 + 测试 ----------------
+      # shell 用 pwsh 而非 bash（全平台统一）：windows-vulkan 腿布阵了 vcvars
+      # 环境（INCLUDE/LIB 已设）后，cc/rustc 走"环境已配置"捷径、直接从 PATH
+      # 找 link.exe——而 bash 步骤会把 Git 的 /usr/bin 前置进 PATH，GNU
+      # link.exe 顶掉 MSVC 链接器（实测 LNK 爆炸："/usr/bin/link: extra
+      # operand"）。pwsh 步骤不注入 Git 路径，vcvars PATH 的 MSVC bin 在最前。
       - name: Build release (static single-file)
-        shell: bash
+        shell: pwsh
         run: cargo build --release ${{ matrix.features }}
 
       # 单元测试：VAD 黄金向量回放、流式 SegTracker↔批量参照 600 组等价性对拍、
