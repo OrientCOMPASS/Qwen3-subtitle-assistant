@@ -75,6 +75,8 @@ pub struct GgufAsr {
     ctx: *mut sys::llama_context,
     mtmd: *mut sys::mtmd_context,
     sample_rate: i32,
+    n_batch: i32,
+    max_new_tokens: i32,
 }
 
 // llama/mtmd 句柄在单引擎内串行使用；产品批处理线程模型与 sherpa 后端一致。
@@ -86,7 +88,7 @@ impl GgufAsr {
     /// `ngl`：offload 到 GPU 的层数（999=全量，llama 按模型实际层数截断；无 GPU 时
     /// 自动留在 CPU）。权重迁移显存后 ggml 会释放主机侧副本（用户需求之一）。
     pub fn open(lm: &Path, mmproj: &Path, threads: i32, ngl: i32,
-                cuda_libs: Option<&Path>) -> Result<Self> {
+                max_new_tokens: i32, cuda_libs: Option<&Path>) -> Result<Self> {
         init_backends(cuda_libs);
 
         unsafe {
@@ -100,7 +102,7 @@ impl GgufAsr {
 
             let mut cparams = sys::llama_context_default_params();
             cparams.n_ctx = 4096;       // 音频 12.5 token/s + 文本 prompt + 生成，4k 足够单段
-            cparams.n_batch = 2048;
+            cparams.n_batch = 2048;     // 音频 chunk 一次 prefill 需要较大 batch
             cparams.n_threads = threads.max(1);
             cparams.n_threads_batch = threads.max(1);
             let ctx = sys::llama_init_from_model(model, cparams);
@@ -126,7 +128,8 @@ impl GgufAsr {
             }
             let sample_rate = sys::mtmd_get_audio_sample_rate(mtmd);
 
-            Ok(Self { model, ctx, mtmd, sample_rate })
+            Ok(Self { model, ctx, mtmd, sample_rate, n_batch: cparams.n_batch,
+                        max_new_tokens: max_new_tokens.max(16) })
         }
     }
 
@@ -140,14 +143,112 @@ impl GgufAsr {
         unsafe { sys::llama_model_size(self.model) as f64 / 1e6 }
     }
 
-    /// 转录一段 16kHz f32 单声道音频，`context` 为任务开关（进 system 段，
-    /// "translate to Chinese"=直出中文；空串=转写）。
+    /// 转录一段 16kHz f32 单声道音频；`context` 为任务开关（进 system 段：
+    /// "translate to Chinese"=直出中文，空串=转写）。返回**解析后的正文**
+    /// （原始输出 `language X<asr_text>正文`；`language None`/空正文 → 空串，
+    /// 与产品「静音段丢弃」语义一致）。
     ///
-    /// TODO(E3-Phase 1b)：mtmd_tokenize(text+bitmap) → mtmd_helper_eval_chunks →
-    /// greedy 采样循环 → detokenize → 解析 `language X<asr_text>正文`
-    /// （`language None` → 空串，与产品「静音段丢弃」语义一致）。
-    pub fn transcribe(&mut self, _samples: &[f32], _context: &str) -> Result<String> {
-        bail!("GGUF 推理链将在 E3-Phase 1b 接入（本版本仅验证加载/链接，见 --gguf-selftest）")
+    /// 推理链（与 llama.cpp mtmd-helper / llama-server 同款语义，E2 已实证）：
+    /// 清 KV → 模板拼 prompt（Qwen3-ASR 固定 chat 模板，音频位用 mtmd marker）→
+    /// mtmd_tokenize(text+audio bitmap) → mtmd_helper_eval_chunks（一次完成
+    /// 音频编码与文本 prefill）→ greedy 采样到 EOG → detokenize → 解析。
+    pub fn transcribe(&mut self, samples: &[f32], context: &str) -> Result<AsrUtterance> {
+        use std::os::raw::{c_char, c_int};
+
+        if samples.is_empty() {
+            return Ok(AsrUtterance { lang: "None".into(), text: String::new() });
+        }
+        unsafe {
+            // 0) 清空 KV cache（每段独立会话；-1,-1,-1 = 全部序列全部位置）
+            let mem = sys::llama_get_memory(self.ctx);
+            sys::llama_memory_seq_rm(mem, -1, -1, -1);
+
+            // 1) prompt：Qwen3-ASR 官方 chat 模板（tokenizer_config 同构 jinja 实测），
+            //    音频占位用 mtmd 的 marker（mtmd_tokenize 会在该处插入音频 chunk）
+            let marker = CStr::from_ptr(sys::mtmd_get_marker(self.mtmd))
+                .to_string_lossy().into_owned();
+            let prompt = format!(
+                "<|im_start|>system\n{context}<|im_end|>\n<|im_start|>user\n<|audio_start|>{marker}<|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+            );
+            let c_prompt = CString::new(prompt)?;
+
+            // 2) 音频 bitmap（16k f32；采样率不符时由调用方负责重采样）
+            let bitmap = sys::mtmd_bitmap_init_from_audio(samples.len(), samples.as_ptr());
+            if bitmap.is_null() {
+                bail!("mtmd_bitmap_init_from_audio 失败");
+            }
+
+            // 3) tokenize：文本按 marker 切开，音频 chunk 插到 marker 位
+            let chunks = sys::mtmd_input_chunks_init();
+            if chunks.is_null() {
+                sys::mtmd_bitmap_free(bitmap);
+                bail!("mtmd_input_chunks_init 失败");
+            }
+            let text = sys::mtmd_input_text {
+                text: c_prompt.as_ptr(),
+                text_len: c_prompt.as_bytes().len(),
+                add_special: false,   // 模板已含全部特殊 token 字面量
+                parse_special: true,  // <|im_start|> 等按特殊 token 解析
+            };
+            let bitmaps: [*const sys::mtmd_bitmap; 1] = [bitmap];
+            let rc = sys::mtmd_tokenize(self.mtmd, chunks, &text, bitmaps.as_ptr(), 1);
+            if rc != 0 {
+                sys::mtmd_input_chunks_free(chunks);
+                sys::mtmd_bitmap_free(bitmap);
+                bail!("mtmd_tokenize 失败 (rc={rc})");
+            }
+
+            // 4) prefill：文本 chunk 走 llama_decode，音频 chunk 走 mtmd 编码后拼接
+            let mut n_past: sys::llama_pos = 0;
+            let rc = sys::mtmd_helper_eval_chunks(
+                self.mtmd, self.ctx, chunks,
+                0,       // n_past 起点
+                0,       // seq_id
+                self.n_batch,
+                true,    // logits_last：末位出 logits 供采样
+                &mut n_past,
+            );
+            sys::mtmd_input_chunks_free(chunks);
+            sys::mtmd_bitmap_free(bitmap);
+            if rc != 0 {
+                bail!("mtmd_helper_eval_chunks 失败 (rc={rc})");
+            }
+
+            // 5) greedy 采样（与产品 sherpa 后端 greedy_search、模型 generation_config
+            //    do_sample=false 语义一致；Qwen3-ASR 输出确定性强，无需温度采样）
+            let vocab = sys::llama_model_get_vocab(self.model);
+            let smpl = sys::llama_sampler_chain_init(sys::llama_sampler_chain_default_params());
+            sys::llama_sampler_chain_add(smpl, sys::llama_sampler_init_greedy());
+
+            let mut out = Vec::<u8>::new();
+            let mut piece = vec![0i8; 1024];
+            let mut n_tok = 0;
+            while n_tok < self.max_new_tokens {
+                let tok = sys::llama_sampler_sample(smpl, self.ctx, -1);
+                if sys::llama_vocab_is_eog(vocab, tok) {
+                    break;
+                }
+                let n = sys::llama_token_to_piece(
+                    vocab, piece.as_mut_ptr() as *mut c_char,
+                    piece.len() as c_int, tok, true,
+                );
+                if n > 0 {
+                    out.extend_from_slice(std::slice::from_raw_parts(
+                        piece.as_ptr() as *const u8, n as usize));
+                }
+                let mut batch = sys::llama_batch_get_one(&mut tok as *mut sys::llama_token, 1);
+                if sys::llama_decode(self.ctx, batch) != 0 {
+                    break;
+                }
+                n_tok += 1;
+            }
+            sys::llama_sampler_free(smpl);
+            let raw = String::from_utf8_lossy(&out).into_owned();
+
+            // 6) 解析 `language X<asr_text>正文`（llama.cpp 不做解析，返回原始输出——
+            //    与 sherpa/qwen-asr 运行时的差异点，E1 已实测确认）
+            Ok(parse_asr_output(&raw))
+        }
     }
 }
 
@@ -161,12 +262,53 @@ impl Drop for GgufAsr {
     }
 }
 
+/// 一次转录的解析结果。`lang` 为 "None" 表示模型判定无有效语音——
+/// 丢弃策略（与 finetune/s2tt_pipeline.py 实测结论一致）：
+/// 正文为空 → 丢弃；lang=None 但带正文 → 短碎片(<2s 或 <4 字)是幻觉丢弃、长段是真实语音保留。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrUtterance {
+    pub lang: String,
+    pub text: String,
+}
+
+/// 解析 Qwen3-ASR 原始输出 `language X<asr_text>正文`。
+fn parse_asr_output(raw: &str) -> AsrUtterance {
+    let s = raw.trim();
+    match s.split_once("<asr_text>") {
+        Some((head, body)) => AsrUtterance {
+            lang: head.trim().trim_start_matches("language").trim().to_string(),
+            text: body.trim().to_string(),
+        },
+        None => AsrUtterance { lang: String::new(), text: s.to_string() },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_asr_output;
+
+    #[test]
+    fn parse_asr_output_variants() {
+        let r = parse_asr_output("language Japanese<asr_text>こんにちは");
+        assert_eq!((r.lang.as_str(), r.text.as_str()), ("Japanese", "こんにちは"));
+        let r = parse_asr_output("language None<asr_text>");
+        assert_eq!((r.lang.as_str(), r.text.as_str()), ("None", ""));
+        let r = parse_asr_output("language Chinese<asr_text> 你好。 ");
+        assert_eq!((r.lang.as_str(), r.text.as_str()), ("Chinese", "你好。"));
+        let r = parse_asr_output("裸文本无标签");
+        assert_eq!((r.lang.as_str(), r.text.as_str()), ("", "裸文本无标签"));
+        // lang=None 但带正文（实测存在）：正文保留，交由调用方按时长/字数分流
+        let r = parse_asr_output("language None<asr_text>今天");
+        assert_eq!((r.lang.as_str(), r.text.as_str()), ("None", "今天"));
+    }
+}
+
 /// `--gguf-selftest` 入口：加载模型 + 打印后端/能力/资源信息。
 /// 在用户机器上用于验证「CUDA 目录加载 / Vulkan 设备发现 / 显存迁移后内存释放」。
 pub fn selftest(lm: &Path, mmproj: &Path, threads: i32,
                 cuda_libs: Option<&Path>) -> Result<String> {
     let t0 = std::time::Instant::now();
-    let asr = GgufAsr::open(lm, mmproj, threads, 999, cuda_libs)?;
+    let asr = GgufAsr::open(lm, mmproj, threads, 999, 128, cuda_libs)?;
     let load = t0.elapsed().as_secs_f64();
 
     // 进程内存（Windows：GetProcessMemoryInfo；其他平台退化为不可用）
