@@ -257,8 +257,11 @@ jobs:
 
       # ---------------- S2TT GGUF 模型（跨 OS 缓存，由 finetune.yml gguf-e2 产线在
       # ubuntu 上构建后 enableCrossOsArchive 保存；这里 windows 直接还原） ----------------
-      # 注意：actions/cache 的 version 哈希包含 path 列表——restore 的 path 必须与
-      # finetune.yml gguf-e2 save 时完全一致（两个根级文件名），否则查不到。
+      # 注意两个 actions/cache 的坑（都实际踩过）：
+      # 1) version 哈希包含 path 列表——restore 的 path 必须与 finetune.yml gguf-e2
+      #    save 时完全一致（两个根级文件名），否则报 "Cache not found"；
+      # 2) 缓存按分支作用域隔离——gguf-e2 必须曾在**本分支**跑过，master 的 CI 才
+      #    能看到它存的缓存（换分支开发时先在新分支 dispatch 一次 gguf-e2）。
       - name: Restore s2tt GGUF (1.7B Q4_K_M + mmproj)
         id: gguf-cache
         uses: actions/cache/restore@v4
