@@ -219,3 +219,55 @@ qwen3-asr-1.7B-int8`），导出器与 k2-fsa 官方包不同——命名可能�
      发现机制），ggml 权重迁移显存后释放主机副本；CPU 兜底；
   5. 单文件打包：v1 = 单 zip（exe+DLL+GGUF ≈1.5GiB，体积断言 ≤2GiB）；
      v2 可选 = GGUF include_bytes! 嵌入 exe + 首启解压缓存（真·单执行文件）。
+
+## 9. E3 实施蓝图：单模型产品（llama.cpp/GGUF 运行时）
+
+> 用户已拍板：移除双模型工作流；硬件加速优先级 CUDA（外置库按指定路径加载）>
+> 通用 GPU（期望"小而内联"）> CPU；入显存后释放主机内存；单文件打包。
+
+### 9.1 关键事实（全部已核实）
+
+* `llama-cpp-sys-2` 0.1.157（产品已锁版本）**自带 `mtmd` feature**：bindgen
+  `allowlist_item("mtmd_.*")` 自动生成全部 mtmd 绑定——**无需手写 FFI**；
+  另有 `vulkan`/`cuda`/`dynamic-backends` features；
+* `tools/mtmd/mtmd-helper.cpp` 提供高层入口（`mtmd_helper_eval_chunks`），
+  音频走 `mtmd_bitmap_init_from_audio(n_samples, f32*)`（E1/E2 已实测该链路）；
+* **llama.cpp 没有 DirectML 后端**（DML 的唯一宿主是 ORT，已被否决）。
+  「小而通用的 GPU 路径」由 **Vulkan** 承担：`ggml-vulkan.dll`（SPIR-V 内嵌，
+  数十 MB）随包发布，`vulkan-1.dll` 为 Win10/11 系统自带、ICD 随显卡驱动——
+  用户零安装，覆盖 NVIDIA/AMD/Intel。v1 以同包 DLL 形式发布（配合产品已有
+  `dynamic-backends` 发现机制，**构建机无需 Vulkan SDK**）；v2 可选 CI 装 SDK
+  后开 `vulkan` feature 静态内联进 exe（真·内置）；
+* CUDA：`ggml-cuda.dll` 取官方 release（与 sys crate pin 的 llama.cpp 版本对齐，
+  同现有 package_dist.py 的 CUDA DLL 策略），NVIDIA 运行库（cudart/cublas/cudnn）
+  **不随包**——用户 `--cuda-libs <dir>` 指定，进程内 `ggml_backend_load_all_from_path`
+  （bindgen 已覆盖 `ggml_*`）加载；未指定则不启用 CUDA；
+* 设备选择「索引最大的 GPU」：ggml-vulkan 枚举为 Vulkan0..N，按名字选最大索引
+  （ggml_backend_dev_by_name，实现期核对 API）；
+* VAD：llama.cpp 树内**无**原生 VAD；ggml 生态标准方案是 **whisper.cpp 的
+  silero-ggml**（`models/convert-silero-vad-to-ggml.py` + `for-tests-silero-v6.2.0-ggml.bin`
+  + `examples/vad-speech-segments` 完整先例）——即用户说的「silero 转到当前框架
+  格式」兜底。**Phase 1 暂留 sherpa-onnx silero**（现成可用，不阻塞主线），
+  **Phase 2 vendor whisper.cpp 的 silero-ggml 实现**（MIT 兼容），随后彻底移除
+  sherpa/ORT DLL；
+* 显存/内存：`n_gpu_layers=999` 全量 offload，ggml 权重迁移显存后 host 侧
+  staging 副本即释放（selftest 输出加载前后 RSS 供用户机验证；CI 无 GPU 只验逻辑路径）。
+
+### 9.2 阶段划分（每阶段独立 CI 验证，随时可停）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| **1a（本轮）** | Cargo 开 `mtmd` feature + 直依赖 sys crate；`src/gguf_asr.rs` 骨架（模型/mmproj 加载、能力查询、生命周期）；`--gguf-selftest` CLI 入口 | master CI 编译+链接通过（mtmd 在 windows shared 工具链下可构建即本方案成立）；现有测试/e2e 不回归 |
+| 1b | selftest 补全推理链：mtmd_helper_eval_chunks + greedy 采样 + 原始输出解析（`language X<asr_text>`） | CI windows job 下载 E2 同款 GGUF（Q4_K_M 1.03GiB + mmproj 0.33GiB），selftest 直出中文断言 |
+| 2 | `--s2tt` 成为产品主路径：ffmpeg→VAD（暂 sherpa）→GgufAsr→排版→SRT；`--cuda-libs` 加载链 + Vulkan 设备选择；后端 DLL 打包（ggml-vulkan.dll 入包） | 与 s2tt-e2e（PyTorch 参照）同视频对照；单包体积断言 ≤2GiB |
+| 3 | **移除双模型工作流**：qc/translate/llm/prompt/prompts、GGUF-LLM 下载、`--from-srt`、sherpa ASR 后端下线；VAD 换 vendor 的 silero-ggml；README 重写 | 全量 CI（瘦身后的 T1~T3）+ 单文件打包 |
+| 4（可选） | GGUF `include_bytes!` 嵌入 exe + 首启解压缓存（真·单执行文件，PE 大节风险实测后定） | exe 体积 <2GiB + 冷启动时间 |
+
+### 9.3 单文件体积账（v1 zip，Phase 2 断言）
+
+| 组件 | 大小 |
+|---|---|
+| s2tt LM Q4_K_M + mmproj q8_0 | 1.36 GiB（E2 实测） |
+| exe + llama/ggml DLL（CPU+Vulkan 后端） | ~0.1 GiB |
+| silero VAD（phase1 sherpa DLL / phase2 ggml 模型 2MB） | ~0.04 GiB → ~0 |
+| **合计** | **≈1.5 GiB ≤ 2 GiB ✓**（余量 0.5 GiB） |
