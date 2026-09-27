@@ -101,8 +101,8 @@ impl GgufAsr {
             let mut cparams = sys::llama_context_default_params();
             cparams.n_ctx = 4096;       // 音频 12.5 token/s + 文本 prompt + 生成，4k 足够单段
             cparams.n_batch = 2048;
-            cparams.n_threads = threads.max(1) as u32;
-            cparams.n_threads_batch = threads.max(1) as u32;
+            cparams.n_threads = threads.max(1);
+            cparams.n_threads_batch = threads.max(1);
             let ctx = sys::llama_init_from_model(model, cparams);
             if ctx.is_null() {
                 sys::llama_model_free(model);
