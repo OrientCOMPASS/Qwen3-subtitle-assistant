@@ -147,7 +147,7 @@ cargo test --release         # VAD 黄金向量 / 流式段状态机↔批量参
   LNK2001 大爆炸；且 MSVC OpenMP 的 vcomp140.dll 本就没有静态版，静态 CRT 收益为零。
 * **GPU 版单文件（Windows/Linux）**：加 `--features vulkan`——Vulkan 后端静态编入，
   编译期需要 Vulkan SDK（Windows 装 LunarG SDK 并设 `VULKAN_SDK`；Linux
-  `apt install libvulkan-dev glslang-tools`）。运行期硬依赖系统 Vulkan loader
+  `apt install libvulkan-dev glslc libvulkan1`）。运行期硬依赖系统 Vulkan loader
   （vulkan-1.dll / libvulkan.so.1，GPU 驱动必带）；无 loader 的机器请用兼容版。
 * **动态链接形态（CUDA 开发者选项）**：`cargo build --release --features dynamic-link`
   产出 exe + llama/ggml DLL；此形态下 `--cuda-libs <DIR>` 可加载 llama.cpp 官方

@@ -201,6 +201,13 @@ jobs:
           if (-not $sdk -or -not (Test-Path (Join-Path $sdk 'Lib\vulkan-1.lib'))) {
             throw "Vulkan SDK 安装失败（VULKAN_SDK=$sdk）"
           }
+          if ([string]::IsNullOrEmpty($env:CL)) {
+            # /FS 强制 cl.exe 经 mspdbsrv 串行写 PDB——vulkan-shaders-gen 的
+            # 嵌套 ExternalProject TryCompile 拿不到 build.rs 注入的 /FS cflag，
+            # 并行下 C1041（cannot open program database）必炸（实测踩过）；
+            # CL 环境变量会被所有 cl.exe 调用（含嵌套 configure）吸收。
+            Add-Content -Path $env:GITHUB_ENV -Value "CL=/FS"
+          }
           Write-Host "VULKAN_SDK=$sdk"
           Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdk"
           & (Join-Path $sdk 'Bin\glslc.exe') --version | Select-Object -First 1
@@ -218,10 +225,11 @@ jobs:
           echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$LIBCLANG"
           if [ "${{ matrix.vulkan }}" = "true" ]; then
-            # 编译期：Vulkan 头/loader 桩（libvulkan-dev）+ glslc（glslang-tools）；
+            # 编译期：Vulkan 头/loader 桩（libvulkan-dev）+ glslc（Ubuntu 24.04
+            # 有独立 glslc 包——glslang-tools 不含 glslc，实测踩过）；
             # 运行期冒烟：libvulkan1（真 loader；runner 无 ICD，正好覆盖
             # 「loader 在、0 设备 → 优雅回退 CPU」路径）
-            sudo apt-get install -y -qq libvulkan-dev glslang-tools libvulkan1 >/dev/null
+            sudo apt-get install -y -qq libvulkan-dev glslc libvulkan1 >/dev/null
             glslc --version | head -1
           fi
           # static-libs feature 需要编译器自带静态库（g++/gcc 包内）
