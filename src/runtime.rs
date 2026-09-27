@@ -69,7 +69,6 @@ pub fn enable_utf8_console() {
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
     }
-    let _ = info; // 非 windows 下保持 use 有效
 }
 
 /// 处理失败时在控制台等待回车，避免拖拽/双击启动时窗口一闪而过、看不到错误。

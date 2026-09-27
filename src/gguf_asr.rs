@@ -73,8 +73,10 @@ fn init_backends(cuda_libs: Option<&Path>) {
 /// 否则（及 CUDA 缺席时）取 Vulkan 设备中索引最大者（多显卡机器上索引 0 常是
 /// 显示卡/核显，索引最大的通常是主力独显——用户明确要求的策略）。
 fn pick_device(want_cuda: bool) -> Option<sys::ggml_backend_dev_t> {
-    use sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU as GPU;
-    use sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU as IGPU;
+    // ggml_backend_dev_type 枚举序（ggml-backend.h，版本 pin 内稳定）：
+    //   CPU=0, GPU=1, IGPU=2, ACCEL=3, META=4
+    const DEV_GPU: u32 = 1;
+    const DEV_IGPU: u32 = 2;
     unsafe {
         let n = sys::ggml_backend_dev_count();
         let mut gpus: Vec<(usize, sys::ggml_backend_dev_t, String)> = Vec::new();
@@ -83,8 +85,8 @@ fn pick_device(want_cuda: bool) -> Option<sys::ggml_backend_dev_t> {
             if dev.is_null() {
                 continue;
             }
-            let ty = sys::ggml_backend_dev_type(dev);
-            if ty != GPU && ty != IGPU {
+            let ty = sys::ggml_backend_dev_type(dev) as u32;
+            if ty != DEV_GPU && ty != DEV_IGPU {
                 continue;
             }
             let name = CStr::from_ptr(sys::ggml_backend_dev_name(dev))
@@ -110,7 +112,7 @@ fn pick_device(want_cuda: bool) -> Option<sys::ggml_backend_dev_t> {
             .or_else(|| gpus.last());
         pick.map(|(i, dev, name)| {
             info!("选定推理设备: [{}] {}（权重将全量入显存，主机副本随后释放）", i, name);
-            dev
+            *dev
         })
     }
 }
@@ -197,7 +199,7 @@ impl GgufAsr {
             }
             let sample_rate = sys::mtmd_get_audio_sample_rate(mtmd);
 
-            Ok(Self { model, ctx, mtmd, sample_rate, n_batch: cparams.n_batch,
+            Ok(Self { model, ctx, mtmd, sample_rate, n_batch: cparams.n_batch as i32,
                         max_new_tokens: max_new_tokens.max(16) })
         }
     }
@@ -297,9 +299,10 @@ impl GgufAsr {
                 if sys::llama_vocab_is_eog(vocab, tok) {
                     break;
                 }
+                // 当前 llama.h 签名多一个 pos 参数（BPE 再分词位置），单 token 解码传 0
                 let n = sys::llama_token_to_piece(
                     vocab, piece.as_mut_ptr() as *mut c_char,
-                    piece.len() as c_int, tok, true,
+                    piece.len() as c_int, 0, tok, true,
                 );
                 if n > 0 {
                     out.extend_from_slice(std::slice::from_raw_parts(
