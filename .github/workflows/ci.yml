@@ -20,9 +20,9 @@
 #     macOS 默认带 Metal GPU 加速；Windows/Linux 单文件版为纯 CPU
 #     （CUDA/Vulkan 依赖共享 ggml 的动态注入，与静态单文件互斥——需要 GPU 的
 #     开发者自行 `cargo build --release --features dynamic-link`）。
-#   * Windows 静态 CRT（LLAMA_STATIC_CRT=1 + RUSTFLAGS=-Ctarget-feature=+crt-static）：
-#     无 vcruntime 依赖；OpenMP 运行库 vcomp140.dll 除外（VC++ 发行版组件，
-#     冒烟步骤会显式校验导入闭包）。
+#   * Windows CRT：双侧动态 CRT（/MD）——exe 依赖 VC++ 2015-2022 发行版的
+#     vcruntime140/ucrtbase/vcomp140（OpenMP 运行库无静态版，静态 CRT 无收益；
+#     实测强行静态会 LNK2001）。冒烟步骤显式校验 PE 导入闭包。
 #   * 默认终端只输出进度/结果级信息；诊断细节进 --log-file（恒 debug 级）或
 #     --verbose。e2e 的 T1 对终端输出做「清洁度断言」（scripts/check_console_clean.py）。
 #   * 默认只产出一个 <名>.srt；.raw.srt 需 --raw-srt。碎片过滤默认关闭，
@@ -119,10 +119,6 @@ jobs:
             selftest: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
-    env:
-      # Windows：静态 CRT（配合 RUSTFLAGS crt-static，产出零 VC 运行库依赖的 exe，
-      # OpenMP 的 vcomp140.dll 除外——冒烟步骤显式校验导入闭包）
-      LLAMA_STATIC_CRT: ${{ matrix.name == 'windows-x64' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -135,8 +131,15 @@ jobs:
           echo "release 构建：清空 target 做全量构建"
           rm -rf target
 
-      # ---------------- 平台准备（libclang for bindgen / 静态库可用性 / CRT） ----
-      - name: Prepare (Windows) — libclang + 静态 CRT RUSTFLAGS
+      # ---------------- 平台准备（libclang for bindgen / 静态库可用性） ----
+      # CRT 说明（Windows）：Rust 与 llama.cpp CMake 两侧都用【动态 CRT】（默认 /MD）。
+      # 曾尝试双侧静态 CRT（LLAMA_STATIC_CRT=1 + RUSTFLAGS=+crt-static）——实测
+      # cmake-rs 的 static_crt 未能把 /MT 传导进 llama.cpp 全部目标（LNK2001
+      # __imp_fputs 大爆炸）；且 MSVC OpenMP 运行库 vcomp140.dll 本就没有静态版、
+      # 必须随 VC++ 发行版安装，静态 CRT 收益为零。故发布 exe 依赖
+      # vcruntime140/ucrtbase/vcomp140（VC++ 2015-2022 Redistributable 组件，
+      # 绝大多数 Windows 机器已随常见软件装好）——冒烟步骤显式校验导入闭包。
+      - name: Prepare (Windows) — libclang
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -153,8 +156,6 @@ jobs:
           }
           Write-Host "Using LIBCLANG_PATH=$found"
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$found"
-          # 静态 CRT：Rust 侧 + llama.cpp CMake 侧（LLAMA_STATIC_CRT 已在 job env）
-          Add-Content -Path $env:GITHUB_ENV -Value "RUSTFLAGS=-C target-feature=+crt-static"
 
       - name: Prepare (Linux) — libclang + 静态 libstdc++/libgomp 可用性
         if: runner.os == 'Linux'
@@ -293,7 +294,8 @@ jobs:
           "$BIN" --gguf-selftest s2tt-Q4_K_M.gguf mmproj-s2tt-q8.gguf 2>&1 | tee selftest.out
           grep -q "自检通过" selftest.out
           if [ "${{ runner.os }}" = "macOS" ]; then
-            grep -qi "metal" selftest.out && echo "Metal 后端已发现 ✓" || echo "::warning::mac 腿未见 Metal 设备（自检仍通过，CPU 兜底）"
+            # Metal 设备在 ggml 里叫 MTL0/MTL1（也接受日志里直接出现 Metal 字样）
+            grep -qiE "MTL[0-9]|metal" selftest.out && echo "Metal 后端已发现 ✓" || echo "::warning::mac 腿未见 Metal 设备（自检仍通过，CPU 兜底）"
           fi
 
       # ---------------- 收集产物 ----------------
@@ -680,9 +682,9 @@ jobs:
 
           | 平台 | 资产 | 推理设备 |
           |---|---|---|
-          | Windows x64 | \`*-windows-x64.exe\` | CPU（OpenMP 多线程；需 VC++ 运行库的 vcomp140.dll，绝大多数机器已随常见软件安装） |
-          | Linux x64 | \`*-linux-x64\` | CPU（glibc ≥ 2.39，Ubuntu 24.04 工具链构建） |
-          | Linux arm64 | \`*-linux-arm64\` | CPU |
+          | Windows x64 | \`*-windows-x64.exe\` | CPU（OpenMP 多线程；需 VC++ 2015-2022 运行库的 vcruntime140/vcomp140——绝大多数机器已随常见软件安装，缺失时装 https://aka.ms/vs/17/release/vc_redist.x64.exe ；CPU 需支持 AVX2，2013 年后的 x64 均可） |
+          | Linux x64 | \`*-linux-x64\` | CPU（glibc ≥ 2.39，Ubuntu 24.04 工具链构建；AVX2 同上） |
+          | Linux arm64 | \`*-linux-arm64\` | CPU（armv8-a 基线，树莓派 4 及以上均可） |
           | macOS Apple Silicon | \`*-macos-arm64\` | **Metal GPU 加速默认开启**，CPU 兜底 |
 
           用法：把视频/音频拖到可执行文件上，或 \`subtitle-assistant 视频.mp4\`；

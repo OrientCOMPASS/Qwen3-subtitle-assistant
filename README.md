@@ -77,8 +77,9 @@ VAD 是内嵌权重的纯 Rust silero v4，**无任何 ONNX Runtime 依赖**。
 
 | 平台 | 推理设备 | 备注 |
 |---|---|---|
-| Windows x64 | CPU（OpenMP） | 静态 CRT，无 vcruntime 依赖；OpenMP 需要 `vcomp140.dll`（VC++ 2015-2022 发行版组件，绝大多数机器已随常见软件装好；缺失时装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)） |
-| Linux x64 / arm64 | CPU（OpenMP 静态链接） | 仅依赖 glibc ≥ 2.39（Ubuntu 24.04 工具链构建）；更早发行版请自行源码构建 |
+| Windows x64 | CPU（OpenMP） | 需 VC++ 2015-2022 运行库（vcruntime140/vcomp140，绝大多数机器已随常见软件装好；缺失时装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)）；CPU 需支持 AVX2（2013 年后的 x64 均可，与 llama.cpp 官方 haswell 发行同级） |
+| Linux x64 | CPU（OpenMP 静态链接） | 仅依赖 glibc ≥ 2.39（Ubuntu 24.04 工具链构建）；更早发行版请自行源码构建 |
+| Linux arm64 | CPU（OpenMP 静态链接） | armv8-a 基线（树莓派 4 及以上均可），glibc 同上 |
 | macOS Apple Silicon | **Metal GPU**（自动） | 无 GPU 环境自动 CPU 兜底（Accelerate BLAS） |
 
 环境自检：`subtitle-assistant --gguf-selftest models\qwen3-asr-s2tt\s2tt-Q4_K_M.gguf models\qwen3-asr-s2tt\mmproj-s2tt-q8.gguf`
@@ -129,9 +130,12 @@ cargo build --release        # 静态单文件（默认）：只需 CMake + LLVM
 cargo test --release         # VAD 黄金向量 / 流式段状态机↔批量参照等价性 / 排版 / SRT / 输出解析
 ```
 
-* **静态单文件形态（发布默认）**：llama.cpp/mtmd 静态编入；Windows 建议
-  `LLAMA_STATIC_CRT=1` + `RUSTFLAGS="-C target-feature=+crt-static"`（静态 CRT）；
-  Linux 加 `--features static-libs`（libstdc++/libgomp 静态）；macOS 自动含 Metal。
+* **静态单文件形态（发布默认）**：llama.cpp/mtmd 静态编入；Linux 加
+  `--features static-libs`（libstdc++/libgomp 静态，产物只剩 glibc 依赖）；
+  macOS 自动含 Metal。Windows 两侧都用默认动态 CRT（`/MD`）——不要加
+  `LLAMA_STATIC_CRT=1`/`RUSTFLAGS=-C target-feature=+crt-static`：cmake-rs 的
+  `static_crt` 传导不进 llama.cpp 全部目标，实测链接期 `__imp_fputs`/`__imp_getenv`
+  LNK2001 大爆炸；且 MSVC OpenMP 的 vcomp140.dll 本就没有静态版，静态 CRT 收益为零。
 * **动态链接形态（GPU 开发者选项）**：`cargo build --release --features dynamic-link`
   产出 exe + llama/ggml DLL；此形态下 `--cuda-libs <DIR>` 可加载 llama.cpp 官方
   release 的 `ggml-cuda.dll`（连同 cudart/cublas/cudnn 放同一目录），Vulkan 后端

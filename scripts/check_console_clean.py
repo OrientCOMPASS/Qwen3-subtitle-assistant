@@ -26,6 +26,9 @@ NOISE_MARKERS = (
     "print_info",           # 模型信息
     "init_tokenizer",       # tokenizer 初始化
     "control token",        # 特殊 token 提示（数十行）
+    "clip_model_loader",    # mtmd/clip 加载日志（mtmd_log_set 桥接对象）
+    "clip_ctx",
+    "compute buffer",       # reserve_compute_meta 显存/内存预算行
     "ggml 后端设备",         # 应用侧后端枚举（debug 级）
     "[ASR✔",                # 逐段转录明细（debug 级）
     "[ASR∅",

@@ -65,10 +65,15 @@ fn to_cstring(p: &Path) -> Result<CString> {
 fn init_backends(cuda_libs: Option<&Path>) {
     BACKEND_INIT.call_once(|| {
         unsafe {
-            // 先把原生日志接管进 log 门面（在任何 ggml/llama 输出发生之前），
-            // 否则加载期噪声会直写 stderr 刷屏。
+            // 先把原生日志接管进 log 门面（在任何 ggml/llama/mtmd 输出发生之前），
+            // 否则加载期噪声会直写 stderr 刷屏。三个回调各管一摊：
+            //   llama_log_set —— llama 核心（模型元数据 dump、tokenizer 提示…）
+            //   ggml_log_set  —— ggml 底层（后端搜索/加载、compute buffer…）
+            //   mtmd_log_set  —— mtmd/clip 音频编码库（不设则"everything is
+            //                    output on stderr"，见 mtmd.h）
             sys::llama_log_set(Some(native_log_hook), std::ptr::null_mut());
             sys::ggml_log_set(Some(native_log_hook), std::ptr::null_mut());
+            sys::mtmd_log_set(Some(native_log_hook), std::ptr::null_mut());
             sys::llama_backend_init();
         }
 
