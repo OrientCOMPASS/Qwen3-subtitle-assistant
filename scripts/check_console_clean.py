@@ -38,6 +38,7 @@ NOISE_MARKERS = (
     "[ASR∅",                # 空输出跳过明细（debug 级）
     "[ASR↻",                # 重复丢弃明细（debug 级）
     "[ASR〰",                # 连续语气词丢弃明细（debug 级）
+    "[ASR♻",                # 段内复读压缩明细（debug 级）
     "[VAD✂",                # 碎片过滤明细（debug 级）
     "排版完成",              # debug 级
     "exe 目录",              # debug 级

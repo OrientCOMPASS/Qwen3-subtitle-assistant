@@ -11,8 +11,9 @@
 //! * 内存有界（队列容量 + VAD 窗口），不再全片缓冲；
 //! * 进度条只有一条，按已解码媒体时间走，消息里带已转写段数。
 //!
-//! 丢弃策略（默认最小化）：空文本段（模型判定纯静音/噪音）无内容可写、始终跳过；
-//! 与上一条保留字幕相同的段（**去标点后**比较；重复音频/幻觉循环的常见输出）、
+//! 幻觉/重复处理（默认开启，用户规则）：空文本段（模型判定纯静音/噪音）无内容
+//! 可写、始终跳过；**段内复读压缩**——连续重复 ≥3 遍的子串只保留 2 遍
+//! （"啊！"×56 → "啊！啊！"）；与上一条保留字幕相同的段（压缩+去标点后比较）、
 //! 以及「上一条与本次都是纯语气词」的连续语气词段（哎/啊/嗯/哼…），始终丢弃；
 //! 「lang=None 短碎片=幻觉」启发式过滤默认**关闭**，`--filter-fragments` 显式开启
 //! （实测结论见 finetune/s2tt_pipeline.py：lang=None 且 <2s 或 <4 字的段多为
@@ -41,13 +42,13 @@ const KEEP_LANG_NONE_MIN_CHARS: usize = 4;
 
 /// 单段处置判定（纯函数，可单测）。
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum KeepDecision {
-    /// 保留为字幕
-    Keep,
+pub(crate) enum Verdict {
+    /// 保留为字幕；携带**复读压缩后**的最终文本（见 collapse_repeats）
+    Keep(String),
     /// 空文本（模型判定纯静音/噪音）——无内容可写，始终跳过
     EmptyText,
-    /// 与上一条保留字幕相同（**去标点后**比较；模型对重复音频/幻觉循环的
-    /// 常见输出）——丢弃
+    /// 与上一条保留字幕相同（复读压缩+去标点后比较；模型对重复音频/幻觉
+    /// 循环的常见输出）——丢弃
     Duplicate,
     /// 上一条与本次（去标点后）都是纯语气词——连续语气词是静音/背景音上最
     /// 典型的幻觉形态，丢弃本次（第一条语气词保留，不误伤真实的"嗯。"应答）
@@ -90,39 +91,95 @@ fn is_pure_filler(stripped: &str) -> bool {
         && stripped.chars().all(|c| FILLER_CHARS.contains(&c))
 }
 
-/// 判定一段 ASR 输出的去留。`last_kept_stripped` 为上一条**保留**字幕去标点
-/// 后的文本。判定顺序：空文本 → 重复（去标点）→ 连续语气词 → 碎片过滤
-/// （仅 flag 开启时）。重复与语气词规则是默认行为（用户要求）：流式管线里
-/// 长静音/循环背景音常让模型连续吐出同一句话或纯语气词，原样进字幕是最刺眼
-/// 的坏 case。
+/// 判定一段 ASR 输出的去留与最终文本。`last_kept_stripped` 为上一条**保留**
+/// 字幕（压缩+去标点后）的文本。
+///
+/// 处理顺序：空文本 → **段内复读压缩**（幻觉循环只留两遍）→ 重复（压缩+
+/// 去标点后比较）→ 连续语气词 → 碎片过滤（仅 flag 开启时）。
+/// 重复/语气词/压缩规则都是默认行为（用户要求，实例见 README）：长静音或
+/// 情绪化音频上模型常陷入复读循环——跨段的由判重/语气词规则拦截，段内的
+/// （"啊！"×56、"我爱你！妈妈，"×10 这类）由压缩规则收敛。
 fn classify_utterance(u: &AsrUtterance, dur_secs: f64, filter_fragments: bool,
-                      last_kept_stripped: Option<&str>) -> KeepDecision {
+                      last_kept_stripped: Option<&str>) -> Verdict {
     let text = u.text.trim();
     if text.is_empty() {
-        return KeepDecision::EmptyText;
+        return Verdict::EmptyText;
     }
-    let stripped = strip_punct(text);
+    let collapsed = collapse_repeats(text);
+    let stripped = strip_punct(&collapsed);
     if stripped.is_empty() {
         // 全是标点（如"……。"）：没有字幕内容可写，按空文本处理
-        return KeepDecision::EmptyText;
+        return Verdict::EmptyText;
     }
     if let Some(prev) = last_kept_stripped {
-        // 契约上 prev 已是去标点文本；再 strip 一次幂等且防御调用方状态漂移
-        let prev = strip_punct(prev);
+        // 契约上 prev 已是压缩+去标点文本；再处理一次幂等且防御调用方状态漂移
+        let prev = strip_punct(&collapse_repeats(prev));
         if stripped == prev {
-            return KeepDecision::Duplicate;
+            return Verdict::Duplicate;
         }
         if is_pure_filler(&prev) && is_pure_filler(&stripped) {
-            return KeepDecision::FillerRepeat;
+            return Verdict::FillerRepeat;
         }
     }
     if filter_fragments && u.lang.eq_ignore_ascii_case("None") {
         let chars = stripped.chars().count();
         if dur_secs < KEEP_LANG_NONE_MIN_SECS || chars < KEEP_LANG_NONE_MIN_CHARS {
-            return KeepDecision::Fragment;
+            return Verdict::Fragment;
         }
     }
-    KeepDecision::Keep
+    Verdict::Keep(collapsed)
+}
+
+/// 段内复读压缩（模型幻觉处理，用户规则）：**连续**重复 ≥3 遍的子串只保留
+/// 2 遍。例："啊！"×56 → "啊！啊！"；"让我抱抱你！呜呜呜，"×4 → ×2；
+/// 正常文本原样返回。
+///
+/// 算法：从左到右扫描；在每个位置找**最小**重复单元 L（"abcabcabc" 的单元是
+/// "abc" 而非 "abcabc"），要求同位置起连续 ≥3 次（预筛：单元重复则
+/// chars[i+L]==chars[i] 必成立）；命中则输出 2 份单元并跳过整条重复链。
+/// 单元长度上限 128 字符（幻觉循环单元都是短语级；同时约束最坏复杂度）。
+fn collapse_repeats(text: &str) -> String {
+    const MAX_UNIT: usize = 128;
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n < 3 {
+        return text.to_string();
+    }
+    let mut out: Vec<char> = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let max_l = ((n - i) / 3).min(MAX_UNIT);
+        let mut hit: Option<(usize, usize)> = None; // (单元长, 链尾)
+        let mut l = 1usize;
+        while l <= max_l {
+            // 预筛：单元在 i+l 处重复的必要条件
+            if chars[i + l] == chars[i] {
+                let unit = &chars[i..i + l];
+                let mut j = i + l;
+                let mut cnt = 1usize;
+                while j + l <= n && &chars[j..j + l] == unit {
+                    cnt += 1;
+                    j += l;
+                }
+                if cnt >= 3 {
+                    hit = Some((l, j));
+                    break;
+                }
+            }
+            l += 1;
+        }
+        match hit {
+            Some((l, j)) => {
+                out.extend_from_slice(&chars[i..i + 2 * l]); // 仅保留两遍
+                i = j;                                        // 跳过整条重复链
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// VAD→ASR 滞回缓冲队列（**按波形字节数计量**，`--buffer-mb` 调整，默认 50MB）。
@@ -270,7 +327,8 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
     let mut n_empty = 0usize;  // 空文本段（模型判定静音/噪音，无内容可写）
     let mut n_dup = 0usize;    // 与上一条字幕重复的段
     let mut n_frag = 0usize;   // --filter-fragments 丢弃的碎片段
-    let mut n_filler = 0usize; // 连续纯语气词丢弃的段
+    let mut n_filler = 0usize;    // 连续纯语气词丢弃的段
+    let mut n_collapsed = 0usize; // 触发段内复读压缩的段
     let mut last_kept_stripped: Option<String> = None; // 上一条保留字幕（去标点，判重/语气词基准）
     let mut pipeline_err: Option<anyhow::Error> = None;
 
@@ -289,31 +347,37 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
         let end_ms = ms_of(seg.start_sample + seg.samples.len());
 
         match classify_utterance(&u, dur_secs, cfg.filter_fragments, last_kept_stripped.as_deref()) {
-            KeepDecision::EmptyText => {
+            Verdict::EmptyText => {
                 n_empty += 1;
                 pb.suspend(|| debug!("[ASR∅] {:.2}s@{} 空输出（lang={}），跳过",
                                      dur_secs, format_timestamp(start_ms), u.lang));
             }
-            KeepDecision::Duplicate => {
+            Verdict::Duplicate => {
                 n_dup += 1;
                 pb.suspend(|| debug!("[ASR↻] {:.2}s@{} 与上一条相同（去标点比较），丢弃（{:?}）",
                                      dur_secs, format_timestamp(start_ms),
                                      truncate(u.text.trim(), 20)));
             }
-            KeepDecision::FillerRepeat => {
+            Verdict::FillerRepeat => {
                 n_filler += 1;
                 pb.suspend(|| debug!("[ASR〰] {:.2}s@{} 连续纯语气词，丢弃（{:?}）",
                                      dur_secs, format_timestamp(start_ms),
                                      truncate(u.text.trim(), 20)));
             }
-            KeepDecision::Fragment => {
+            Verdict::Fragment => {
                 n_frag += 1;
                 pb.suspend(|| debug!("[VAD✂] {:.2}s@{} 丢弃（lang={} text={:?}）",
                                      dur_secs, format_timestamp(start_ms), u.lang,
                                      truncate(&u.text, 20)));
             }
-            KeepDecision::Keep => {
-                let text = u.text.trim().to_string();
+            Verdict::Keep(text) => {
+                if text != u.text.trim() {
+                    n_collapsed += 1;
+                    let before = truncate(u.text.trim(), 24);
+                    let after = truncate(&text, 24);
+                    pb.suspend(|| debug!("[ASR♻] {:.2}s@{} 复读压缩: {:?} → {:?}",
+                                         dur_secs, format_timestamp(start_ms), before, after));
+                }
                 // 保留的字幕内容 = 用户关心的产出，info 级直接打到终端
                 //（v0.4 的行为；被收敛的只是加载噪声与跳过明细那类诊断）。
                 pb.suspend(|| info!("[ASR✔] {} ({:.1}s) {}",
@@ -355,6 +419,9 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
     }
     if n_filler > 0 {
         notes.push(format!("{n_filler} 段连续语气词丢弃"));
+    }
+    if n_collapsed > 0 {
+        notes.push(format!("{n_collapsed} 段复读压缩"));
     }
     if cfg.filter_fragments && n_frag > 0 {
         notes.push(format!("碎片过滤丢弃 {n_frag} 段"));
@@ -480,73 +547,119 @@ mod tests {
 
     #[test]
     fn classify_empty_text_always_skipped() {
-        assert_eq!(classify_utterance(&u("None", ""), 5.0, false, None), KeepDecision::EmptyText);
-        assert_eq!(classify_utterance(&u("Japanese", "   "), 5.0, true, None), KeepDecision::EmptyText);
+        assert_eq!(classify_utterance(&u("None", ""), 5.0, false, None), Verdict::EmptyText);
+        assert_eq!(classify_utterance(&u("Japanese", "   "), 5.0, true, None), Verdict::EmptyText);
         // 全标点 = 无内容可写，同样按空处理
-        assert_eq!(classify_utterance(&u("Chinese", "……。"), 5.0, false, None), KeepDecision::EmptyText);
+        assert_eq!(classify_utterance(&u("Chinese", "……。"), 5.0, false, None), Verdict::EmptyText);
     }
 
     #[test]
     fn classify_duplicate_ignores_punctuation() {
         // 去标点后的判重：标点差异不再放行重复句
         assert_eq!(classify_utterance(&u("Chinese", "今天天气很好。"), 3.0, false, Some("今天天气很好")),
-                   KeepDecision::Duplicate);
+                   Verdict::Duplicate);
         assert_eq!(classify_utterance(&u("Chinese", "今天天气很好，"), 3.0, false, Some("今天天气很好。")),
-                   KeepDecision::Duplicate, "基准本身带标点也应命中（调用方存的是去标点文本，此处双保险）");
+                   Verdict::Duplicate, "基准带标点也应命中（classify 内防御性再压缩+去标点）");
         // 内容不同 → 保留
         assert_eq!(classify_utterance(&u("Chinese", "今天天气很好！"), 3.0, false, Some("明天天气很好")),
-                   KeepDecision::Keep);
+                   Verdict::Keep("今天天气很好！".into()));
         // 没有上一条 → 保留
         assert_eq!(classify_utterance(&u("Chinese", "今天天气很好。"), 3.0, false, None),
-                   KeepDecision::Keep);
+                   Verdict::Keep("今天天气很好。".into()));
         // 首尾/内部空白等价
         assert_eq!(classify_utterance(&u("Chinese", " 今天 天气很好。 "), 3.0, false, Some("今天天气很好")),
-                   KeepDecision::Duplicate);
+                   Verdict::Duplicate);
     }
 
     #[test]
     fn classify_filler_repeat_dropped_but_single_kept() {
-        // 第一条语气词（无上一条）→ 保留（不误伤真实应答）
-        assert_eq!(classify_utterance(&u("Chinese", "嗯。"), 1.0, false, Some("我们出发吧")),
-                   KeepDecision::Keep);
+        // 上一条语气词但本次是实义句 → 保留
+        assert_eq!(classify_utterance(&u("Chinese", "太阳会升起。"), 2.0, false, Some("嗯")),
+                   Verdict::Keep("太阳会升起。".into()));
         // 上一条与本次都是纯语气词 → 丢弃
         assert_eq!(classify_utterance(&u("Chinese", "嗯嗯。"), 1.0, false, Some("嗯")),
-                   KeepDecision::FillerRepeat);
+                   Verdict::FillerRepeat);
         assert_eq!(classify_utterance(&u("Chinese", "啊……"), 0.8, false, Some("哎")),
-                   KeepDecision::FillerRepeat);
-        // 上一条是语气词但本次是实义句 → 保留
-        assert_eq!(classify_utterance(&u("Chinese", "太阳会升起。"), 2.0, false, Some("嗯")),
-                   KeepDecision::Keep);
+                   Verdict::FillerRepeat);
         // 上一条是实义句、本次是语气词 → 保留（首条语气词合法）
         assert_eq!(classify_utterance(&u("Chinese", "哎呀！"), 1.0, false, Some("太阳会升起")),
-                   KeepDecision::Keep);
+                   Verdict::Keep("哎呀！".into()));
         // 语气词+实义混合不算纯语气词
         assert_eq!(classify_utterance(&u("Chinese", "嗯好的。"), 1.0, false, Some("嗯")),
-                   KeepDecision::Keep);
-        // 重复判定优先于语气词判定（完全相同的语气词 = Duplicate）
+                   Verdict::Keep("嗯好的。".into()));
+        // 完全相同的语气词 = Duplicate（判重优先）
         assert_eq!(classify_utterance(&u("Chinese", "嗯。"), 1.0, false, Some("嗯")),
-                   KeepDecision::Duplicate);
+                   Verdict::Duplicate);
+    }
+
+    /// 段内复读压缩：连续重复 ≥3 遍的子串只保留 2 遍（用户规则 + 实例）。
+    #[test]
+    fn collapse_repeats_keeps_at_most_two() {
+        // 单字循环："啊！"×10 → "啊！"×2
+        let spam = "啊！".repeat(10);
+        assert_eq!(collapse_repeats(&spam), "啊！啊！");
+        // 短语循环（用户例 342）："让我抱抱你！呜呜呜，"×4 → ×2
+        let hug = "让我抱抱你！呜呜呜，".repeat(4);
+        assert_eq!(collapse_repeats(&hug), "让我抱抱你！呜呜呜，让我抱抱你！呜呜呜，");
+        // 前缀实义内容 + 尾部循环（用户例 323）
+        let mixed = format!("真舒服！感觉真棒！我怎么能这么轻易就放手？啊！好舒服！{}", "啊！".repeat(20));
+        assert_eq!(collapse_repeats(&mixed),
+                   "真舒服！感觉真棒！我怎么能这么轻易就放手？啊！好舒服！啊！啊！");
+        // 恰好 3 遍 → 2 遍；2 遍不动
+        assert_eq!(collapse_repeats("谢谢谢谢谢谢"), "谢谢"); // 最小单元"谢"×6 → 保留 2 个
+        assert_eq!(collapse_repeats("好好好"), "好好");
+        assert_eq!(collapse_repeats("好好"), "好好");
+        // 无重复原样；多单元链
+        assert_eq!(collapse_repeats("你好世界"), "你好世界");
+        assert_eq!(collapse_repeats("abababab"), "abab");
+        // 链后仍有内容
+        assert_eq!(collapse_repeats(&format!("{}收尾", "哈".repeat(6))), "哈哈收尾");
+    }
+
+    /// 压缩参与判定链：压缩后判重（用户例 324/325：两条巨型"啊！"字幕 →
+    /// 第一条压缩保留为"啊！啊！"，第二条压缩后与之重复被丢弃）。
+    #[test]
+    fn classify_collapses_before_compare() {
+        let spam56 = "啊！".repeat(56);
+        let spam42 = "啊！".repeat(42);
+        // 第一条：上一条是实义句 → 压缩后保留
+        let v = classify_utterance(&u("Chinese", &spam56), 14.9, false, Some("真舒服感觉真棒"));
+        assert_eq!(v, Verdict::Keep("啊！啊！".into()));
+        // 第二条：压缩后与第一条的压缩判重基准相同 → Duplicate
+        let v2 = classify_utterance(&u("Chinese", &spam42), 8.3, false, Some("啊啊"));
+        assert_eq!(v2, Verdict::Duplicate);
+        // 压缩后成为纯语气词且上一条也是语气词 → FillerRepeat
+        let v3 = classify_utterance(&u("Chinese", &spam42), 8.3, false, Some("嗯"));
+        assert_eq!(v3, Verdict::FillerRepeat);
+        // 用户例 150："我爱你！妈妈，"×10 + 尾巴 → 压缩为两遍+尾巴
+        let love = format!("{}我爱你！", "我爱你！妈妈，".repeat(10));
+        let v4 = classify_utterance(&u("Chinese", &love), 15.0, false, None);
+        assert_eq!(v4, Verdict::Keep("我爱你！妈妈，我爱你！妈妈，我爱你！".into()));
     }
 
     #[test]
     fn classify_fragment_only_when_flag_on() {
         // lang=None + 短（<2s）→ 过滤开启才丢
-        assert_eq!(classify_utterance(&u("None", "今天"), 0.8, true, None), KeepDecision::Fragment);
-        assert_eq!(classify_utterance(&u("None", "今天"), 0.8, false, None), KeepDecision::Keep);
+        assert_eq!(classify_utterance(&u("None", "今天"), 0.8, true, None), Verdict::Fragment);
+        assert_eq!(classify_utterance(&u("None", "今天"), 0.8, false, None), Verdict::Keep("今天".into()));
         // lang=None 但长段（真实语音，如结尾致辞）→ 过滤开启也保留
-        assert_eq!(classify_utterance(&u("None", "谢谢大家的观看"), 5.0, true, None), KeepDecision::Keep);
+        assert_eq!(classify_utterance(&u("None", "谢谢大家的观看"), 5.0, true, None),
+                   Verdict::Keep("谢谢大家的观看".into()));
         // lang 有值的短段不受过滤影响
-        assert_eq!(classify_utterance(&u("Japanese", "はい"), 0.5, true, None), KeepDecision::Keep);
+        assert_eq!(classify_utterance(&u("Japanese", "はい"), 0.5, true, None), Verdict::Keep("はい".into()));
+        // 碎片字数按压缩后计：复读压缩过的 lang=None 碎片同样被过滤
+        let spam = "嗯！".repeat(10); // 压缩后 "嗯！嗯！" → 去标点 2 字 < 4
+        assert_eq!(classify_utterance(&u("None", &spam), 1.0, true, None), Verdict::Fragment);
     }
 
     #[test]
     fn classify_priority_empty_then_dup_then_filler_then_fragment() {
         // 空文本优先于一切
-        assert_eq!(classify_utterance(&u("None", " "), 0.5, true, Some("x")), KeepDecision::EmptyText);
+        assert_eq!(classify_utterance(&u("None", " "), 0.5, true, Some("x")), Verdict::EmptyText);
         // 重复优先于语气词与碎片
-        assert_eq!(classify_utterance(&u("None", "今天"), 0.5, true, Some("今天")), KeepDecision::Duplicate);
+        assert_eq!(classify_utterance(&u("None", "今天"), 0.5, true, Some("今天")), Verdict::Duplicate);
         // 语气词优先于碎片
-        assert_eq!(classify_utterance(&u("None", "嗯"), 0.5, true, Some("啊")), KeepDecision::FillerRepeat);
+        assert_eq!(classify_utterance(&u("None", "嗯"), 0.5, true, Some("啊")), Verdict::FillerRepeat);
     }
 
     #[test]
