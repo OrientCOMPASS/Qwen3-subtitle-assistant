@@ -312,7 +312,7 @@ jobs:
           "$BIN" --version
           "$BIN" --help | head -12
           # v0.5/v0.6 行为开关与重命名后的 flag 必须出现在 CLI 面上
-          for f in --raw-srt --verbose --filter-fragments --buffer-mb --greedy                    --temperature --model-dir --vad-max-seg-secs; do
+          for f in --raw-srt --verbose --filter-fragments --buffer-mb --greedy --temperature --model-dir --vad-max-seg-secs --max-cue-chars --no-layout; do
             "$BIN" --help | grep -q -- "$f" || { echo "!! --help 缺少 $f"; exit 1; }
           done
           # 旧名以隐藏 alias 保留（不显示在 --help，但必须仍被 clap 接受：
@@ -387,7 +387,8 @@ jobs:
             $help = & ./target/release/Qwen3-subtitle-assistant.exe --help 2>&1
             if ($LASTEXITCODE -ne 0) { throw "vulkan 版 --help 退出码 $LASTEXITCODE" }
             foreach ($f in @("--raw-srt", "--verbose", "--filter-fragments", "--buffer-mb",
-                              "--greedy", "--temperature", "--model-dir", "--vad-max-seg-secs")) {
+                              "--greedy", "--temperature", "--model-dir", "--vad-max-seg-secs",
+                              "--max-cue-chars", "--no-layout")) {
               if (-not ($help -match [regex]::Escape($f))) { throw "vulkan 版 --help 缺少 $f" }
             }
             Write-Host "VK_LAUNCH_OK + SMOKE_OK"
@@ -860,6 +861,9 @@ jobs:
           * **单输出文件**：默认只产出 \`.srt\`；排版前对照 \`.raw.srt\` 需 \`--raw-srt\`。
           * **碎片过滤默认关闭**：lang=None 短碎片的启发式丢弃需显式 \`--filter-fragments\`
             （空文本段始终跳过——无内容可写）。
+          * **v0.6.2 断句标准恢复**：单条字幕 ≤7s（双模型时代默认；E3 曾误放宽到
+            15s 导致过长字幕）且 ≤40 字符（新 --max-cue-chars，语速快时秒数约束不够），
+            行宽默认 40（≈20 汉字）；新增 --no-layout 原样输出。
           * **v0.6.1 新增**：**段内复读压缩**——输出字幕里连续重复 ≥3 遍的子串
             只保留 2 遍（幻觉循环如 \"啊！\"×56 → \"啊！啊！\"），压缩后再参与
             判重与语气词规则；跨段与段内两层夹击模型复读。

@@ -107,14 +107,23 @@ pub struct Args {
     #[arg(long, short = 'b', default_value_t = 50)]
     pub buffer_mb: usize,
 
-    // ---------------- 排版与输出 ----------------
-    /// 字幕行最大显示宽度（CJK 计 2；0=不折行）
-    #[arg(long, default_value_t = 44)]
+    // ---------------- 排版与输出（断句标准：双模型时代默认，v0.6.2 恢复） ----
+    /// 字幕行最大显示宽度（CJK 计 2、ASCII 计 1；40 ≈ 20 个汉字。0=不折行）
+    #[arg(long, default_value_t = 40)]
     pub max_line_width: usize,
 
-    /// 单条字幕最长秒数（超过按句读拆分）
-    #[arg(long, default_value_t = 15.0)]
+    /// 单条字幕最长秒数，超过按句读拆分（时间按字符占比分配；0=不按秒拆）
+    #[arg(long, default_value_t = 7.0)]
     pub max_cue_secs: f64,
+
+    /// 单条字幕最大字符数，超过按句读拆分（≈ 两行；语速快时秒数约束不够，
+    /// 需要字符维度兜底。0=不按字符拆）
+    #[arg(long, default_value_t = 40)]
+    pub max_cue_chars: usize,
+
+    /// 关闭排版（不折行、不拆长条），输出与转录段一一对应的字幕（调试对照用）
+    #[arg(long)]
+    pub no_layout: bool,
 
     /// 输出目录（默认与输入文件同目录）
     #[arg(long, short = 'o')]

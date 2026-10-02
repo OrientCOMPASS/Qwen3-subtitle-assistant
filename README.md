@@ -112,7 +112,7 @@ S2TT Qwen3-ASR（llama.cpp + mtmd 音频编码，静态链接）
    │  ④ 上一条与本次都是纯语气词（哎啊嗯哼呀哇哦噢…闭集）→ 丢弃本次
    │  ⑤ lang=None 且 <2s 或 <4 字的碎片 → 仅 --filter-fragments 时丢弃
    ▼
-排版（CJK 显示宽度折行 --max-line-width；长 cue 按句读拆分 --max-cue-secs）
+排版·断句标准（长 cue 按句读拆分：≤7s 且 ≤40 字符；CJK 显示宽度折行到 40）
    ▼
 <视频名>.srt        （--raw-srt 时另存排版前对照 .raw.srt）
 ```
@@ -157,7 +157,10 @@ debug。`--log-file` 的文件通道**恒为 debug 全量**（终端干净的同
 | | `--max-new-tokens N` | 256 | 单段生成上限；alias: `--asr-max-new-tokens` |
 | 输出 | `--output-dir DIR` | 输入同目录 | SRT 输出目录 |
 | | `--raw-srt` | 关 | 另存排版前 `.raw.srt` 对照 |
-| | `--max-line-width N` / `--max-cue-secs F` | 44 / 15 | 排版：折行宽度 / 长 cue 拆分阈值 |
+| | `--max-cue-secs F` | **7** | 断句：单条最长秒数（双模型时代标准；0=关） |
+| | `--max-cue-chars N` | **40** | 断句：单条最大字符数（≈两行；0=关） |
+| | `--max-line-width N` | **40** | 折行显示宽度（CJK 计 2；≈20 汉字/行） |
+| | `--no-layout` | 关 | 关闭排版，输出与转录段一一对应 |
 | 日志 | `--log-file PATH` | 无 | 全量诊断落盘（终端不受影响） |
 | | `--verbose` | 关 | 终端放开 debug 明细 |
 | | `--no-pause` | 关 | 失败时不等待回车（拖拽场景默认等待） |

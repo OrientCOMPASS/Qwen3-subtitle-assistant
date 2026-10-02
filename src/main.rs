@@ -148,10 +148,17 @@ fn process_one(input: &Path, cfg: &Config,
         }
     }
 
-    // 排版：折行 + 长 cue 拆分
-    let laid = srt::layout(&segments, cfg.max_line_width, cfg.max_cue_secs);
-    debug!("排版完成：{} 条 -> {} 条（行宽 {}，单条最长 {}s）",
-           segments.len(), laid.len(), cfg.max_line_width, cfg.max_cue_secs);
+    // 排版：折行 + 长 cue 拆分（断句标准：≤max_cue_secs 且 ≤max_cue_chars；
+    // --no-layout 时原样输出，便于与转录段一一对照）
+    let laid = if cfg.no_layout {
+        debug!("排版已关闭（--no-layout）：{} 条原样输出", segments.len());
+        segments.clone()
+    } else {
+        let laid = srt::layout(&segments, cfg.max_line_width, cfg.max_cue_secs, cfg.max_cue_chars);
+        debug!("排版完成：{} 条 -> {} 条（行宽 {}，单条 ≤{}s 且 ≤{} 字）",
+               segments.len(), laid.len(), cfg.max_line_width, cfg.max_cue_secs, cfg.max_cue_chars);
+        laid
+    };
 
     let out_path = cfg.output_srt_path(input);
     if let Some(parent) = out_path.parent() {

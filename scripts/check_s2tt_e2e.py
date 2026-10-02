@@ -71,12 +71,15 @@ def check_translate(media_list: str) -> int:
         minutes = max(0.05, end / 60)
         widest = max((max(width(l) for l in t.split("\n")) for _, _, t in cs), default=0)
         longest = max((e - s for s, e, _ in cs), default=0)
+        # v0.6.2 断句标准（双模型时代默认恢复）：≤7s / ≤40 字符 / 行宽 40
+        most_chars = max((len(t.replace("\n", "")) for _, _, t in cs), default=0)
         checks = [
             (len(cs) >= minutes * 4, f"cues {len(cs)} >= {minutes*4:.0f}（密度 >=4/分钟）"),
             (kana <= 0.05, f"假名占比 {kana:.1%} <= 5%（语言定向）"),
             (cjk >= 0.50, f"汉字占比 {cjk:.1%} >= 50%（确实中文）"),
-            (widest <= 44, f"最宽行 {widest} <= 44（折行）"),
-            (longest <= 16.0, f"最长 cue {longest:.1f}s <= 16s（长 cue 拆分）"),
+            (widest <= 40, f"最宽行 {widest} <= 40（折行）"),
+            (longest <= 8.0, f"最长 cue {longest:.1f}s <= 8s（秒数断句）"),
+            (most_chars <= 44, f"最长条 {most_chars} 字 <= 44（字符断句，上限40+硬切余量）"),
         ]
         print(f"== {srt}")
         for ok, d in checks:

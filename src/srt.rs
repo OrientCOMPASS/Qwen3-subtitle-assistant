@@ -2,9 +2,12 @@
 //!
 //! 旧版只做「序号 + 时间轴 + 文本」的直白拼接：一个 VAD 语音段就是一条 cue，
 //! 十几秒的连续讲话会变成一整屏文字。这里补上两件事：
-//! 1. **长 cue 拆分**：超过 `--max-cue-secs` 的字幕按句读边界拆成多条，
+//! 1. **长 cue 拆分**（断句标准，v0.6.2 恢复双模型时代默认并加强）：
+//!    时长 > `--max-cue-secs`（默认 7s，旧双模型流程标准；E3 曾误放宽到 15s）
+//!    **或** 字符数 > `--max-cue-chars`（默认 40 ≈ 两行）即按句读边界拆条，
 //!    时间按字符占比在原区间内分配（没有词级时间戳时的标准做法）；
-//! 2. **行宽折行**：按显示宽度（CJK 计 2、ASCII 计 1）折行，优先在标点/空格处断。
+//! 2. **行宽折行**：按显示宽度（CJK 计 2、ASCII 计 1）折行到
+//!    `--max-line-width`（默认 40 ≈ 20 个汉字），优先在标点/空格处断。
 //!
 //! 另提供 `parse_srt`（测试用参照读取，`--from-srt` 模式已随双模型工作流下线）。
 
@@ -207,26 +210,40 @@ fn sentence_ends(text: &str) -> Vec<usize> {
 }
 
 /// 把过长的 cue 按句读拆成多条，时间按字符占比在原区间内线性分配。
-pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64) -> Vec<SubtitleSegment> {
+///
+/// 双约束（v0.6.2 恢复双模型时代断句标准并补字符维度）：
+/// * `max_cue_secs`：单条时长上限（旧版默认 7s；E3 单模型化时曾被放宽到 15s，
+///   实测产出过长字幕——回归修复）；
+/// * `max_cue_chars`：单条字符数上限（默认 40 ≈ 行宽 40 的两行）。旧流程靠
+///   LLM「译文简洁」软约束压字符数，单模型直出没有这一层，需要硬上限兜底
+///   （语速快时 7s 也可能塞 60+ 字）。
+/// 任一约束超标即拆；0/≤0 = 关闭对应维度。
+pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64, max_cue_chars: usize)
+                      -> Vec<SubtitleSegment> {
     let dur = seg.duration_secs();
-    if max_cue_secs <= 0.0 || dur <= max_cue_secs || seg.text.trim().is_empty() {
+    if seg.text.trim().is_empty() {
         return vec![seg.clone()];
     }
     let flat = seg.text.replace('\n', " ");
+    let n_chars = flat.chars().count();
+    let over_secs = max_cue_secs > 0.0 && dur > max_cue_secs;
+    let over_chars = max_cue_chars > 0 && n_chars > max_cue_chars;
+    if !over_secs && !over_chars {
+        return vec![seg.clone()];
+    }
     let chars: Vec<char> = flat.chars().collect();
     let ends = sentence_ends(&flat);
     if ends.len() < 2 {
-        // 没有任何句读：按字符数均分
-        let parts = (dur / max_cue_secs).ceil().max(2.0) as usize;
+        // 没有任何句读：按字符数均分（份数取两维约束的较大者）
+        let by_secs = if over_secs { (dur / max_cue_secs).ceil() } else { 1.0 };
+        let by_chars = if over_chars { (n_chars as f64 / max_cue_chars as f64).ceil() } else { 1.0 };
+        let parts = by_secs.max(by_chars).max(2.0) as usize;
         let per = (chars.len() / parts).max(1);
-        let mut out = Vec::new();
-        for (k, chunk) in chars.chunks(per).enumerate() {
-            out.push((k, chunk.iter().collect::<String>()));
-        }
-        return distribute(seg, &out.into_iter().map(|(_, s)| s).collect::<Vec<_>>());
+        let out: Vec<String> = chars.chunks(per).map(|c| c.iter().collect()).collect();
+        return distribute(seg, &out);
     }
 
-    // 贪心成组：每组时长不超过 max_cue_secs
+    // 贪心成组：每组同时不超 max_cue_secs 与 max_cue_chars
     let total_chars = chars.len().max(1) as f64;
     let mut groups: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -235,8 +252,11 @@ pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64) -> Vec<SubtitleS
         let piece: String = chars[prev_end..end].iter().collect();
         prev_end = end;
         let candidate = format!("{}{}", cur, piece);
-        let cand_secs = candidate.chars().count() as f64 / total_chars * dur;
-        if !cur.is_empty() && cand_secs > max_cue_secs {
+        let cand_chars = candidate.chars().count();
+        let cand_secs = cand_chars as f64 / total_chars * dur;
+        let violates = (max_cue_secs > 0.0 && cand_secs > max_cue_secs)
+            || (max_cue_chars > 0 && cand_chars > max_cue_chars);
+        if !cur.is_empty() && violates {
             groups.push(cur.trim().to_string());
             cur = piece.trim().to_string();
         } else {
@@ -249,20 +269,24 @@ pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64) -> Vec<SubtitleS
     groups.retain(|g| !g.is_empty());
 
     // 兜住不变式：单个"句子"本身就很长时（标点稀疏），贪心分组会把它整段收下，
-    // 产出的 cue 仍然超过 max_cue_secs。这里对超长的组再按字符均分硬切一次，
-    // 保证"每条 cue 的时长 <= ~max_cue_secs"这个对外承诺成立。
+    // 产出的 cue 仍可能超标。这里对超标的组再按字符均分硬切一次，保证
+    // "每条 cue 时长 <= ~max_cue_secs 且字符数 <= ~max_cue_chars"的对外承诺。
     let mut final_groups: Vec<String> = Vec::with_capacity(groups.len());
     for g in groups {
         let n = g.chars().count();
         let g_secs = n as f64 / total_chars * dur;
-        if g_secs <= max_cue_secs || n < 2 {
+        let bad_secs = max_cue_secs > 0.0 && g_secs > max_cue_secs;
+        let bad_chars = max_cue_chars > 0 && n > max_cue_chars;
+        if (!bad_secs && !bad_chars) || n < 2 {
             final_groups.push(g);
             continue;
         }
-        let parts = (g_secs / max_cue_secs).ceil().max(2.0) as usize;
-        let chars: Vec<char> = g.chars().collect();
-        let per = (chars.len() / parts).max(1);
-        for chunk in chars.chunks(per) {
+        let by_secs = if bad_secs { (g_secs / max_cue_secs).ceil() } else { 1.0 };
+        let by_chars = if bad_chars { (n as f64 / max_cue_chars as f64).ceil() } else { 1.0 };
+        let parts = by_secs.max(by_chars).max(2.0) as usize;
+        let gchars: Vec<char> = g.chars().collect();
+        let per = (gchars.len() / parts).max(1);
+        for chunk in gchars.chunks(per) {
             let piece: String = chunk.iter().collect();
             let piece = piece.trim().to_string();
             if !piece.is_empty() {
@@ -304,15 +328,16 @@ fn distribute(seg: &SubtitleSegment, groups: &[String]) -> Vec<SubtitleSegment> 
     out
 }
 
-/// 排版：先拆长 cue，再折行，并重排序号。
+/// 排版：先拆长 cue（时长/字符双约束），再折行，并重排序号。
 pub fn layout(
     segments: &[SubtitleSegment],
     max_line_width: usize,
     max_cue_secs: f64,
+    max_cue_chars: usize,
 ) -> Vec<SubtitleSegment> {
     let mut out: Vec<SubtitleSegment> = Vec::new();
     for seg in segments {
-        for mut piece in split_long_cue(seg, max_cue_secs) {
+        for mut piece in split_long_cue(seg, max_cue_secs, max_cue_chars) {
             if max_line_width > 0 {
                 piece.text = wrap_text(&piece.text, max_line_width);
             }
@@ -439,7 +464,7 @@ mod tests {
     fn split_long_cue_by_punctuation() {
         let text = "第一句话在这里。第二句话也在这里。第三句话结束了。";
         let s = seg(10_000, 30_000, text); // 20s
-        let parts = split_long_cue(&s, 8.0);
+        let parts = split_long_cue(&s, 8.0, 0);
         assert!(parts.len() >= 2, "应被拆分: {:?}", parts);
         assert_eq!(parts[0].start_ms, 10_000);
         assert_eq!(parts.last().unwrap().end_ms, 30_000);
@@ -459,7 +484,7 @@ mod tests {
         // 必须靠均分兜底，否则"每条 cue <= max_cue_secs"的承诺就不成立。
         let text = format!("{}，{}", "あ".repeat(60), "い".repeat(60));
         let s = seg(0, 60_000, &text);
-        let parts = split_long_cue(&s, 7.0);
+        let parts = split_long_cue(&s, 7.0, 0);
         assert!(parts.len() >= 8, "应被切成足够多条: {}", parts.len());
         for p in &parts {
             assert!(
@@ -479,7 +504,7 @@ mod tests {
     fn split_handles_text_without_any_punctuation() {
         let text = "あ".repeat(200);
         let s = seg(0, 40_000, &text);
-        let parts = split_long_cue(&s, 7.0);
+        let parts = split_long_cue(&s, 7.0, 0);
         assert!(parts.len() >= 5, "{}", parts.len());
         assert!(parts.iter().all(|p| p.duration_secs() <= 8.5));
     }
@@ -487,7 +512,41 @@ mod tests {
     #[test]
     fn split_keeps_short_cue() {
         let s = seg(0, 3000, "短い。");
-        assert_eq!(split_long_cue(&s, 7.0).len(), 1);
+        assert_eq!(split_long_cue(&s, 7.0, 0).len(), 1);
+    }
+
+    #[test]
+    fn split_by_chars_even_when_duration_ok() {
+        // 6s 但 80 字（语速快）：时长约束(7s)不触发，字符约束(40)必须触发
+        let text: String = (0..8).map(|k| format!("第{}句话在这里。", k)).collect();
+        let s = seg(0, 6_000, &text);
+        assert_eq!(text.chars().count(), 64);
+        let parts = split_long_cue(&s, 7.0, 40);
+        assert!(parts.len() >= 2, "字符超标应拆分: {:?}", parts.len());
+        for p in &parts {
+            let n = p.text.chars().count();
+            assert!(n <= 42, "拆后单条仍超字符上限: {n}");
+        }
+        // 时间轴覆盖原区间且单调
+        assert_eq!(parts[0].start_ms, 0);
+        assert_eq!(parts.last().unwrap().end_ms, 6_000);
+        // 字符上限 0 = 关闭：不再拆
+        assert_eq!(split_long_cue(&s, 7.0, 0).len(), 1);
+    }
+
+    #[test]
+    fn split_user_scenario_dense_15s_cue() {
+        // 用户报告的坏 case 形态：14.9s 一条塞满密集文本（旧默认 15s 不拆）
+        let text: String = "赛翁的马跑掉了，村民们聚拢过来大喊大叫，".repeat(4); // 84 字
+        let s = seg(37_000, 51_900, &text);
+        let parts = split_long_cue(&s, 7.0, 40);
+        assert!(parts.len() >= 3, "应拆成多条: {}", parts.len());
+        for p in &parts {
+            assert!(p.duration_secs() <= 7.5, "仍有超长 cue: {:.1}s", p.duration_secs());
+            assert!(p.text.chars().count() <= 42, "仍有超字符 cue");
+        }
+        assert_eq!(parts[0].start_ms, 37_000);
+        assert_eq!(parts.last().unwrap().end_ms, 51_900);
     }
 
     #[test]
@@ -496,7 +555,7 @@ mod tests {
             seg(0, 20_000, "とても長い文章です。まだまだ続きます。最後に終わります。"),
             seg(20_000, 22_000, "短い"),
         ];
-        let out = layout(&v, 20, 7.0);
+        let out = layout(&v, 20, 7.0, 0);
         assert!(out.len() >= 3);
         for (i, s) in out.iter().enumerate() {
             assert_eq!(s.index, i + 1);
