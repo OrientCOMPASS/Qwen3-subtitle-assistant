@@ -71,15 +71,19 @@ def check_translate(media_list: str) -> int:
         minutes = max(0.05, end / 60)
         widest = max((max(width(l) for l in t.split("\n")) for _, _, t in cs), default=0)
         longest = max((e - s for s, e, _ in cs), default=0)
-        # v0.6.2 断句标准（双模型时代默认恢复）：≤7s / ≤40 字符 / 行宽 40
+        # v0.6.2 断句标准（双模型时代默认恢复）：≤7s / ≤40 字符 / 行宽 40；
+        # v0.6.4 稀疏文本豁免：低字密度段的 cue 允许超 7s（内容完整性优先），
+        # 上限放宽到 12s，同时新增"无单字碎片 cue"反向断言（用户实测坏 case）。
         most_chars = max((len(t.replace("\n", "")) for _, _, t in cs), default=0)
+        skinny = [t for _, _, t in cs if len(t.replace("\n", "").strip()) < 2]
         checks = [
             (len(cs) >= minutes * 4, f"cues {len(cs)} >= {minutes*4:.0f}（密度 >=4/分钟）"),
             (kana <= 0.05, f"假名占比 {kana:.1%} <= 5%（语言定向）"),
             (cjk >= 0.50, f"汉字占比 {cjk:.1%} >= 50%（确实中文）"),
             (widest <= 40, f"最宽行 {widest} <= 40（折行）"),
-            (longest <= 8.0, f"最长 cue {longest:.1f}s <= 8s（秒数断句）"),
+            (longest <= 12.0, f"最长 cue {longest:.1f}s <= 12s（秒数断句+稀疏豁免）"),
             (most_chars <= 44, f"最长条 {most_chars} 字 <= 44（字符断句，上限40+硬切余量）"),
+            (not skinny, f"无单字碎片 cue（发现 {len(skinny)} 条: {skinny[:3]}）"),
         ]
         print(f"== {srt}")
         for ok, d in checks:

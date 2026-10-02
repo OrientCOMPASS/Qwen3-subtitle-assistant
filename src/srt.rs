@@ -209,6 +209,23 @@ fn sentence_ends(text: &str) -> Vec<usize> {
     ends
 }
 
+/// 硬切单片的最小内容量（字符）：份数封顶 = ceil(字数/该值)，防止时长驱动
+/// 的均分把稀疏文本剁成 1-2 字碎片（见 split_long_cue 文档「稀疏文本豁免」）。
+const MIN_PIECE_CHARS: usize = 4;
+
+/// 把文本尽量均分成 parts 份（按字符索引比例切，份间至多差 1 字；
+/// 相比 chunks(per) 不会在尾部甩出超短残片）。空白片过滤。
+fn split_even(text: &str, parts: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let parts = parts.clamp(1, n.max(1));
+    (0..parts)
+        .map(|k| chars[n * k / parts..n * (k + 1) / parts].iter().collect::<String>())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// 把过长的 cue 按句读拆成多条，时间按字符占比在原区间内线性分配。
 ///
 /// 双约束（v0.6.2 恢复双模型时代断句标准并补字符维度）：
@@ -218,6 +235,12 @@ fn sentence_ends(text: &str) -> Vec<usize> {
 ///   LLM「译文简洁」软约束压字符数，单模型直出没有这一层，需要硬上限兜底
 ///   （语速快时 7s 也可能塞 60+ 字）。
 /// 任一约束超标即拆；0/≤0 = 关闭对应维度。
+///
+/// **稀疏文本豁免**（v0.6.4）：硬切份数受「字数 / MIN_PIECE_CHARS」封顶——
+/// 时长驱动的均分在低字密度段（呻吟/单字应答/慢速语音）会剁出一串 1-2 字
+/// 碎片字幕（用户实测坏 case：20s 段仅 6 字 → 6 条单字 cue）。宁可少而长：
+/// 稀疏段的 cue 时长允许超过 max_cue_secs（几字挂十几秒完全可读），
+/// 内容完整性优先于秒数上限。
 pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64, max_cue_chars: usize)
                       -> Vec<SubtitleSegment> {
     let dur = seg.duration_secs();
@@ -234,12 +257,17 @@ pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64, max_cue_chars: u
     let chars: Vec<char> = flat.chars().collect();
     let ends = sentence_ends(&flat);
     if ends.len() < 2 {
-        // 没有任何句读：按字符数均分（份数取两维约束的较大者）
+        // 没有任何句读：按字符数均分（份数取两维约束的较大者，
+        // 再受 MIN_PIECE_CHARS 封顶——稀疏文本不出碎片，见函数文档）
         let by_secs = if over_secs { (dur / max_cue_secs).ceil() } else { 1.0 };
         let by_chars = if over_chars { (n_chars as f64 / max_cue_chars as f64).ceil() } else { 1.0 };
-        let parts = by_secs.max(by_chars).max(2.0) as usize;
-        let per = (chars.len() / parts).max(1);
-        let out: Vec<String> = chars.chunks(per).map(|c| c.iter().collect()).collect();
+        let want = by_secs.max(by_chars).max(2.0) as usize;
+        let cap = (n_chars + MIN_PIECE_CHARS - 1) / MIN_PIECE_CHARS;
+        let parts = want.min(cap.max(1));
+        let out = split_even(&flat, parts);
+        if out.len() <= 1 {
+            return vec![seg.clone()];
+        }
         return distribute(seg, &out);
     }
 
@@ -283,16 +311,10 @@ pub fn split_long_cue(seg: &SubtitleSegment, max_cue_secs: f64, max_cue_chars: u
         }
         let by_secs = if bad_secs { (g_secs / max_cue_secs).ceil() } else { 1.0 };
         let by_chars = if bad_chars { (n as f64 / max_cue_chars as f64).ceil() } else { 1.0 };
-        let parts = by_secs.max(by_chars).max(2.0) as usize;
-        let gchars: Vec<char> = g.chars().collect();
-        let per = (gchars.len() / parts).max(1);
-        for chunk in gchars.chunks(per) {
-            let piece: String = chunk.iter().collect();
-            let piece = piece.trim().to_string();
-            if !piece.is_empty() {
-                final_groups.push(piece);
-            }
-        }
+        let want = by_secs.max(by_chars).max(2.0) as usize;
+        let cap = (n + MIN_PIECE_CHARS - 1) / MIN_PIECE_CHARS;
+        let parts = want.min(cap.max(1));
+        final_groups.extend(split_even(&g, parts));
     }
     if final_groups.len() <= 1 {
         return vec![seg.clone()];
@@ -547,6 +569,36 @@ mod tests {
         }
         assert_eq!(parts[0].start_ms, 37_000);
         assert_eq!(parts.last().unwrap().end_ms, 51_900);
+    }
+
+    /// 用户实测坏 case（v0.6.3）：20s 段只有 6 个无标点字 → 曾被时长驱动
+    /// 均分成 6 条单字 cue。v0.6.4 稀疏豁免：份数 ≤ ceil(6/4)=2，
+    /// 产出 2 条 ≥3 字的 cue（时长各 ~10s，稀疏段允许超 max_cue_secs）。
+    #[test]
+    fn split_sparse_text_no_single_char_pieces() {
+        let s = seg(0, 20_106, "你他妈可香了");
+        let parts = split_long_cue(&s, 7.0, 40);
+        assert_eq!(parts.len(), 2, "{:?}", parts.iter().map(|p| &p.text).collect::<Vec<_>>());
+        for p in &parts {
+            assert!(p.text.chars().count() >= 3, "碎片 cue: {:?}", p.text);
+        }
+        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined, "你他妈可香了");
+        assert_eq!(parts[0].start_ms, 0);
+        assert_eq!(parts.last().unwrap().end_ms, 20_106);
+    }
+
+    /// 密集文本不受稀疏豁免影响：秒数/字符约束照常生效。
+    #[test]
+    fn split_dense_text_still_respects_limits() {
+        let text: String = "这句话很长需要被拆开".repeat(6); // 66 字
+        let s = seg(0, 14_000, &text);
+        let parts = split_long_cue(&s, 7.0, 40);
+        assert!(parts.len() >= 2);
+        for p in &parts {
+            assert!(p.duration_secs() <= 8.0, "密集文本仍有时长超标: {:.1}", p.duration_secs());
+            assert!(p.text.chars().count() <= 44);
+        }
     }
 
     #[test]

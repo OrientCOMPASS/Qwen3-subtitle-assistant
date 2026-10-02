@@ -143,26 +143,33 @@ fn is_pure_filler(stripped: &str) -> bool {
         && stripped.chars().all(|c| FILLER_CHARS.contains(&c))
 }
 
-/// 段内复读压缩（模型幻觉处理，用户规则）：**连续**重复 ≥3 遍的子串只保留
-/// 2 遍。例："啊！"×56 → "啊！啊！"；"让我抱抱你！呜呜呜，"×4 → ×2；
-/// 正常文本原样返回。
+/// 词组级重复单元的最小长度（字符数）。≥ 此长度的单元视为「词组/短句」。
+const PHRASE_UNIT: usize = 3;
+
+/// 段内复读压缩（模型幻觉处理，用户规则，v0.6.4 分级收紧）：
+/// * **词组级单元（≥3 字符）**：连续重复 **≥2 遍 → 只保留 1 遍**。相邻同词组
+///   复读（"我等你可久了！我等你可久了！"）几乎必是模型回声/幻觉循环——实测
+///   短语池循环素材上，旧的「≥3 留 2」会把每条链都留成 ×2，整屏仍是垃圾；
+/// * **字级单元（1-2 字符）**：连续重复 **≥3 遍 → 保留 2 遍**（保护"谢谢"
+///   "哈哈""慢慢"等合法叠词，"哈哈哈"→"哈哈"、"啊！"×56 → "啊！啊！"）。
 ///
 /// 算法：从左到右扫描；在每个位置找**最小**重复单元 L（"abcabcabc" 的单元是
-/// "abc" 而非 "abcabc"），要求同位置起连续 ≥3 次（预筛：单元重复则
-/// chars[i+L]==chars[i] 必成立）；命中则输出 2 份单元并跳过整条重复链。
-/// 单元长度上限 128 字符（幻觉循环单元都是短语级；同时约束最坏复杂度）。
+/// "abc" 而非 "abcabc"；预筛：单元重复则 chars[i+L]==chars[i] 必成立）；命中
+/// 则输出保留份数并跳过整条重复链。单元长度上限 128 字符（幻觉循环单元都是
+/// 短语级；同时约束最坏复杂度）。
 fn collapse_repeats(text: &str) -> String {
     const MAX_UNIT: usize = 128;
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
-    if n < 3 {
+    if n < 2 {
         return text.to_string();
     }
     let mut out: Vec<char> = Vec::with_capacity(n);
     let mut i = 0usize;
     while i < n {
-        let max_l = ((n - i) / 3).min(MAX_UNIT);
-        let mut hit: Option<(usize, usize)> = None; // (单元长, 链尾)
+        // 词组级 2 遍即触发，扫描窗口按 /2 放宽（旧 /3 会漏掉恰好 2 遍的词组链）
+        let max_l = ((n - i) / 2).min(MAX_UNIT);
+        let mut hit: Option<(usize, usize, usize)> = None; // (单元长, 保留份数, 链尾)
         let mut l = 1usize;
         while l <= max_l {
             // 预筛：单元在 i+l 处重复的必要条件
@@ -174,17 +181,26 @@ fn collapse_repeats(text: &str) -> String {
                     cnt += 1;
                     j += l;
                 }
-                if cnt >= 3 {
-                    hit = Some((l, j));
+                let keep = if l >= PHRASE_UNIT && cnt >= 2 {
+                    1 // 词组级：≥2 遍只留 1 遍
+                } else if cnt >= 3 {
+                    2 // 字级：≥3 遍留 2 遍（叠词保护）
+                } else {
+                    0
+                };
+                if keep > 0 {
+                    hit = Some((l, keep, j));
                     break;
                 }
             }
             l += 1;
         }
         match hit {
-            Some((l, j)) => {
-                out.extend_from_slice(&chars[i..i + 2 * l]); // 仅保留两遍
-                i = j;                                        // 跳过整条重复链
+            Some((l, keep, j)) => {
+                for _ in 0..keep {
+                    out.extend_from_slice(&chars[i..i + l]);
+                }
+                i = j; // 跳过整条重复链
             }
             None => {
                 out.push(chars[i]);
@@ -612,6 +628,9 @@ mod tests {
         let spam = "啊！".repeat(56);
         assert_eq!(prepare_segment(&u("Chinese", &spam), 14.9, false),
                    SegmentVerdict::Process("啊！啊！".into()));
+        // 词组级 ×2 也压（v0.6.4）
+        assert_eq!(prepare_segment(&u("Chinese", "我等你可久了！我等你可久了！"), 5.8, false),
+                   SegmentVerdict::Process("我等你可久了！".into()));
         // 正常文本原样
         assert_eq!(prepare_segment(&u("Chinese", " 太阳会升起。 "), 2.0, false),
                    SegmentVerdict::Process("太阳会升起。".into()));
@@ -667,11 +686,11 @@ mod tests {
     #[test]
     fn piece_dedup_catches_split_born_duplicates() {
         let seg_text = "别走！别走！别走";
-        // 段级：压缩不触发（"别走！"完整重复仅 2 次）
+        // 段级：词组"别走！"（3 字符）完整重复 2 次 → v0.6.4 压缩为 1 次 + 残段
         assert_eq!(prepare_segment(&u("Chinese", seg_text), 13.6, false),
-                   SegmentVerdict::Process(seg_text.into()));
-        // 拆分（模拟 layout 的句读拆分产物）
-        let pieces = ["别走！", "别走！", "别走"];
+                   SegmentVerdict::Process("别走！别走".into()));
+        // 拆分（模拟 layout 对压缩产物的句读拆分）
+        let pieces = ["别走！", "别走"];
         let mut last: Option<String> = None;
         let mut kept = Vec::new();
         for p in pieces {
@@ -695,22 +714,35 @@ mod tests {
         assert_eq!(classify_piece("下一段的新内容。", last.as_deref()), PieceVerdict::Keep);
     }
 
-    /// 段内复读压缩（保留 v0.6.1 用例）：连续重复 ≥3 遍的子串只保留 2 遍。
+    /// 段内复读压缩（v0.6.4 分级规则）：词组级（≥3 字符）≥2 遍留 1 遍；
+    /// 字级（1-2 字符）≥3 遍留 2 遍（叠词保护）。
     #[test]
-    fn collapse_repeats_keeps_at_most_two() {
-        let spam = "啊！".repeat(10);
+    fn collapse_repeats_phrase_and_char_units() {
+        // 字级单元：≥3 → 留 2（叠词/语气词保护）
+        let spam = "啊！".repeat(10); // 单元"啊！"长 2
         assert_eq!(collapse_repeats(&spam), "啊！啊！");
+        assert_eq!(collapse_repeats("谢谢谢谢谢谢"), "谢谢"); // 单元"谢"×6 → 留 2
+        assert_eq!(collapse_repeats("好好好"), "好好");
+        assert_eq!(collapse_repeats("哈哈"), "哈哈");         // ×2 字级不触发
+        assert_eq!(collapse_repeats(&format!("{}收尾", "哈".repeat(6))), "哈哈收尾");
+        // 词组级单元（≥3 字符）：≥2 遍即只留 1 遍
         let hug = "让我抱抱你！呜呜呜，".repeat(4);
-        assert_eq!(collapse_repeats(&hug), "让我抱抱你！呜呜呜，让我抱抱你！呜呜呜，");
+        assert_eq!(collapse_repeats(&hug), "让我抱抱你！呜呜呜，");
+        assert_eq!(collapse_repeats("对不起，对不起，"), "对不起，");
+        assert_eq!(collapse_repeats("我爱你我爱你"), "我爱你");
+        // 用户实测坏 case（v0.6.3 遗留 ×2）：短语池循环
+        let loop_txt = "真难受！我等你可久了！我等你可久了！你懂的吧？";
+        assert_eq!(collapse_repeats(loop_txt), "真难受！我等你可久了！你懂的吧？");
+        // 2 字词组 ×2 不触发（"好的好的"是合法口语）
+        assert_eq!(collapse_repeats("好的好的"), "好的好的");
+        // 无重复原样；英文多字符单元
+        assert_eq!(collapse_repeats("你好世界"), "你好世界");
+        assert_eq!(collapse_repeats("abababab"), "abab"); // 单元"ab"长 2 → 字级规则留 2
+        assert_eq!(collapse_repeats("no no no no "), "no "); // 单元"no "长 3 = 词组级 → ≥2 留 1
+        // 前缀实义内容 + 尾部字级循环
         let mixed = format!("真舒服！感觉真棒！我怎么能这么轻易就放手？啊！好舒服！{}", "啊！".repeat(20));
         assert_eq!(collapse_repeats(&mixed),
                    "真舒服！感觉真棒！我怎么能这么轻易就放手？啊！好舒服！啊！啊！");
-        assert_eq!(collapse_repeats("谢谢谢谢谢谢"), "谢谢"); // 最小单元"谢"×6 → 保留 2 个
-        assert_eq!(collapse_repeats("好好好"), "好好");
-        assert_eq!(collapse_repeats("好好"), "好好");
-        assert_eq!(collapse_repeats("你好世界"), "你好世界");
-        assert_eq!(collapse_repeats("abababab"), "abab");
-        assert_eq!(collapse_repeats(&format!("{}收尾", "哈".repeat(6))), "哈哈收尾");
     }
 
     #[test]
