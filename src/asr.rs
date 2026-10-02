@@ -11,13 +11,14 @@
 //! * 内存有界（队列容量 + VAD 窗口），不再全片缓冲；
 //! * 进度条只有一条，按已解码媒体时间走，消息里带已转写段数。
 //!
-//! 幻觉/重复处理（默认开启，用户规则）：空文本段（模型判定纯静音/噪音）无内容
-//! 可写、始终跳过；**段内复读压缩**——连续重复 ≥3 遍的子串只保留 2 遍
-//! （"啊！"×56 → "啊！啊！"）；与上一条保留字幕相同的段（压缩+去标点后比较）、
-//! 以及「上一条与本次都是纯语气词」的连续语气词段（哎/啊/嗯/哼…），始终丢弃；
-//! 「lang=None 短碎片=幻觉」启发式过滤默认**关闭**，`--filter-fragments` 显式开启
-//! （实测结论见 finetune/s2tt_pipeline.py：lang=None 且 <2s 或 <4 字的段多为
-//! 半幻觉碎片，但默认保留用户对产出的完整控制权）。
+//! 幻觉/重复处理（默认开启，用户规则；注意**粒度**）：
+//! * 段级（拆分前）：空文本跳过；**复读压缩**（连续重复 ≥3 遍的子串只留 2 遍，
+//!   "啊！"×56 → "啊！啊！"）；`--filter-fragments` 的 lang=None 短碎片过滤
+//!   （<2s/<4字 门槛按段校准，默认关闭）。
+//! * 条级（**大段拆分/折行之后**，v0.6.3 起——拆分先行才能拦住拆出来的相邻
+//!   重复条，如"别走！"×3；终端 [ASR✔] 打印的也是拆分后的真实字幕条）：
+//!   与上一条保留字幕相同（压缩+去标点后比较）丢弃；上一条与本条都是纯语气词
+//!   （哎/啊/嗯/哼…闭集）丢弃本条。
 
 use crate::config::Config;
 use crate::ffmpeg::{self, SAMPLE_RATE};
@@ -40,21 +41,72 @@ use std::sync::{Arc, Condvar, Mutex};
 const KEEP_LANG_NONE_MIN_SECS: f64 = 2.0;
 const KEEP_LANG_NONE_MIN_CHARS: usize = 4;
 
-/// 单段处置判定（纯函数，可单测）。
+/// 段级预处理判定（纯函数，可单测）：空文本/碎片在**段**粒度判（碎片启发式
+/// 的 <2s/<4字 门槛是按段校准的，见 finetune/s2tt_pipeline.py）；复读压缩
+/// 也在段粒度做（幻觉循环链跨越拆分边界，必须先看全文）。
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Verdict {
-    /// 保留为字幕；携带**复读压缩后**的最终文本（见 collapse_repeats）
-    Keep(String),
-    /// 空文本（模型判定纯静音/噪音）——无内容可写，始终跳过
+pub(crate) enum SegmentVerdict {
+    /// 进入拆分与条级判定；携带复读压缩后的文本
+    Process(String),
+    /// 空文本（模型判定纯静音/噪音，或全标点）——无内容可写
     EmptyText,
-    /// 与上一条保留字幕相同（复读压缩+去标点后比较；模型对重复音频/幻觉
-    /// 循环的常见输出）——丢弃
-    Duplicate,
-    /// 上一条与本次（去标点后）都是纯语气词——连续语气词是静音/背景音上最
-    /// 典型的幻觉形态，丢弃本次（第一条语气词保留，不误伤真实的"嗯。"应答）
-    FillerRepeat,
-    /// lang=None 短碎片且 `--filter-fragments` 开启——丢弃
+    /// lang=None 短碎片且 `--filter-fragments` 开启
     Fragment,
+}
+
+/// 条级判定（纯函数，可单测）：判重与连续语气词在**最终字幕条**粒度做——
+/// 大段拆分之后。v0.6.2 及以前在段粒度判，拆分产生的相邻重复碎片
+/// （"别走！"/"别走！"/"别走"）会整体绕过判重，用户实测抓到；拆分先行后
+/// 这类重复在条粒度被逐一拦截。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PieceVerdict {
+    Keep,
+    /// 空内容（拆分/折行后无实义字符）
+    Empty,
+    /// 与上一条**保留**字幕相同（压缩+去标点后比较）
+    Duplicate,
+    /// 上一条与本条都是纯语气词
+    FillerRepeat,
+}
+
+/// 段级预处理：空文本 → 复读压缩 → 碎片过滤（仅 flag 开启时）。
+fn prepare_segment(u: &AsrUtterance, dur_secs: f64, filter_fragments: bool) -> SegmentVerdict {
+    let text = u.text.trim();
+    if text.is_empty() {
+        return SegmentVerdict::EmptyText;
+    }
+    let collapsed = collapse_repeats(text);
+    let stripped = strip_punct(&collapsed);
+    if stripped.is_empty() {
+        // 全是标点（如"……。"）：没有字幕内容可写，按空文本处理
+        return SegmentVerdict::EmptyText;
+    }
+    if filter_fragments && u.lang.eq_ignore_ascii_case("None") {
+        let chars = stripped.chars().count();
+        if dur_secs < KEEP_LANG_NONE_MIN_SECS || chars < KEEP_LANG_NONE_MIN_CHARS {
+            return SegmentVerdict::Fragment;
+        }
+    }
+    SegmentVerdict::Process(collapsed)
+}
+
+/// 条级判定：`last_kept_stripped` 为上一条**保留字幕条**（压缩+去标点后）。
+fn classify_piece(text: &str, last_kept_stripped: Option<&str>) -> PieceVerdict {
+    let stripped = strip_punct(text);
+    if stripped.is_empty() {
+        return PieceVerdict::Empty;
+    }
+    if let Some(prev) = last_kept_stripped {
+        // 契约上 prev 已是压缩+去标点文本；再处理一次幂等且防御调用方状态漂移
+        let prev = strip_punct(&collapse_repeats(prev));
+        if stripped == prev {
+            return PieceVerdict::Duplicate;
+        }
+        if is_pure_filler(&prev) && is_pure_filler(&stripped) {
+            return PieceVerdict::FillerRepeat;
+        }
+    }
+    PieceVerdict::Keep
 }
 
 /// 语气词集合（用户例举"哎啊嗯哼等"，取常见闭集；命中规则=去标点后**每个字**
@@ -89,45 +141,6 @@ fn is_punct(c: char) -> bool {
 fn is_pure_filler(stripped: &str) -> bool {
     !stripped.is_empty()
         && stripped.chars().all(|c| FILLER_CHARS.contains(&c))
-}
-
-/// 判定一段 ASR 输出的去留与最终文本。`last_kept_stripped` 为上一条**保留**
-/// 字幕（压缩+去标点后）的文本。
-///
-/// 处理顺序：空文本 → **段内复读压缩**（幻觉循环只留两遍）→ 重复（压缩+
-/// 去标点后比较）→ 连续语气词 → 碎片过滤（仅 flag 开启时）。
-/// 重复/语气词/压缩规则都是默认行为（用户要求，实例见 README）：长静音或
-/// 情绪化音频上模型常陷入复读循环——跨段的由判重/语气词规则拦截，段内的
-/// （"啊！"×56、"我爱你！妈妈，"×10 这类）由压缩规则收敛。
-fn classify_utterance(u: &AsrUtterance, dur_secs: f64, filter_fragments: bool,
-                      last_kept_stripped: Option<&str>) -> Verdict {
-    let text = u.text.trim();
-    if text.is_empty() {
-        return Verdict::EmptyText;
-    }
-    let collapsed = collapse_repeats(text);
-    let stripped = strip_punct(&collapsed);
-    if stripped.is_empty() {
-        // 全是标点（如"……。"）：没有字幕内容可写，按空文本处理
-        return Verdict::EmptyText;
-    }
-    if let Some(prev) = last_kept_stripped {
-        // 契约上 prev 已是压缩+去标点文本；再处理一次幂等且防御调用方状态漂移
-        let prev = strip_punct(&collapse_repeats(prev));
-        if stripped == prev {
-            return Verdict::Duplicate;
-        }
-        if is_pure_filler(&prev) && is_pure_filler(&stripped) {
-            return Verdict::FillerRepeat;
-        }
-    }
-    if filter_fragments && u.lang.eq_ignore_ascii_case("None") {
-        let chars = stripped.chars().count();
-        if dur_secs < KEEP_LANG_NONE_MIN_SECS || chars < KEEP_LANG_NONE_MIN_CHARS {
-            return Verdict::Fragment;
-        }
-    }
-    Verdict::Keep(collapsed)
 }
 
 /// 段内复读压缩（模型幻觉处理，用户规则）：**连续**重复 ≥3 遍的子串只保留
@@ -292,8 +305,17 @@ impl SegQueue {
     }
 }
 
-/// 转录一个媒体文件（流式），返回排版前的字幕段（按时间有序，index 已分配）。
-pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<Vec<SubtitleSegment>> {
+/// 转录产物：`cues` = 最终字幕条（已拆分/折行/判重，index 已分配，直接可写
+/// .srt）；`raw` = 排版前原始直出（未压缩、未拆分、未判重，仅非空段，
+/// --raw-srt 调试对照用）。
+pub struct TranscribeOut {
+    pub cues: Vec<SubtitleSegment>,
+    pub raw: Vec<SubtitleSegment>,
+}
+
+/// 转录一个媒体文件（流式）。管线内完成大段拆分与排版（拆分先于判重——
+/// 判重/语气词在"最终字幕条"粒度执行，见 classify_piece 文档）。
+pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<TranscribeOut> {
     let duration = ffmpeg::get_duration_secs(input).unwrap_or(0.0);
 
     let pb = make_progress(duration);
@@ -321,15 +343,16 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
         })
         .context("启动 VAD 生产者线程失败")?;
 
-    // ---- 消费者（主线程）：收一段、ASR 一段 ----
+    // ---- 消费者（主线程）：收一段、ASR 一段、拆条、条级判定 ----
     let mut out: Vec<SubtitleSegment> = Vec::new();
-    let mut n_segs = 0usize;   // VAD 确认的语音段总数
-    let mut n_empty = 0usize;  // 空文本段（模型判定静音/噪音，无内容可写）
-    let mut n_dup = 0usize;    // 与上一条字幕重复的段
-    let mut n_frag = 0usize;   // --filter-fragments 丢弃的碎片段
-    let mut n_filler = 0usize;    // 连续纯语气词丢弃的段
+    let mut raw: Vec<SubtitleSegment> = Vec::new(); // --raw-srt 用原始直出
+    let mut n_segs = 0usize;    // VAD 确认的语音段总数
+    let mut n_empty = 0usize;   // 空文本（段级或条级，无内容可写）
+    let mut n_dup = 0usize;     // 条级判重丢弃
+    let mut n_filler = 0usize;  // 条级连续语气词丢弃
+    let mut n_frag = 0usize;    // --filter-fragments 段级碎片丢弃
     let mut n_collapsed = 0usize; // 触发段内复读压缩的段
-    let mut last_kept_stripped: Option<String> = None; // 上一条保留字幕（去标点，判重/语气词基准）
+    let mut last_kept_stripped: Option<String> = None; // 上一条保留字幕条（去标点）
     let mut pipeline_err: Option<anyhow::Error> = None;
 
     while let Some(item) = queue.pop() {
@@ -346,50 +369,78 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
         let start_ms = ms_of(seg.start_sample);
         let end_ms = ms_of(seg.start_sample + seg.samples.len());
 
-        match classify_utterance(&u, dur_secs, cfg.filter_fragments, last_kept_stripped.as_deref()) {
-            Verdict::EmptyText => {
+        // 原始直出（未压缩/未拆分/未判重）——--raw-srt 的调试对照价值所在
+        if cfg.raw_srt {
+            let t = u.text.trim();
+            if !t.is_empty() {
+                raw.push(SubtitleSegment {
+                    index: raw.len() + 1, start_ms, end_ms, text: t.to_string(),
+                });
+            }
+        }
+
+        match prepare_segment(&u, dur_secs, cfg.filter_fragments) {
+            SegmentVerdict::EmptyText => {
                 n_empty += 1;
                 pb.suspend(|| debug!("[ASR∅] {:.2}s@{} 空输出（lang={}），跳过",
                                      dur_secs, format_timestamp(start_ms), u.lang));
             }
-            Verdict::Duplicate => {
-                n_dup += 1;
-                pb.suspend(|| debug!("[ASR↻] {:.2}s@{} 与上一条相同（去标点比较），丢弃（{:?}）",
-                                     dur_secs, format_timestamp(start_ms),
-                                     truncate(u.text.trim(), 20)));
-            }
-            Verdict::FillerRepeat => {
-                n_filler += 1;
-                pb.suspend(|| debug!("[ASR〰] {:.2}s@{} 连续纯语气词，丢弃（{:?}）",
-                                     dur_secs, format_timestamp(start_ms),
-                                     truncate(u.text.trim(), 20)));
-            }
-            Verdict::Fragment => {
+            SegmentVerdict::Fragment => {
                 n_frag += 1;
                 pb.suspend(|| debug!("[VAD✂] {:.2}s@{} 丢弃（lang={} text={:?}）",
                                      dur_secs, format_timestamp(start_ms), u.lang,
                                      truncate(&u.text, 20)));
             }
-            Verdict::Keep(text) => {
-                if text != u.text.trim() {
+            SegmentVerdict::Process(collapsed) => {
+                if collapsed != u.text.trim() {
                     n_collapsed += 1;
                     let before = truncate(u.text.trim(), 24);
-                    let after = truncate(&text, 24);
+                    let after = truncate(&collapsed, 24);
                     pb.suspend(|| debug!("[ASR♻] {:.2}s@{} 复读压缩: {:?} → {:?}",
                                          dur_secs, format_timestamp(start_ms), before, after));
                 }
-                // 保留的字幕内容 = 用户关心的产出，info 级直接打到终端
-                //（v0.4 的行为；被收敛的只是加载噪声与跳过明细那类诊断）。
-                pb.suspend(|| info!("[ASR✔] {} ({:.1}s) {}",
-                                    format_timestamp(start_ms), dur_secs, text));
-                last_kept_stripped = Some(strip_punct(&text));
-                out.push(SubtitleSegment {
-                    index: out.len() + 1,
-                    start_ms,
-                    end_ms,
-                    text,
-                });
-                done.store(out.len(), Ordering::Relaxed);
+                // 大段拆分 + 折行 **先于** 判重/语气词检查（用户要求）：
+                // 检查与终端打印都以「最终写入 SRT 的字幕条」为单位，
+                // 拆分产生的相邻重复条（"别走！"×3 这类）才会被条级判重拦截，
+                // [ASR✔] 打印的也就是真实字幕内容而非拆分前整段。
+                let whole = SubtitleSegment { index: 0, start_ms, end_ms, text: collapsed };
+                let pieces = if cfg.no_layout {
+                    vec![whole]
+                } else {
+                    crate::srt::layout(&[whole], cfg.max_line_width,
+                                       cfg.max_cue_secs, cfg.max_cue_chars)
+                };
+                for mut piece in pieces {
+                    match classify_piece(&piece.text, last_kept_stripped.as_deref()) {
+                        PieceVerdict::Empty => {
+                            n_empty += 1;
+                        }
+                        PieceVerdict::Duplicate => {
+                            n_dup += 1;
+                            let ts = format_timestamp(piece.start_ms);
+                            let t = truncate(&piece.text, 20);
+                            pb.suspend(|| debug!("[ASR↻] {} 与上一条相同（去标点比较），丢弃（{:?}）", ts, t));
+                        }
+                        PieceVerdict::FillerRepeat => {
+                            n_filler += 1;
+                            let ts = format_timestamp(piece.start_ms);
+                            let t = truncate(&piece.text, 20);
+                            pb.suspend(|| debug!("[ASR〰] {} 连续纯语气词，丢弃（{:?}）", ts, t));
+                        }
+                        PieceVerdict::Keep => {
+                            piece.index = out.len() + 1;
+                            // 终端打印与 SRT 一致的字幕条（折行压成单行显示）
+                            let flat: String = piece.text.chars()
+                                .map(|c| if c == '\n' { ' ' } else { c }).collect();
+                            let pdur = (piece.end_ms - piece.start_ms) as f64 / 1000.0;
+                            let ts = format_timestamp(piece.start_ms);
+                            pb.suspend(|| info!("[ASR✔] {} ({:.1}s) {}", ts, pdur, flat));
+                            last_kept_stripped = Some(strip_punct(&piece.text));
+                            out.push(piece);
+                            done.store(out.len(), Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
         // 每段处理完刷新一次：已转写数 + 缓冲区占用（用户要求终端可见）
@@ -408,17 +459,17 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
     }
     if n_segs == 0 {
         warn!("未检出任何语音段（静音/纯音乐？）");
-        return Ok(Vec::new());
+        return Ok(TranscribeOut { cues: Vec::new(), raw });
     }
     let mut notes: Vec<String> = Vec::new();
     if n_empty > 0 {
-        notes.push(format!("{n_empty} 段空输出跳过"));
+        notes.push(format!("{n_empty} 处空输出跳过"));
     }
     if n_dup > 0 {
-        notes.push(format!("{n_dup} 段重复丢弃"));
+        notes.push(format!("{n_dup} 条重复丢弃"));
     }
     if n_filler > 0 {
-        notes.push(format!("{n_filler} 段连续语气词丢弃"));
+        notes.push(format!("{n_filler} 条连续语气词丢弃"));
     }
     if n_collapsed > 0 {
         notes.push(format!("{n_collapsed} 段复读压缩"));
@@ -428,7 +479,7 @@ pub fn transcribe_file(input: &Path, cfg: &Config, asr: &mut GgufAsr) -> Result<
     }
     let tail = if notes.is_empty() { String::new() } else { format!("（{}）", notes.join("，")) };
     info!("转录完成：{n_segs} 段语音 → {} 条字幕{tail}", out.len());
-    Ok(out)
+    Ok(TranscribeOut { cues: out, raw })
 }
 
 /// 生产者主体：ffmpeg PCM 流 → f32 样本 → VadSegmenter.accept（返回即发送）。
@@ -545,121 +596,121 @@ mod tests {
         AsrUtterance { lang: lang.into(), text: text.into() }
     }
 
+    // ---------------- 段级预处理 prepare_segment ----------------
+
     #[test]
-    fn classify_empty_text_always_skipped() {
-        assert_eq!(classify_utterance(&u("None", ""), 5.0, false, None), Verdict::EmptyText);
-        assert_eq!(classify_utterance(&u("Japanese", "   "), 5.0, true, None), Verdict::EmptyText);
-        // 全标点 = 无内容可写，同样按空处理
-        assert_eq!(classify_utterance(&u("Chinese", "……。"), 5.0, false, None), Verdict::EmptyText);
+    fn prepare_empty_and_punct_only() {
+        assert_eq!(prepare_segment(&u("None", ""), 5.0, false), SegmentVerdict::EmptyText);
+        assert_eq!(prepare_segment(&u("Japanese", "   "), 5.0, true), SegmentVerdict::EmptyText);
+        // 全标点 = 无内容可写
+        assert_eq!(prepare_segment(&u("Chinese", "……。"), 5.0, false), SegmentVerdict::EmptyText);
     }
 
     #[test]
-    fn classify_duplicate_ignores_punctuation() {
-        // 去标点后的判重：标点差异不再放行重复句
-        assert_eq!(classify_utterance(&u("Chinese", "今天天气很好。"), 3.0, false, Some("今天天气很好")),
-                   Verdict::Duplicate);
-        assert_eq!(classify_utterance(&u("Chinese", "今天天气很好，"), 3.0, false, Some("今天天气很好。")),
-                   Verdict::Duplicate, "基准带标点也应命中（classify 内防御性再压缩+去标点）");
-        // 内容不同 → 保留
-        assert_eq!(classify_utterance(&u("Chinese", "今天天气很好！"), 3.0, false, Some("明天天气很好")),
-                   Verdict::Keep("今天天气很好！".into()));
-        // 没有上一条 → 保留
-        assert_eq!(classify_utterance(&u("Chinese", "今天天气很好。"), 3.0, false, None),
-                   Verdict::Keep("今天天气很好。".into()));
-        // 首尾/内部空白等价
-        assert_eq!(classify_utterance(&u("Chinese", " 今天 天气很好。 "), 3.0, false, Some("今天天气很好")),
-                   Verdict::Duplicate);
+    fn prepare_collapses_and_keeps() {
+        // 复读压缩在段级完成（幻觉循环链跨越拆分边界，必须先看全文）
+        let spam = "啊！".repeat(56);
+        assert_eq!(prepare_segment(&u("Chinese", &spam), 14.9, false),
+                   SegmentVerdict::Process("啊！啊！".into()));
+        // 正常文本原样
+        assert_eq!(prepare_segment(&u("Chinese", " 太阳会升起。 "), 2.0, false),
+                   SegmentVerdict::Process("太阳会升起。".into()));
     }
 
     #[test]
-    fn classify_filler_repeat_dropped_but_single_kept() {
-        // 上一条语气词但本次是实义句 → 保留
-        assert_eq!(classify_utterance(&u("Chinese", "太阳会升起。"), 2.0, false, Some("嗯")),
-                   Verdict::Keep("太阳会升起。".into()));
-        // 上一条与本次都是纯语气词 → 丢弃
-        assert_eq!(classify_utterance(&u("Chinese", "嗯嗯。"), 1.0, false, Some("嗯")),
-                   Verdict::FillerRepeat);
-        assert_eq!(classify_utterance(&u("Chinese", "啊……"), 0.8, false, Some("哎")),
-                   Verdict::FillerRepeat);
-        // 上一条是实义句、本次是语气词 → 保留（首条语气词合法）
-        assert_eq!(classify_utterance(&u("Chinese", "哎呀！"), 1.0, false, Some("太阳会升起")),
-                   Verdict::Keep("哎呀！".into()));
-        // 语气词+实义混合不算纯语气词
-        assert_eq!(classify_utterance(&u("Chinese", "嗯好的。"), 1.0, false, Some("嗯")),
-                   Verdict::Keep("嗯好的。".into()));
-        // 完全相同的语气词 = Duplicate（判重优先）
-        assert_eq!(classify_utterance(&u("Chinese", "嗯。"), 1.0, false, Some("嗯")),
-                   Verdict::Duplicate);
+    fn prepare_fragment_only_when_flag_on() {
+        // lang=None + 短（<2s）→ 过滤开启才丢（按压缩后字符计）
+        assert_eq!(prepare_segment(&u("None", "今天"), 0.8, true), SegmentVerdict::Fragment);
+        assert_eq!(prepare_segment(&u("None", "今天"), 0.8, false),
+                   SegmentVerdict::Process("今天".into()));
+        // lang=None 但长段（真实语音）→ 过滤开启也保留
+        assert_eq!(prepare_segment(&u("None", "谢谢大家的观看"), 5.0, true),
+                   SegmentVerdict::Process("谢谢大家的观看".into()));
+        // 复读压缩过的 lang=None 碎片同样被过滤（灌水不再骗过字数门槛）
+        let spam = "嗯！".repeat(10); // 压缩后 "嗯！嗯！" → 去标点 2 字 < 4
+        assert_eq!(prepare_segment(&u("None", &spam), 1.0, true), SegmentVerdict::Fragment);
+        // lang 有值的短段不受过滤影响
+        assert_eq!(prepare_segment(&u("Japanese", "はい"), 0.5, true),
+                   SegmentVerdict::Process("はい".into()));
     }
 
-    /// 段内复读压缩：连续重复 ≥3 遍的子串只保留 2 遍（用户规则 + 实例）。
+    // ---------------- 条级判定 classify_piece ----------------
+
+    #[test]
+    fn piece_duplicate_ignores_punctuation() {
+        assert_eq!(classify_piece("今天天气很好。", Some("今天天气很好")), PieceVerdict::Duplicate);
+        assert_eq!(classify_piece("今天天气很好，", Some("今天天气很好。")), PieceVerdict::Duplicate,
+                   "基准带标点也应命中（防御性再压缩+去标点）");
+        assert_eq!(classify_piece("今天天气很好！", Some("明天天气很好")), PieceVerdict::Keep);
+        assert_eq!(classify_piece("今天天气很好。", None), PieceVerdict::Keep);
+        assert_eq!(classify_piece(" 今天 天气很好。 ", Some("今天天气很好")), PieceVerdict::Duplicate);
+    }
+
+    #[test]
+    fn piece_filler_repeat_dropped_but_single_kept() {
+        // 上一条实义 → 本条语气词保留（首条语气词合法）
+        assert_eq!(classify_piece("哎呀！", Some("太阳会升起")), PieceVerdict::Keep);
+        // 两条都纯语气词 → 丢弃
+        assert_eq!(classify_piece("嗯嗯。", Some("嗯")), PieceVerdict::FillerRepeat);
+        assert_eq!(classify_piece("啊……", Some("哎")), PieceVerdict::FillerRepeat);
+        // 语气词 + 实义混合不算纯语气词
+        assert_eq!(classify_piece("嗯好的。", Some("嗯")), PieceVerdict::Keep);
+        // 完全相同 → Duplicate 优先
+        assert_eq!(classify_piece("嗯。", Some("嗯")), PieceVerdict::Duplicate);
+        // 全标点条 → Empty
+        assert_eq!(classify_piece("……", Some("嗯")), PieceVerdict::Empty);
+    }
+
+    /// 用户实例回归（v0.6.2 缺陷）："别走！别走！别走"（2 个完整重复 + 1 个
+    /// 残段，段级压缩不触发）拆分后产生三条相邻重复字幕。v0.6.3 拆分先于
+    /// 判重：条级逐一拦截，仅第一条保留。
+    #[test]
+    fn piece_dedup_catches_split_born_duplicates() {
+        let seg_text = "别走！别走！别走";
+        // 段级：压缩不触发（"别走！"完整重复仅 2 次）
+        assert_eq!(prepare_segment(&u("Chinese", seg_text), 13.6, false),
+                   SegmentVerdict::Process(seg_text.into()));
+        // 拆分（模拟 layout 的句读拆分产物）
+        let pieces = ["别走！", "别走！", "别走"];
+        let mut last: Option<String> = None;
+        let mut kept = Vec::new();
+        for p in pieces {
+            match classify_piece(p, last.as_deref()) {
+                PieceVerdict::Keep => {
+                    last = Some(strip_punct(p));
+                    kept.push(p);
+                }
+                PieceVerdict::Duplicate | PieceVerdict::FillerRepeat | PieceVerdict::Empty => {}
+            }
+        }
+        assert_eq!(kept, vec!["别走！"], "拆分产生的相邻重复条应只剩第一条");
+    }
+
+    /// 跨段边界的重复同样被条级判重拦截（上一段末条 = 下一段首条）。
+    #[test]
+    fn piece_dedup_across_segments() {
+        let mut last = Some(strip_punct("谢谢观看"));
+        assert_eq!(classify_piece("谢谢观看！", last.as_deref()), PieceVerdict::Duplicate);
+        last = Some(strip_punct("谢谢观看"));
+        assert_eq!(classify_piece("下一段的新内容。", last.as_deref()), PieceVerdict::Keep);
+    }
+
+    /// 段内复读压缩（保留 v0.6.1 用例）：连续重复 ≥3 遍的子串只保留 2 遍。
     #[test]
     fn collapse_repeats_keeps_at_most_two() {
-        // 单字循环："啊！"×10 → "啊！"×2
         let spam = "啊！".repeat(10);
         assert_eq!(collapse_repeats(&spam), "啊！啊！");
-        // 短语循环（用户例 342）："让我抱抱你！呜呜呜，"×4 → ×2
         let hug = "让我抱抱你！呜呜呜，".repeat(4);
         assert_eq!(collapse_repeats(&hug), "让我抱抱你！呜呜呜，让我抱抱你！呜呜呜，");
-        // 前缀实义内容 + 尾部循环（用户例 323）
         let mixed = format!("真舒服！感觉真棒！我怎么能这么轻易就放手？啊！好舒服！{}", "啊！".repeat(20));
         assert_eq!(collapse_repeats(&mixed),
                    "真舒服！感觉真棒！我怎么能这么轻易就放手？啊！好舒服！啊！啊！");
-        // 恰好 3 遍 → 2 遍；2 遍不动
         assert_eq!(collapse_repeats("谢谢谢谢谢谢"), "谢谢"); // 最小单元"谢"×6 → 保留 2 个
         assert_eq!(collapse_repeats("好好好"), "好好");
         assert_eq!(collapse_repeats("好好"), "好好");
-        // 无重复原样；多单元链
         assert_eq!(collapse_repeats("你好世界"), "你好世界");
         assert_eq!(collapse_repeats("abababab"), "abab");
-        // 链后仍有内容
         assert_eq!(collapse_repeats(&format!("{}收尾", "哈".repeat(6))), "哈哈收尾");
-    }
-
-    /// 压缩参与判定链：压缩后判重（用户例 324/325：两条巨型"啊！"字幕 →
-    /// 第一条压缩保留为"啊！啊！"，第二条压缩后与之重复被丢弃）。
-    #[test]
-    fn classify_collapses_before_compare() {
-        let spam56 = "啊！".repeat(56);
-        let spam42 = "啊！".repeat(42);
-        // 第一条：上一条是实义句 → 压缩后保留
-        let v = classify_utterance(&u("Chinese", &spam56), 14.9, false, Some("真舒服感觉真棒"));
-        assert_eq!(v, Verdict::Keep("啊！啊！".into()));
-        // 第二条：压缩后与第一条的压缩判重基准相同 → Duplicate
-        let v2 = classify_utterance(&u("Chinese", &spam42), 8.3, false, Some("啊啊"));
-        assert_eq!(v2, Verdict::Duplicate);
-        // 压缩后成为纯语气词且上一条也是语气词 → FillerRepeat
-        let v3 = classify_utterance(&u("Chinese", &spam42), 8.3, false, Some("嗯"));
-        assert_eq!(v3, Verdict::FillerRepeat);
-        // 用户例 150："我爱你！妈妈，"×10 + 尾巴 → 压缩为两遍+尾巴
-        let love = format!("{}我爱你！", "我爱你！妈妈，".repeat(10));
-        let v4 = classify_utterance(&u("Chinese", &love), 15.0, false, None);
-        assert_eq!(v4, Verdict::Keep("我爱你！妈妈，我爱你！妈妈，我爱你！".into()));
-    }
-
-    #[test]
-    fn classify_fragment_only_when_flag_on() {
-        // lang=None + 短（<2s）→ 过滤开启才丢
-        assert_eq!(classify_utterance(&u("None", "今天"), 0.8, true, None), Verdict::Fragment);
-        assert_eq!(classify_utterance(&u("None", "今天"), 0.8, false, None), Verdict::Keep("今天".into()));
-        // lang=None 但长段（真实语音，如结尾致辞）→ 过滤开启也保留
-        assert_eq!(classify_utterance(&u("None", "谢谢大家的观看"), 5.0, true, None),
-                   Verdict::Keep("谢谢大家的观看".into()));
-        // lang 有值的短段不受过滤影响
-        assert_eq!(classify_utterance(&u("Japanese", "はい"), 0.5, true, None), Verdict::Keep("はい".into()));
-        // 碎片字数按压缩后计：复读压缩过的 lang=None 碎片同样被过滤
-        let spam = "嗯！".repeat(10); // 压缩后 "嗯！嗯！" → 去标点 2 字 < 4
-        assert_eq!(classify_utterance(&u("None", &spam), 1.0, true, None), Verdict::Fragment);
-    }
-
-    #[test]
-    fn classify_priority_empty_then_dup_then_filler_then_fragment() {
-        // 空文本优先于一切
-        assert_eq!(classify_utterance(&u("None", " "), 0.5, true, Some("x")), Verdict::EmptyText);
-        // 重复优先于语气词与碎片
-        assert_eq!(classify_utterance(&u("None", "今天"), 0.5, true, Some("今天")), Verdict::Duplicate);
-        // 语气词优先于碎片
-        assert_eq!(classify_utterance(&u("None", "嗯"), 0.5, true, Some("啊")), Verdict::FillerRepeat);
     }
 
     #[test]

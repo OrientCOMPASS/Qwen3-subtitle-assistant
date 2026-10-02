@@ -137,35 +137,24 @@ fn process_one(input: &Path, cfg: &Config,
     if !input.is_file() {
         anyhow::bail!("输入文件不存在: {:?}", input);
     }
-    // 流式转录：VAD 切出一段 → 立即 ASR 一段（见 asr.rs 的生产者/消费者管线）
-    let segments = asr::transcribe_file(input, cfg, engine)?;
+    // 流式转录：VAD 切出一段 → 立即 ASR 一段；**大段拆分/折行/判重都在管线内
+    // 完成**（拆分先于判重，见 asr.rs）——cues 即最终字幕条，raw 为原始直出。
+    let tout = asr::transcribe_file(input, cfg, engine)?;
 
     // 排版前原始直出：仅 --raw-srt 时另存（默认只交付一个 .srt）
     if cfg.raw_srt {
         let raw_path = cfg.raw_srt_path(input);
-        if let Err(e) = srt::write_srt(&raw_path, &segments) {
+        if let Err(e) = srt::write_srt(&raw_path, &tout.raw) {
             log::warn!("写 .raw.srt 失败（不影响主输出）: {e:#}");
         }
     }
-
-    // 排版：折行 + 长 cue 拆分（断句标准：≤max_cue_secs 且 ≤max_cue_chars；
-    // --no-layout 时原样输出，便于与转录段一一对照）
-    let laid = if cfg.no_layout {
-        debug!("排版已关闭（--no-layout）：{} 条原样输出", segments.len());
-        segments.clone()
-    } else {
-        let laid = srt::layout(&segments, cfg.max_line_width, cfg.max_cue_secs, cfg.max_cue_chars);
-        debug!("排版完成：{} 条 -> {} 条（行宽 {}，单条 ≤{}s 且 ≤{} 字）",
-               segments.len(), laid.len(), cfg.max_line_width, cfg.max_cue_secs, cfg.max_cue_chars);
-        laid
-    };
 
     let out_path = cfg.output_srt_path(input);
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    srt::write_srt(&out_path, &laid)?;
-    Ok((out_path, laid.len()))
+    srt::write_srt(&out_path, &tout.cues)?;
+    Ok((out_path, tout.cues.len()))
 }
 
 fn resolve_ngl(cfg: &Config) -> i32 {

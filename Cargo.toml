@@ -1,6 +1,6 @@
 [package]
 name = "subtitle-assistant"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "本地离线字幕助手（S2TT 微调 Qwen3-ASR 单模型直出 · llama.cpp/GGUF 静态单文件 · 流式 VAD→ASR · 纯 Rust silero VAD · 字幕排版）"
 license = "Unlicense"
